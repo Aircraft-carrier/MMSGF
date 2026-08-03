@@ -873,6 +873,7 @@ def build_mot_train_dataset(config):
             action_chunk_size=spec.action_chunk_size,
             video_downsample_ratio=spec.video_downsample_ratio,
             text_emb_cache_path=getattr(config, "text_emb_cache_path", getattr(config, "empty_emb_path", None)),
+            empty_emb_path=getattr(config, "empty_emb_path", None),
             action_cache_manifest_path=getattr(config, "action_cache_manifest_path", None),
             video_decoder_cache_size=int(
                 getattr(config, "video_decoder_cache_size", MOT_DEFAULT_VIDEO_DECODER_CACHE_SIZE)
@@ -2327,13 +2328,17 @@ class MOTTrainer:
             self.empty_text_emb = torch.load(empty_path, map_location="cpu", weights_only=False)
         return self.empty_text_emb
 
-    def _train_text_emb(self, text_emb: torch.Tensor) -> torch.Tensor:
+    def _train_text_emb(
+        self,
+        text_emb: torch.Tensor,
+        empty_text_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         cfg_prob = float(getattr(self.config, "cfg_prob", 0.0))
         if cfg_prob <= 0.0:
             return text_emb
         return _apply_cfg_text_dropout(
             text_emb,
-            self._get_empty_text_emb(),
+            self._get_empty_text_emb() if empty_text_emb is None else empty_text_emb,
             cfg_prob,
             training=True,
         )
@@ -2511,7 +2516,7 @@ class MOTTrainer:
         }
 
     @torch.no_grad()
-    def _prepare_joint_input_dict(self, batch_dict):
+    def _prepare_joint_input_dict(self, batch_dict, *, add_noise=True):
         spec = _mot_spec_from_config(self.config)
         video_latent_loss_mask = batch_dict["video_latent_loss_mask"].to(
             device=batch_dict["latents"].device,
@@ -2534,20 +2539,27 @@ class MOTTrainer:
             device=batch_dict["actions"].device,
             dtype=torch.bool,
         )
-        latent_dict = self._add_video_noise(
-            latent=batch_dict["latents"],
-            train_scheduler=self.train_scheduler_latent,
-            spec=spec,
-            noisy_cond_prob=float(getattr(self.config, "video_noisy_cond_prob", 0.5)),
-            video_latent_loss_mask=video_latent_loss_mask,
+        if add_noise:
+            latent_dict = self._add_video_noise(
+                latent=batch_dict["latents"],
+                train_scheduler=self.train_scheduler_latent,
+                spec=spec,
+                noisy_cond_prob=float(getattr(self.config, "video_noisy_cond_prob", 0.5)),
+                video_latent_loss_mask=video_latent_loss_mask,
+            )
+            action_dict = self._add_action_noise(
+                actions=batch_dict["actions"],
+                train_scheduler=self.train_scheduler_action,
+                spec=spec,
+                action_loss_mask=action_loss_mask,
+            )
+        else:
+            latent_dict = {"latent": batch_dict["latents"]}
+            action_dict = {"latent": batch_dict["actions"]}
+        text_emb = self._train_text_emb(
+            batch_dict["text_emb"],
+            batch_dict.get("empty_text_emb"),
         )
-        action_dict = self._add_action_noise(
-            actions=batch_dict["actions"],
-            train_scheduler=self.train_scheduler_action,
-            spec=spec,
-            action_loss_mask=action_loss_mask,
-        )
-        text_emb = self._train_text_emb(batch_dict["text_emb"])
 
         latent_dict["text_emb"] = text_emb
         latent_dict["video_latent_loss_mask"] = video_latent_loss_mask

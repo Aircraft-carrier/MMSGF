@@ -172,7 +172,7 @@ def _x_to_g(meta: MOTMaskMetadata, q_idx, kv_idx):
     q_order = meta.order_ids[:, q_idx]
     k_order = meta.order_ids[:, kv_idx]
 
-    clean_to_g = (q_noise == NOISE_CLEAN) & (k_order <= q_order)
+    clean_to_g = (q_noise == NOISE_CLEAN) & (k_order < q_order)
     noisy_to_g = (q_noise == NOISE_NOISY) & (k_order < q_order)
     return clean_to_g | noisy_to_g
 

@@ -564,6 +564,7 @@ class MotTrainData(Dataset):
         action_chunk_size: int,
         video_downsample_ratio: int,
         text_emb_cache_path: str | Path,
+        empty_emb_path: str | Path | None = None,
         action_cache_manifest_path: str | Path | None = None,
         video_decoder_cache_size: int = MOT_DEFAULT_VIDEO_DECODER_CACHE_SIZE,
         point_store_cache_size: int = MOT_DEFAULT_POINT_STORE_CACHE_SIZE,
@@ -659,9 +660,15 @@ class MotTrainData(Dataset):
             )
         if self.data_profile == "joint":
             self.text_emb_cache = torch.load(text_emb_cache_path, map_location="cpu", weights_only=False)
+            self.empty_text_emb = (
+                torch.load(empty_emb_path, map_location="cpu", weights_only=False)
+                if empty_emb_path is not None
+                else None
+            )
             self._action_cache_index = load_action_cache_index(action_cache_manifest_path)
         else:
             self.text_emb_cache = None
+            self.empty_text_emb = None
             self._action_cache_index = {}
         self.video_timestamp_tolerance_s = MOT_VIDEO_TIMESTAMP_TOLERANCE_S
 
@@ -952,6 +959,8 @@ class MotTrainData(Dataset):
             "dataset_skip_count": torch.tensor(0, dtype=torch.int64),
             "_runtime_cache_stats": self._runtime_cache_stats(),
         }
+        if self.empty_text_emb is not None:
+            out["empty_text_emb"] = self.empty_text_emb
         return out
 
     def _video_decoder(self, video_path: Path) -> VideoDecoder:

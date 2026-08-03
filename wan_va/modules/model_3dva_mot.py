@@ -372,8 +372,8 @@ class ThreeDVAMOTBlock(nn.Module):
 
     def forward(
         self,
-        states: VAStreamStates,
-        conditioning: VAStreamConditioning,
+        states: VAStreamStates,              # hidden
+        conditioning: VAStreamConditioning,  # time
         text: torch.Tensor,
         video_rotary: torch.Tensor,
         action_rotary: torch.Tensor,
@@ -398,7 +398,7 @@ class ThreeDVAMOTBlock(nn.Module):
             for block, temb in zip(blocks, conditioning)
         )
         qkv_parts = [
-            self._self_qkv(block, hidden, modulation, rotary_emb)
+            self._self_qkv(block, hidden, modulation, rotary_emb) 
             for block, hidden, modulation, rotary_emb in zip(
                 blocks,
                 states,
