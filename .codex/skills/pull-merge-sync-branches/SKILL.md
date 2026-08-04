@@ -1,52 +1,85 @@
 ---
 name: pull-merge-sync-branches
-description: Pull origin, merge hardcoded two-machine sync branches into main, push main, and then pull the merged result on the other machine.
+description: Pull remote updates, merge a requested branch into the current or target branch, commit all resulting local changes, and upload the branch to origin. Use when Codex needs to synchronize with remote, merge work, preserve local edits, create any needed commit, and push.
 ---
 
 # Pull Merge Sync Branches
 
-Use this in `/Users/zhengshuhang/Desktop/code/mywam_sgfpipe/myWAM` after both machines have pushed their local work to:
+Synchronize local and remote work, merge the requested branch, commit local changes, and push the result. This is the full sync workflow; use `local-upload-sync-branch` for upload-only tasks.
 
-- `origin/sync/machine-a`
-- `origin/sync/machine-b`
+## Workflow
 
-Hardcoded target branch:
+1. Inspect state before touching branches:
 
-- `main`
+```bash
+git status --short --branch
+git branch --show-current
+git remote -v
+```
 
-Merge workflow on one integration machine:
+2. Fetch remote refs:
 
 ```bash
 git fetch origin
-git switch main
-git pull --ff-only origin main
-git merge origin/sync/machine-a
-git merge origin/sync/machine-b
-git push origin main
 ```
 
-If a merge conflict appears, resolve the conflict files manually, then run:
+3. Preserve local edits before pulling when the worktree is dirty:
 
 ```bash
-git status
+git stash push -u -m "codex-before-pull-merge"
+```
+
+Skip this only when the worktree is clean.
+
+4. Update the target branch:
+
+```bash
+git pull --ff-only origin main
+```
+
+If the target branch is not `main`, replace `main` with the requested branch.
+
+5. Merge the requested branch or remote ref:
+
+```bash
+git merge --no-edit origin/<branch>
+```
+
+If the user refers to "this branch" and context shows a specific remote branch such as `origin/sync/machine-a`, merge that branch. If no branch can be inferred, inspect `git branch -a` and ask a concise clarification.
+
+6. Restore stashed local edits if step 3 created a stash:
+
+```bash
+git stash pop
+```
+
+Resolve conflicts by editing files, then stage resolved files with `git add -A`. Do not discard either side blindly.
+
+7. Commit any resulting local changes:
+
+```bash
 git add -A
-git commit
-git push origin main
+git commit -m "<concise user-facing commit message>"
 ```
 
-After `main` has been pushed, update the other machine:
+If the merge already created a commit and there are no additional changes, do not create an empty commit.
+
+8. Push the target branch:
 
 ```bash
-git fetch origin
-git switch main
-git pull --ff-only origin main
+git push origin HEAD
 ```
 
-Only after confirming `main` contains both machines' changes, optionally clean up the temporary remote branches:
+9. Confirm final state:
 
 ```bash
-git push origin --delete sync/machine-a
-git push origin --delete sync/machine-b
+git status --short --branch
+git log --oneline --decorate -5
 ```
 
-Avoid destructive commands such as `git reset --hard`, `git clean -fd`, and force push unless the user explicitly asks for them.
+## Safety Rules
+
+- Do not run `git reset --hard`, `git clean -fd`, `git checkout --`, or force push.
+- Do not delete local or remote branches unless the user explicitly asks.
+- Preserve user edits with stash or a normal commit before operations that require a clean worktree.
+- Prefer fast-forward pulls for the target branch before merging requested work.

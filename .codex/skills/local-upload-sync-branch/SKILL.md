@@ -1,54 +1,53 @@
 ---
 name: local-upload-sync-branch
-description: Save this machine's unpushed local repository changes to a hardcoded sync branch and push it to origin. Use before syncing two machines through remote branches.
+description: Commit all current repository changes and upload them to the remote branch. Use when Codex needs to save local work, create a commit, and push it to origin without pulling or merging remote updates.
 ---
 
 # Local Upload Sync Branch
 
-Use this in `/Users/zhengshuhang/Desktop/code/mywam_sgfpipe/myWAM` when one machine has local changes that need to be uploaded before merging with another machine.
+Commit local work and push it to the remote branch. This skill is intentionally upload-only: do not pull, merge, rebase, delete branches, or force push unless the user explicitly asks.
 
-Hardcoded branches:
+## Workflow
 
-- Machine A: `sync/machine-a`
-- Machine B: `sync/machine-b`
-- Remote: `origin`
-
-Workflow:
-
-1. Check the current state:
+1. Inspect the repository state and current branch:
 
 ```bash
 git status --short --branch
 git branch --show-current
+git remote -v
 ```
 
-2. Choose the branch for this machine. Use `sync/machine-a` on the first machine and `sync/machine-b` on the second machine.
+2. Decide the target branch:
 
-3. Save all local changes onto that sync branch:
+- Use the current branch by default.
+- If the user names a branch, switch to it only when that is clearly requested.
+- If the branch does not exist and the user requested it, create it with `git switch -c <branch>`.
+
+3. Stage and commit all repository changes:
 
 ```bash
-git switch -c sync/machine-a
 git add -A
-git commit -m "Save local work from machine A"
-git fetch origin
-git push -u origin sync/machine-a
+git commit -m "<concise user-facing commit message>"
 ```
 
-For the second machine, use the same commands with `sync/machine-b`:
+If there are no staged changes, do not create an empty commit; report that there is nothing to commit.
+
+4. Push the committed branch:
 
 ```bash
-git switch -c sync/machine-b
-git add -A
-git commit -m "Save local work from machine B"
-git fetch origin
-git push -u origin sync/machine-b
+git push -u origin HEAD
 ```
 
-If the sync branch already exists locally, use `git switch sync/machine-a` or `git switch sync/machine-b` instead of `git switch -c ...`.
-
-Do not run `git reset --hard` or force push. If there are conflicts or an existing branch has diverged, stop and inspect with:
+5. Confirm the final state:
 
 ```bash
-git status
-git log --oneline --graph --decorate --all -n 30
+git status --short --branch
+git log --oneline --decorate -5
 ```
+
+## Safety Rules
+
+- Do not run `git reset --hard`, `git clean -fd`, `git checkout --`, or force push.
+- Do not discard user changes.
+- If push is rejected because the remote has new commits, stop and report that the pull-merge-upload workflow is needed.
+- If files are large, generated, or symlinks, still follow the user's "commit all changes" request unless repository policy clearly excludes them.
