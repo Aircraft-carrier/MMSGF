@@ -1,6 +1,11 @@
 
 # 从 t=0 开始的 Video → Geometry → Action 自回归生成与索引对照
 
+> 状态说明：本文保留的是旧 fixed-window `autoregressive_rollout` 的索引分析。
+> 该实现及 `distillation/rollout.py` 已删除；当前训练使用
+> `distillation/self_rollout/engine.py`，可视化位于
+> `distillation/self_rollout/artifacts.py`。
+
 本文模拟从初始状态 t=0 开始，执行：
 
 ~~~text
@@ -21,7 +26,7 @@
 
 ~~~text
 inference/mot_inference.py
-distillation/rollout.py
+distillation/self_rollout/engine.py
 wan_va/dataset/mot_dataset.py
 ~~~
 
@@ -1470,4 +1475,3 @@ rollout：
 ~~~
 
 因此，训练是单窗口 teacher forcing；推理/rollout 是按 chunk 进行的 feedback 式自回归生成。
-

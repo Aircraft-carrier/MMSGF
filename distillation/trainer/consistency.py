@@ -118,9 +118,13 @@ class ConsistencyTrainer(DistillationTrainerBase):
     @torch.no_grad()
     def _maybe_run_training_rollout(self, batch: dict, completed_step: int) -> None:
         interval = int(getattr(self.config.distill, "rollout_interval", 0))
-        if interval <= 0 or completed_step % interval != 0:
+        from distillation.self_rollout import (
+            rollout_artifact_due,
+            save_rollout_artifacts,
+        )
+
+        if not rollout_artifact_due(completed_step, interval):
             return
-        from distillation.rollout import save_rollout_artifacts
 
         rollout = self._run_rollout(batch)
         if self.config.rank != 0:

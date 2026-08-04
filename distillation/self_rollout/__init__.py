@@ -1,6 +1,7 @@
 """Distillation-owned incremental MOT rollout."""
 
 from .attention import TokenMetadataBatch, build_cache_visibility, segmented_orders
+from .artifacts import rollout_artifact_due, save_rollout_artifacts
 from .cache import KVSegment, SelfRolloutKVCache
 from .provider import (
     GroundTruthProvider,
@@ -36,5 +37,7 @@ __all__ = [
     "build_cache_visibility",
     "segmented_orders",
     "resolve_ground_truth_provider",
+    "rollout_artifact_due",
+    "save_rollout_artifacts",
     "self_rollout",
 ]

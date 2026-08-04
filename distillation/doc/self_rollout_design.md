@@ -1,5 +1,9 @@
 # Distillation `self_rollout` 设计方案
 
+> 当前状态：设计已由 `distillation/self_rollout/` 实现；旧的
+> `distillation/rollout.py` 已删除，可视化 artifact 导出迁移到
+> `distillation/self_rollout/artifacts.py`。
+
 ## 1. 目标
 
 当前 distillation rollout 通过 `inference/mot_inference.py:508` 的固定窗口推理完成：
@@ -817,12 +821,6 @@ SGF trajectory replay
 ## 14. 与 consistency trainer 的集成
 
 当前：
-
-```python
-from distillation.rollout import autoregressive_rollout
-```
-
-目标：
 
 ```python
 from distillation.self_rollout import self_rollout
@@ -1869,8 +1867,8 @@ AR / Consistency / SGF 同 profile checkpoint contract
 
 Consistency 和 SGF 的新执行路径均直接调用 `distillation.self_rollout`，不调用
 `autoregressive_rollout` 或 `inference.mot_inference.run_mot_inference`。旧
-`distillation/rollout.py` 仅保留兼容 artifact saver 和旧接口，不是新训练 rollout
-的依赖。
+`distillation/rollout.py` 已删除；Consistency 训练的周期采样可视化由
+`distillation/self_rollout/artifacts.py` 输出。
 
 CPU 验证覆盖 cache transaction、history block 反例、visibility、geometry 两套 K/V、
 phase 删除、GT continuation、provider frame mapping、stale version、generator 序列、

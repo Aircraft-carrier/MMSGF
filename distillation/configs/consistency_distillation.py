@@ -31,7 +31,8 @@ consistency_distillation_cfg.distill = EasyDict(
     action_aware_weight=0.01,
     # 仅在成功 student optimizer.step 后更新 EMA。
     ema_decay=0.9999,
-    rollout_interval=500,
+    # 每 100 个已完成的 optimizer step 用 EMA student 采样并保存可视化。
+    rollout_interval=100,
     rollout_video_num_steps=2,
     rollout_action_num_steps=2,
     # T0 是已知 anchor，默认逐帧生成 T1/T2/T3。
