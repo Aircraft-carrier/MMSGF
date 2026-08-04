@@ -255,21 +255,20 @@ class _AttentionEvent:
 
 
 class _VisibilityRecorder:
-    """Wrap the real geometry visibility builder and retain every layer call."""
+    """Record the dense reference implied by maskless cache selection."""
 
     def __init__(self) -> None:
         self.phase = "unassigned"
         self.events: list[_AttentionEvent] = []
-        self._real_build = geometry_cache_module.build_cache_visibility
+        self._real_build = geometry_cache_module.build_cache_selection
 
     def __call__(
         self,
         query: TokenMetadataBatch,
         key: TokenMetadataBatch,
-        *,
-        window_size: int,
-    ) -> torch.Tensor:
-        mask = self._real_build(query, key, window_size=window_size)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query_valid, key_valid = self._real_build(query, key)
+        mask = query_valid[:, :, None] & key_valid[:, None, :]
         kind = "joint_register" if query.batch_size == BATCH_SIZE else "relation"
         self.events.append(
             _AttentionEvent(
@@ -280,7 +279,7 @@ class _VisibilityRecorder:
                 mask=mask.detach().clone(),
             )
         )
-        return mask
+        return query_valid, key_valid
 
 
 @dataclass(frozen=True)
@@ -326,7 +325,7 @@ def _run_trace() -> _TraceResult:
 
     with patch.object(
         geometry_cache_module,
-        "build_cache_visibility",
+        "build_cache_selection",
         new=recorder,
     ):
         recorder.phase = "history.encode_geometry"

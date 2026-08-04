@@ -7,9 +7,9 @@ import torch
 from .attention import (
     NOISE_GEOMETRY,
     STREAM_GEOMETRY,
-    build_cache_visibility,
+    build_cache_selection,
     build_token_metadata,
-    incremental_attention,
+    indexed_attention,
 )
 from .cache import KVCacheSnapshot, KVSegment, SelfRolloutKVCache
 from .state import CacheSource, RolloutState
@@ -66,9 +66,9 @@ class GeometryRolloutCache:
 class GeometryIncrementalAdapter:
     """Encode geometry from committed and current-transaction G K/V.
 
-    History groups are intentionally encoded in one transaction, so their mask
-    is a full ``H x H`` square.  Anchor and rollout groups use one transaction
-    each, which produces the causal extension below::
+    History groups are intentionally encoded in one transaction, so their
+    visibility is a full ``H x H`` square.  Anchor and rollout groups use one
+    transaction each, which produces the causal extension below::
 
         history              anchor / rollout
         G0 G1 G2 G3          G0 G1 G2 G3 | G4 G5 ...
@@ -215,18 +215,29 @@ class GeometryIncrementalAdapter:
         cache.append_transaction(
             layer_id,
             transaction_id,
-            KVSegment(current_key, current_value, metadata),
+            KVSegment(
+                current_key,
+                current_value,
+                metadata,
+                stream_id=STREAM_GEOMETRY,
+            ),
         )
         key, value, key_meta = cache.materialize(
             layer_id,
             transaction_id=transaction_id,
+            stream_id=STREAM_GEOMETRY,
         )
-        mask = build_cache_visibility(
+        query_valid, key_valid = build_cache_selection(
             metadata,
             key_meta,
-            window_size=self.window_size,
         )
-        return incremental_attention(query, key, value, mask), mask.any(dim=-1)
+        return indexed_attention(
+            query,
+            key,
+            value,
+            query_valid=query_valid,
+            key_valid=key_valid,
+        )
 
     def _run_relation_attention(
         self,

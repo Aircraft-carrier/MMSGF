@@ -15,8 +15,8 @@ from .state import CacheSource, RolloutPhase, RolloutState
 
 
 def self_rollout(*args, **kwargs):
-    # Keep heavy model adapter imports lazy so cache/mask unit tests do not load
-    # optional model attention extensions.
+    # Keep heavy model adapter imports lazy so cache-policy unit tests do not
+    # load optional model attention extensions.
     from .engine import self_rollout as _self_rollout
 
     return _self_rollout(*args, **kwargs)

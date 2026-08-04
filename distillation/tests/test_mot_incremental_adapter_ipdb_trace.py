@@ -314,21 +314,20 @@ class _AttentionEvent:
 
 
 class _VisibilityRecorder:
-    """Wrap the real inference mask and retain every adapter-layer call."""
+    """Record the dense reference implied by maskless cache selection."""
 
     def __init__(self) -> None:
         self.phase = "unassigned"
         self.events: list[_AttentionEvent] = []
-        self._real_build = mot_adapter_module.build_cache_visibility
+        self._real_build = mot_adapter_module.build_cache_selection
 
     def __call__(
         self,
         query: TokenMetadataBatch,
         key: TokenMetadataBatch,
-        *,
-        window_size: int,
-    ) -> torch.Tensor:
-        mask = self._real_build(query, key, window_size=window_size)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query_valid, key_valid = self._real_build(query, key)
+        mask = query_valid[:, :, None] & key_valid[:, None, :]
         self.events.append(
             _AttentionEvent(
                 phase=self.phase,
@@ -337,7 +336,7 @@ class _VisibilityRecorder:
                 mask=mask.detach().clone(),
             )
         )
-        return mask
+        return query_valid, key_valid
 
 
 @dataclass(frozen=True)
@@ -415,17 +414,22 @@ def _commit_geometry_groups_stub(
         state.mot_cache.append_transaction(
             layer_id,
             transaction_id,
-            KVSegment(key, key + 0.5, metadata),
+            KVSegment(
+                key,
+                key + 0.5,
+                metadata,
+                stream_id=STREAM_GEOMETRY,
+            ),
         )
         materialized_key, _value, key_metadata = state.mot_cache.materialize(
             layer_id,
             transaction_id=transaction_id,
+            stream_id=STREAM_GEOMETRY,
         )
         del materialized_key
-        mot_adapter_module.build_cache_visibility(
+        mot_adapter_module.build_cache_selection(
             metadata,
             key_metadata,
-            window_size=16,
         )
     state.mot_cache.commit_transaction(transaction_id, source_id=int(source))
 
@@ -453,7 +457,7 @@ def _run_trace() -> _TraceResult:
 
     with patch.object(
         mot_adapter_module,
-        "build_cache_visibility",
+        "build_cache_selection",
         new=recorder,
     ):
         recorder.phase = "history.commit_video"

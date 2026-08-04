@@ -13,6 +13,7 @@ class KVSegment:
     key: torch.Tensor
     value: torch.Tensor
     metadata: TokenMetadataBatch
+    stream_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.key.shape != self.value.shape:
@@ -82,6 +83,7 @@ class SelfRolloutKVCache:
         layer_id: int,
         *,
         transaction_id: int | None = None,
+        stream_id: int | None = None,
         batch_size: int | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
@@ -93,6 +95,31 @@ class SelfRolloutKVCache:
             parts.extend(
                 self._transactions.get(int(transaction_id), {}).get(int(layer_id), ())
             )
+        if stream_id is not None:
+            selected_parts = []
+            for part in parts:
+                if part.stream_id is not None:
+                    if int(part.stream_id) == int(stream_id):
+                        selected_parts.append(part)
+                    continue
+                matches = part.metadata.stream_ids == int(stream_id)
+                if not bool((matches == matches[:1]).all().item()):
+                    raise ValueError("stream selection must be batch-invariant")
+                columns = matches[0]
+                if not bool(columns.any().item()):
+                    continue
+                if bool(columns.all().item()):
+                    selected_parts.append(part)
+                    continue
+                selected_parts.append(
+                    KVSegment(
+                        part.key[:, columns],
+                        part.value[:, columns],
+                        part.metadata.select(columns),
+                        stream_id=int(stream_id),
+                    )
+                )
+            parts = selected_parts
         if parts:
             return (
                 torch.cat([part.key for part in parts], dim=1),
@@ -123,6 +150,7 @@ class SelfRolloutKVCache:
                         segment.key,
                         segment.value,
                         segment.metadata.as_committed(source_id=source_id),
+                        stream_id=segment.stream_id,
                     ),
                 )
 
@@ -139,6 +167,7 @@ class SelfRolloutKVCache:
                 segment.key[:, keep],
                 segment.value[:, keep],
                 segment.metadata.select(keep),
+                stream_id=segment.stream_id,
             )
 
         def truncate_segments(segments: list[KVSegment]) -> list[KVSegment]:

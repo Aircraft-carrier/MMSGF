@@ -17,9 +17,9 @@ from .attention import (
     STREAM_ACTION,
     STREAM_VIDEO,
     TokenMetadataBatch,
-    build_cache_visibility,
+    build_cache_selection,
     build_token_metadata,
-    incremental_attention,
+    indexed_attention,
 )
 from .cache import KVSegment
 from .state import CacheSource, RolloutState
@@ -319,6 +319,16 @@ class MOTIncrementalAdapter:
             raise ValueError("all streams must share a batch size")
         text = self._text(text_emb, batch_size)
         hidden_states = [stream.hidden for stream in streams]
+        current_meta = (
+            streams[0].metadata
+            if len(streams) == 1
+            else TokenMetadataBatch.cat([stream.metadata for stream in streams])
+        )
+        current_stream_id = None
+        if all(stream.block_kind == "video" for stream in streams):
+            current_stream_id = STREAM_VIDEO
+        elif all(stream.block_kind == "action" for stream in streams):
+            current_stream_id = STREAM_ACTION
         for layer_id, mot_block in enumerate(self.model.mot_blocks):
             qkv_parts = []
             modulations = []
@@ -343,24 +353,31 @@ class MOTIncrementalAdapter:
             query, current_key, current_value = (
                 torch.cat(parts, dim=1) for parts in zip(*qkv_parts)
             )
-            current_meta = TokenMetadataBatch.cat(
-                [stream.metadata for stream in streams]
-            )
             state.mot_cache.append_transaction(
                 layer_id,
                 transaction_id,
-                KVSegment(current_key, current_value, current_meta),
+                KVSegment(
+                    current_key,
+                    current_value,
+                    current_meta,
+                    stream_id=current_stream_id,
+                ),
             )
             key, value, key_meta = state.mot_cache.materialize(
                 layer_id,
                 transaction_id=transaction_id,
             )
-            mask = build_cache_visibility(
+            query_valid, key_valid = build_cache_selection(
                 current_meta,
                 key_meta,
-                window_size=self.window_size,
             )
-            attended = incremental_attention(query, key, value, mask)
+            attended, _visible = indexed_attention(
+                query,
+                key,
+                value,
+                query_valid=query_valid,
+                key_valid=key_valid,
+            )
             lengths = [stream.hidden.shape[1] for stream in streams]
             attended_parts = torch.split(attended, lengths, dim=1)
 

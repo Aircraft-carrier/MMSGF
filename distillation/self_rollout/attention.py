@@ -1,12 +1,14 @@
 """Distillation-owned attention metadata and visibility for ``self_rollout``.
 
 This module intentionally has no dependency on ``wan_va.modules`` so cache and
-mask semantics can be tested on CPU without importing optional FlashAttention
-extensions.  The integer constants mirror ``wan_va.modules.mot_attention``.
+visibility semantics can be tested on CPU without importing optional
+FlashAttention extensions.  The integer constants mirror
+``wan_va.modules.mot_attention``.
 
-The rollout mask is rectangular: rows are the current query transaction and
-columns are committed K/V followed by the current transaction.  With ``1`` as
-visible and ``.`` as masked, the stream-level rule is::
+The dense reference is rectangular: rows are the current query transaction and
+columns are committed K/V followed by the current transaction.  Runtime
+rollout selects the readable cache segments first and executes maskless SDPA.
+With ``1`` as visible and ``.`` as masked, the stream-level rule is::
 
                      K: committed X  committed G  current X  current G
         Q: current X          1            1           1          1
@@ -370,6 +372,92 @@ def build_cache_visibility(
         & readable
     )
     return base & (geometry_relation | x_relation)
+
+
+def build_cache_selection(
+    query: TokenMetadataBatch,
+    key: TokenMetadataBatch,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return separable query/key validity for an already selected cache."""
+
+    if query.batch_size != key.batch_size:
+        raise ValueError("query/key batch sizes must match")
+    if query.device != key.device:
+        raise ValueError("query/key metadata must be on the same device")
+    query_valid = (query.seq_ids >= 0) & query.valid_ids
+    if key.seq_len == 0:
+        key_valid = torch.zeros(
+            (query.batch_size, 0),
+            dtype=torch.bool,
+            device=query.device,
+        )
+    else:
+        key_valid = (
+            (key.seq_ids == query.seq_ids[:, :1])
+            & (key.seq_ids >= 0)
+            & key.valid_ids
+        )
+    return query_valid, key_valid
+
+
+def indexed_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    query_valid: torch.Tensor,
+    key_valid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run maskless SDPA after compacting invalid query/key rows."""
+
+    if key.shape != value.shape:
+        raise ValueError("key and value shapes must match")
+    if tuple(query_valid.shape) != tuple(query.shape[:2]):
+        raise ValueError("query_valid must match query [B,Q]")
+    if tuple(key_valid.shape) != tuple(key.shape[:2]):
+        raise ValueError("key_valid must match key [B,K]")
+    if query_valid.dtype != torch.bool or key_valid.dtype != torch.bool:
+        raise TypeError("query_valid and key_valid must be bool")
+
+    visible = query_valid & key_valid.any(dim=-1, keepdim=True)
+    if key.shape[1] == 0:
+        return torch.zeros_like(query), visible
+
+    all_valid = bool((query_valid.all() & key_valid.all()).item())
+    if all_valid:
+        output = torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attn_mask=None,
+        ).transpose(1, 2)
+        return output, visible
+
+    outputs = []
+    for batch_index in range(query.shape[0]):
+        query_indices = query_valid[batch_index].nonzero(as_tuple=False).flatten()
+        key_indices = key_valid[batch_index].nonzero(as_tuple=False).flatten()
+        batch_output = torch.zeros_like(query[batch_index : batch_index + 1])
+        if query_indices.numel() == 0 or key_indices.numel() == 0:
+            outputs.append(batch_output)
+            continue
+        selected_query = query[batch_index : batch_index + 1].index_select(
+            1,
+            query_indices,
+        )
+        selected_key = key[batch_index : batch_index + 1].index_select(1, key_indices)
+        selected_value = value[batch_index : batch_index + 1].index_select(
+            1,
+            key_indices,
+        )
+        selected_output = torch.nn.functional.scaled_dot_product_attention(
+            selected_query.transpose(1, 2),
+            selected_key.transpose(1, 2),
+            selected_value.transpose(1, 2),
+            attn_mask=None,
+        ).transpose(1, 2)
+        outputs.append(batch_output.index_copy(1, query_indices, selected_output))
+    return torch.cat(outputs, dim=0), visible
 
 
 def incremental_attention(
