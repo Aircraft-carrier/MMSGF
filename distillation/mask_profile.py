@@ -18,7 +18,9 @@ else:
 # Mirrors wan_va.modules.mot_attention without importing optional model modules.
 STREAM_ACTION = 1
 PROFILE_NAME = "segmented_history_strict_geometry_v1"
-PROFILE_VERSION = 1
+# Version 2 changes G->G from strict frame history to segmented order-causal
+# visibility.  Old checkpoints must not silently reuse the new topology.
+PROFILE_VERSION = 2
 
 
 def generation_profile_contract(generation_shape: Any) -> dict[str, Any]:
@@ -29,7 +31,7 @@ def generation_profile_contract(generation_shape: Any) -> dict[str, Any]:
         "history_frames": int(generation_shape.get("history_frames", 4)),
         "chunk_size": int(generation_shape["chunk_size"]),
         "window_size": int(generation_shape["window_size"]),
-        "geometry_relation": "strict_frame_history",
+        "geometry_relation": "segmented_order_causal",
         "x_to_g_relation": "strict_order",
     }
 
@@ -100,11 +102,6 @@ def install_order_profile(model: Any, generation_shape: Any) -> None:
     if order_mode != "segmented":
         return
     if getattr(model, "_distillation_order_profile", None) == order_mode:
-        from distillation.self_rollout.training_policy import (
-            install_training_attention_policy,
-        )
-
-        install_training_attention_policy(model, generation_shape)
         return
 
     original_prepare_metadata = model._prepare_metadata
@@ -133,9 +130,3 @@ def install_order_profile(model: Any, generation_shape: Any) -> None:
 
     model._prepare_metadata = prepare_metadata
     model._distillation_order_profile = order_mode
-
-    from distillation.self_rollout.training_policy import (
-        install_training_attention_policy,
-    )
-
-    install_training_attention_policy(model, generation_shape)

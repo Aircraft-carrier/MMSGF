@@ -1,4 +1,4 @@
-"""Visualize default X-only and joint MOT masks as split-color PNGs.
+"""Visualize AR and consistency training masks as split-color PNGs.
 
 Run directly from the repository root to regenerate the checked artifact:
 
@@ -11,9 +11,13 @@ upper-right triangle uses the key token color.  White cells are masked.
  X-only:
       NV 8 + CV 8 + NA 8 + CA 8
 
-Joint:
+Joint MOT:
     NV 8 + CV 8 + G 8 + NA 8 + CA 8
 
+Both stages currently install ``segmented_history_strict_geometry_v1`` and
+therefore use identical native ``wan_va`` training masks.  History geometry
+shares one mutually visible order group; anchor and later geometry groups can
+read all earlier groups plus their own group.
 """
 
 from pathlib import Path
@@ -45,14 +49,17 @@ from wan_va.modules.mot_attention import (
     build_mot_metadata,
     build_x_metadata,
 )
-from distillation.self_rollout.attention import segmented_orders
+from distillation.configs.autoregressive_training import (
+    autoregressive_training_cfg,
+)
+from distillation.configs.consistency_distillation import (
+    consistency_distillation_cfg,
+)
+from distillation.mask_profile import _apply_segmented_order
 
 
 DEFAULT_BATCH_SIZE = 1
 DEFAULT_NUM_FRAMES = 8
-DEFAULT_HISTORY_FRAMES = 4
-DEFAULT_CHUNK_SIZE = 4
-DEFAULT_WINDOW_SIZE = 10
 TOKENS_PER_FRAME = 1
 
 TOKEN_COLORS = {
@@ -66,93 +73,80 @@ MASKED_COLOR = (255, 255, 255)
 GRID_COLOR = (209, 213, 219)
 TEXT_COLOR = (31, 41, 55)
 
-X_ARTIFACT_PATH = (
-    Path(__file__).resolve().parent
-    / "artifacts"
-    / "build_x_metadata_dense_mask.png"
-)
-MOT_ARTIFACT_PATH = (
-    Path(__file__).resolve().parent
-    / "artifacts"
-    / "build_mot_metadata_dense_mask.png"
-)
+ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"
+AR_X_ARTIFACT_PATH = ARTIFACT_DIR / "ar_training_x_mask.png"
+AR_MOT_ARTIFACT_PATH = ARTIFACT_DIR / "ar_training_mot_mask.png"
+CONSISTENCY_X_ARTIFACT_PATH = ARTIFACT_DIR / "consistency_training_x_mask.png"
+CONSISTENCY_MOT_ARTIFACT_PATH = ARTIFACT_DIR / "consistency_training_mot_mask.png"
 
-def build_x_metadata4sgf() -> MOTMaskMetadata:
-    """Build the X-only metadata with the two-stage SGF order."""
+
+def build_x_training_metadata(generation_shape) -> MOTMaskMetadata:
+    """Build X-only metadata exactly as the configured training profile does."""
+
+    chunk_size = int(generation_shape["chunk_size"])
     metadata = build_x_metadata(
         batch_size=DEFAULT_BATCH_SIZE,
         video_tokens_per_frame=TOKENS_PER_FRAME,
         action_tokens_per_frame=TOKENS_PER_FRAME,
         num_frames=DEFAULT_NUM_FRAMES,
-        chunk_size=DEFAULT_CHUNK_SIZE,
-        window_size=DEFAULT_WINDOW_SIZE,
+        chunk_size=chunk_size,
+        window_size=int(generation_shape["window_size"]),
         device=torch.device("cpu"),
     )
-    video_order, action_order = _build_sgf_orders(
-        num_frames=DEFAULT_NUM_FRAMES,
-        chunk_size=DEFAULT_CHUNK_SIZE,
-        device=metadata.device,
+    return _apply_segmented_order(
+        metadata,
+        history_frames=int(generation_shape.get("history_frames", 4)),
+        chunk_size=chunk_size,
     )
-    metadata.order_ids = torch.cat(
-        [video_order, video_order, action_order, action_order], dim=1
-    )
-    metadata.cache_key = None
-    metadata.structure_cache_key = None
-    return metadata
 
 
-def build_mot_metadata4sgf() -> MOTMaskMetadata:
-    """Build the joint V/G/A metadata with the two-stage SGF order."""
+def build_mot_training_metadata(generation_shape) -> MOTMaskMetadata:
+    """Build joint V/G/A metadata as the configured training profile does."""
+
+    chunk_size = int(generation_shape["chunk_size"])
     metadata = build_mot_metadata(
         batch_size=DEFAULT_BATCH_SIZE,
         video_tokens_per_frame=TOKENS_PER_FRAME,
         geometry_tokens_per_frame=TOKENS_PER_FRAME,
         action_tokens_per_frame=TOKENS_PER_FRAME,
         num_frames=DEFAULT_NUM_FRAMES,
-        chunk_size=DEFAULT_CHUNK_SIZE,
-        window_size=DEFAULT_WINDOW_SIZE,
+        chunk_size=chunk_size,
+        window_size=int(generation_shape["window_size"]),
         device=torch.device("cpu"),
     )
-    video_order, action_order = _build_sgf_orders(
-        num_frames=DEFAULT_NUM_FRAMES,
-        chunk_size=DEFAULT_CHUNK_SIZE,
-        device=metadata.device,
-    )
-    metadata.order_ids = torch.cat(
-        [video_order, video_order, video_order, action_order, action_order], dim=1
-    )
-
-    metadata.cache_key = None
-    metadata.structure_cache_key = None
-    return metadata
-
-
-def _build_sgf_orders(
-    *, num_frames: int, chunk_size: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return SGF video/geometry and action clocks for one frame sequence."""
-    video_order = segmented_orders(
-        torch.arange(num_frames, device=device),
-        history_frames=DEFAULT_HISTORY_FRAMES,
+    return _apply_segmented_order(
+        metadata,
+        history_frames=int(generation_shape.get("history_frames", 4)),
         chunk_size=chunk_size,
     )
-    action_order = video_order + 1
-    return video_order[None, :], action_order[None, :]
 
 
+def build_dense_training_mask(
+    metadata: MOTMaskMetadata,
+) -> torch.Tensor:
+    """Build the dense reference mask used by native ``wan_va`` training."""
 
-def build_default_x_metadata_and_mask() -> tuple[MOTMaskMetadata, torch.Tensor]:
-    """Build the configured 8-frame X-only mask with one V/A token per frame."""
-
-    metadata = build_x_metadata4sgf()
-    return metadata, build_dense_mot_mask(metadata)[0]
+    return build_dense_mot_mask(metadata)
 
 
-def build_default_mot_metadata_and_mask() -> tuple[MOTMaskMetadata, torch.Tensor]:
-    """Build the configured training-time 8-frame joint MOT mask."""
+def build_training_metadata_and_masks(
+    generation_shape,
+) -> tuple[
+    MOTMaskMetadata,
+    torch.Tensor,
+    MOTMaskMetadata,
+    torch.Tensor,
+]:
+    """Return X-only and joint metadata/masks for one training configuration."""
 
-    metadata = build_mot_metadata4sgf()
-    return metadata, build_dense_mot_mask(metadata)[0]
+    x_metadata = build_x_training_metadata(generation_shape)
+    mot_metadata = build_mot_training_metadata(generation_shape)
+    return (
+        x_metadata,
+        build_dense_training_mask(x_metadata)[0],
+        mot_metadata,
+        build_dense_training_mask(mot_metadata)[0],
+    )
 
 
 def render_metadata_mask(
@@ -335,58 +329,104 @@ def _draw_rotated_label(
     image.paste(label, (center_x - label.width // 2, top), label)
 
 
-def test_visualize_default_x_metadata_mask(tmp_path):
-    metadata, mask = build_default_x_metadata_and_mask()
+def test_visualize_ar_training_masks(tmp_path):
+    metadata = build_training_metadata_and_masks(
+        autoregressive_training_cfg.distill.generation_shape
+    )
+    _assert_training_mask_semantics(*metadata)
 
-    assert tuple(mask.shape) == (32, 32)
+    x_output = render_metadata_mask(
+        metadata[0],
+        metadata[1],
+        tmp_path / "ar_training_x_mask.png",
+        title="AR training X-only attention mask",
+    )
+    mot_output = render_metadata_mask(
+        metadata[2],
+        metadata[3],
+        tmp_path / "ar_training_mot_mask.png",
+        title="AR training joint V/G/A attention mask",
+    )
+    _assert_png_colors(x_output, {"NV", "CV", "NA", "CA"})
+    _assert_png_colors(mot_output, {"NV", "CV", "G", "NA", "CA"})
+
+
+def test_visualize_consistency_training_masks(tmp_path):
+    metadata = build_training_metadata_and_masks(
+        consistency_distillation_cfg.distill.generation_shape
+    )
+    _assert_training_mask_semantics(*metadata)
+
+    x_output = render_metadata_mask(
+        metadata[0],
+        metadata[1],
+        tmp_path / "consistency_training_x_mask.png",
+        title="Consistency training X-only attention mask",
+    )
+    mot_output = render_metadata_mask(
+        metadata[2],
+        metadata[3],
+        tmp_path / "consistency_training_mot_mask.png",
+        title="Consistency training joint V/G/A attention mask",
+    )
+    _assert_png_colors(x_output, {"NV", "CV", "NA", "CA"})
+    _assert_png_colors(mot_output, {"NV", "CV", "G", "NA", "CA"})
+
+
+def test_ar_and_consistency_training_masks_are_identical():
+    ar = build_training_metadata_and_masks(
+        autoregressive_training_cfg.distill.generation_shape
+    )
+    consistency = build_training_metadata_and_masks(
+        consistency_distillation_cfg.distill.generation_shape
+    )
+
+    assert torch.equal(ar[0].order_ids, consistency[0].order_ids)
+    assert torch.equal(ar[1], consistency[1])
+    assert torch.equal(ar[2].order_ids, consistency[2].order_ids)
+    assert torch.equal(ar[3], consistency[3])
+
+
+def _assert_training_mask_semantics(
+    x_metadata: MOTMaskMetadata,
+    x_mask: torch.Tensor,
+    mot_metadata: MOTMaskMetadata,
+    mot_mask: torch.Tensor,
+) -> None:
     expected_video_order = [0, 0, 0, 0, 2, 4, 6, 8]
     expected_action_order = [1, 1, 1, 1, 3, 5, 7, 9]
-    assert metadata.order_ids[0, :8].tolist() == expected_video_order
-    assert metadata.order_ids[0, 16:24].tolist() == expected_action_order
-    assert bool(mask[0, 0])
-    assert not bool(mask[0, 4])
-    assert not bool(mask[8, 4])
-    assert not bool(mask[8, 12])
 
-    output_path = render_metadata_mask(
-        metadata,
-        mask,
-        tmp_path / "x_mask.png",
-        title="X-only MOT dense attention mask",
-    )
-    _assert_png_colors(output_path, {"NV", "CV", "NA", "CA"})
+    assert tuple(x_mask.shape) == (32, 32)
+    assert x_metadata.order_ids[0, :8].tolist() == expected_video_order
+    assert x_metadata.order_ids[0, 16:24].tolist() == expected_action_order
 
+    # X-only packing: NV[0:8], CV[8:16], NA[16:24], CA[24:32].
+    assert bool(x_mask[0, 0])
+    assert bool(x_mask[0, 3])
+    assert not bool(x_mask[0, 8])
+    assert bool(x_mask[4, 8])
+    assert bool(x_mask[8, 11])
+    assert bool(x_mask[16, 8])
 
-def test_visualize_default_mot_metadata_mask(tmp_path):
-    metadata, mask = build_default_mot_metadata_and_mask()
+    assert tuple(mot_mask.shape) == (40, 40)
+    assert mot_metadata.order_ids[0, 16:24].tolist() == expected_video_order
 
-    assert tuple(mask.shape) == (40, 40)
-    assert metadata.order_ids[0, 16:24].tolist() == [0, 0, 0, 0, 2, 4, 6, 8]
-    assert not bool(mask[0, 8])
-    assert bool(mask[12, 8])
-    assert bool(mask[12, 16])
-    assert bool(mask[8, 9])
-    assert not bool(mask[8, 0])
-    assert bool(mask[16, 16])
-    assert bool(mask[16, 17])
-    assert bool(mask[20, 19])
-
-    geometry = mask[16:24, 16:24]
+    # Joint packing: NV[0:8], CV[8:16], G[16:24], NA[24:32], CA[32:40].
+    geometry = mot_mask[16:24, 16:24]
+    # History G0..G3 is one order group, so visibility is bidirectional.
     assert bool(geometry[:4, :4].all())
     assert not bool(geometry[:4, 4:].any())
-    for frame in range(4, 8):
+    # Anchor G4 and each later target are separate groups: past + self only.
+    for frame in range(4, DEFAULT_NUM_FRAMES):
         assert bool(geometry[frame, : frame + 1].all())
         assert not bool(geometry[frame, frame + 1 :].any())
-    assert not bool(mask[16:24, :16].any())
-    assert not bool(mask[16:24, 24:].any())
+    assert not bool(mot_mask[16:24, :16].any())
+    assert not bool(mot_mask[16:24, 24:].any())
 
-    output_path = render_metadata_mask(
-        metadata,
-        mask,
-        tmp_path / "mot_mask.png",
-        title="Joint V/A/G MOT dense attention mask",
-    )
-    _assert_png_colors(output_path, {"NV", "CV", "G", "NA", "CA"})
+    assert not bool(mot_mask[0, 16])
+    assert bool(mot_mask[4, 16])
+    assert not bool(mot_mask[4, 20])
+    assert bool(mot_mask[24, 16])
 
 
 def _assert_png_colors(output_path: Path, expected_kinds: set[str]) -> None:
@@ -405,19 +445,37 @@ def _assert_png_colors(output_path: Path, expected_kinds: set[str]) -> None:
 # 直接在终端运行的生成指令：
 # PYTHONPATH=. python distillation/tests/test_visualize_x_metadata_mask.py
 if __name__ == "__main__":
-    x_meta, x_dense_mask = build_default_x_metadata_and_mask()
-    x_saved_path = render_metadata_mask(
-        x_meta,
-        x_dense_mask,
-        X_ARTIFACT_PATH,
-        title="X-only MOT dense attention mask",
+    stages = (
+        (
+            "AR training",
+            autoregressive_training_cfg.distill.generation_shape,
+            AR_X_ARTIFACT_PATH,
+            AR_MOT_ARTIFACT_PATH,
+        ),
+        (
+            "Consistency training",
+            consistency_distillation_cfg.distill.generation_shape,
+            CONSISTENCY_X_ARTIFACT_PATH,
+            CONSISTENCY_MOT_ARTIFACT_PATH,
+        ),
     )
-    mot_meta, mot_dense_mask = build_default_mot_metadata_and_mask()
-    mot_saved_path = render_metadata_mask(
-        mot_meta,
-        mot_dense_mask,
-        MOT_ARTIFACT_PATH,
-        title="Joint V/A/G MOT dense attention mask",
-    )
-    print(x_saved_path)
-    print(mot_saved_path)
+    for stage_name, generation_shape, x_path, mot_path in stages:
+        x_meta, x_mask, mot_meta, mot_mask = build_training_metadata_and_masks(
+            generation_shape
+        )
+        print(
+            render_metadata_mask(
+                x_meta,
+                x_mask,
+                x_path,
+                title=f"{stage_name} X-only attention mask",
+            )
+        )
+        print(
+            render_metadata_mask(
+                mot_meta,
+                mot_mask,
+                mot_path,
+                title=f"{stage_name} joint V/G/A attention mask",
+            )
+        )
