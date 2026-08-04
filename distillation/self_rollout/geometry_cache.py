@@ -468,6 +468,8 @@ class GeometryIncrementalAdapter:
         transaction_id = state.new_transaction_id()
         state_snapshot = state.mot_cache.snapshot()
         geometry_snapshot = geometry_cache.snapshot()
+        # [B,G,S,V,3,H,W] -> [B, F, 3, H, W] -> [B*F, (H/patch_size)*(W/patch_size), embed_dim] 
+        # -> [B, F, patch_tokens, embed_dim] -> [B, F, patch_tokens + register_tokens, embed_dim]
         geometry_state = self.vggto.encode_grouped(rgb, slot_valid_mask=slot_valid_mask)
         tokens = geometry_state.tokens
         cached_outputs: list[torch.Tensor | None] = [None] * self.vggto.depth
@@ -478,7 +480,7 @@ class GeometryIncrementalAdapter:
                     tokens,
                     geometry_state.patch_hw,
                     layer_id,
-                )
+                ) # [B, F, L, D] -> [B*F, L, D]  frame token interaction
                 if layer_id in self.vggto.register_attention_indices:
                     registers = frame_tokens[:, :, : self.vggto.patch_start_idx]
                     layer_registers[layer_id] = registers.contiguous()
@@ -508,7 +510,7 @@ class GeometryIncrementalAdapter:
                         group_size=slots,
                         views=views,
                         slot_valid_mask=slot_valid_mask,
-                    )
+                    ) # [B, G, S, V, L, D] -> [B*G*S, V*L, D]  cross-view token interaction
                     tokens = self._run_relation_attention(
                         grouped,
                         patch_hw=geometry_state.patch_hw,
@@ -519,7 +521,7 @@ class GeometryIncrementalAdapter:
                         source=source,
                         version_id=version_id,
                         cache=geometry_cache,
-                    )
+                    ) # [B*G*S, V*L, D] -> [B*V, G*S*L, D]  relation token interaction
                     if layer_id in self.vggto.cached_layer_set:
                         cached_outputs[layer_id] = torch.cat(
                             [frame_tokens, tokens],
