@@ -161,11 +161,11 @@ def _g_to_g(meta: MOTMaskMetadata, q_idx, kv_idx):
 def _x_to_g(meta: MOTMaskMetadata, q_idx, kv_idx):
     """Visibility from LingBot VA/action queries into VGGTO geometry keys.
 
-    G shares clean video's position in the LingBot causal order. Therefore noisy
-    queries can read only strict-past G by order id, while clean queries can read
-    current/past G. Because action order is odd and video/G order is even, code
-    `NA1` reads `G0/G1`; this is the same dataset-offset inverse-dynamics
-    convention described in `_x_to_x`.
+    G shares clean video's position in the LingBot causal order. X queries read
+    only strict-past G by order id to avoid current-geometry leakage. Because
+    action order is odd and video/G order is even, code `NA1` reads `G0/G1`;
+    this is the same dataset-offset inverse-dynamics convention described in
+    `_x_to_x`.
     """
 
     q_noise = meta.noise_ids[:, q_idx]
@@ -487,7 +487,7 @@ def create_flex_mot_block_mask(meta: MOTMaskMetadata, compile: Optional[bool] = 
         x_to_x = x_query & x_key & (clean_to_clean | noisy_to_clean | noisy_to_noisy)
 
         g_to_g = g_query & g_key & (k_order <= q_order)
-        clean_to_g = x_query & g_key & (q_noise == NOISE_CLEAN) & (k_order <= q_order)
+        clean_to_g = x_query & g_key & (q_noise == NOISE_CLEAN) & (k_order < q_order)
         noisy_to_g = x_query & g_key & (q_noise == NOISE_NOISY) & (k_order < q_order)
         return valid & (x_to_x | g_to_g | clean_to_g | noisy_to_g)
 

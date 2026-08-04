@@ -213,7 +213,7 @@ def _cute_mot_mask():
 
         # G is self-contained and uses the same chunk-causal clock as VA.
         g_to_g = g_query & g_key & (k_order <= q_order)
-        clean_to_g = x_query & g_key & (q_noise == cutlass.Int32(NOISE_CLEAN)) & (k_order <= q_order)
+        clean_to_g = x_query & g_key & (q_noise == cutlass.Int32(NOISE_CLEAN)) & (k_order < q_order)
         noisy_to_g = x_query & g_key & (q_noise == cutlass.Int32(NOISE_NOISY)) & (k_order < q_order)
         return valid & (x_to_x | g_to_g | clean_to_g | noisy_to_g)
 
@@ -254,7 +254,7 @@ def _mot_flex_mask_mod(meta: Any):
         noisy_to_noisy = (q_noise == NOISE_NOISY) & (k_noise == NOISE_NOISY) & (k_order == q_order)
         x_to_x = x_query & x_key & (clean_to_clean | noisy_to_clean | noisy_to_noisy)
         g_to_g = g_query & g_key & (k_order <= q_order)
-        clean_to_g = x_query & g_key & (q_noise == NOISE_CLEAN) & (k_order <= q_order)
+        clean_to_g = x_query & g_key & (q_noise == NOISE_CLEAN) & (k_order < q_order)
         noisy_to_g = x_query & g_key & (q_noise == NOISE_NOISY) & (k_order < q_order)
         return valid & (x_to_x | g_to_g | clean_to_g | noisy_to_g)
 
