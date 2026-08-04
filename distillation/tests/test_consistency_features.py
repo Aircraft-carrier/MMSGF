@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from distillation.configs.consistency_distillation import consistency_distillation_cfg
@@ -10,6 +11,7 @@ from distillation.scheduler import (
     sample_consistency_timesteps,
 )
 from distillation.schema import VAPrediction, VATimesteps
+from distillation.self_rollout.provider import resolve_ground_truth_provider
 
 
 class _Scheduler:
@@ -25,7 +27,18 @@ def test_consistency_stage_defaults_enable_cfg_normalization_and_periodic_rollou
     assert config.distill.rollout_interval == 500
     assert config.distill.rollout_video_num_steps == 2
     assert config.distill.rollout_action_num_steps == 2
-    assert config.distill.rollout_chunk_pairs == 1
+    assert config.distill.rollout_horizon_frames == 3
+    assert config.distill.rollout_gt_mode == "none"
+
+
+def test_consistency_provider_mode_requires_explicit_provider() -> None:
+    with pytest.raises(ValueError, match="explicit ground_truth_provider"):
+        resolve_ground_truth_provider("provider", {})
+
+
+def test_consistency_provider_mode_forwards_provider() -> None:
+    provider = object()
+    assert resolve_ground_truth_provider("provider", {}, provider) is provider
 
 
 def test_video_consistency_prediction_uses_flash_wam_boundary_scaling() -> None:

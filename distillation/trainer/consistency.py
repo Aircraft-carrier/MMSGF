@@ -71,10 +71,20 @@ class ConsistencyTrainer(DistillationTrainerBase):
         return decoded.to(device=latents.device, dtype=latents.dtype)
 
     @torch.no_grad()
-    def _run_rollout(self, batch: dict):
-        from distillation.rollout import autoregressive_rollout
+    def _run_rollout(self, batch: dict, ground_truth_provider=None):
+        from distillation.self_rollout import (
+            resolve_ground_truth_provider,
+            self_rollout,
+        )
 
-        return autoregressive_rollout(
+        gt_mode = str(getattr(self.config.distill, "rollout_gt_mode", "none"))
+        ground_truth_provider = resolve_ground_truth_provider(
+            gt_mode,
+            batch,
+            ground_truth_provider,
+        )
+
+        return self_rollout(
             batch,
             transformer=self.method_model.ema_student,
             config=self.config,
@@ -84,15 +94,26 @@ class ConsistencyTrainer(DistillationTrainerBase):
             decode_latents_to_rgb_views=self._decode_rollout_latents,
             video_num_steps=int(self.config.distill.rollout_video_num_steps),
             action_num_steps=int(self.config.distill.rollout_action_num_steps),
-            chunk_pairs=int(self.config.distill.rollout_chunk_pairs),
+            rollout_frames=int(self.config.distill.rollout_horizon_frames),
+            ground_truth_provider=ground_truth_provider,
+            replacement_policy=str(
+                getattr(
+                    self.config.distill,
+                    "rollout_replacement_policy",
+                    "require_ground_truth",
+                )
+            ),
         )
 
     @torch.no_grad()
-    def rollout(self, batch: dict):
+    def rollout(self, batch: dict, *, ground_truth_provider=None):
         """Run the configured EMA-student rollout for a caller-provided batch."""
         batch = self.convert_input_format(batch)
         batch = self._materialize_batch_latents(batch)
-        return self._run_rollout(batch)
+        return self._run_rollout(
+            batch,
+            ground_truth_provider=ground_truth_provider,
+        )
 
     @torch.no_grad()
     def _maybe_run_training_rollout(self, batch: dict, completed_step: int) -> None:

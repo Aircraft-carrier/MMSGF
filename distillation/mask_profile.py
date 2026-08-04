@@ -1,41 +1,81 @@
 """Distillation-only attention order profiles."""
 from __future__ import annotations
 
-from typing import Any
+import json
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
 
 import torch
 
-from wan_va.modules.mot_attention import STREAM_ACTION, MOTMaskMetadata
+from distillation.self_rollout.attention import segmented_orders
+
+if TYPE_CHECKING:
+    from wan_va.modules.mot_attention import MOTMaskMetadata
+else:
+    MOTMaskMetadata = Any
+
+
+# Mirrors wan_va.modules.mot_attention without importing optional model modules.
+STREAM_ACTION = 1
+PROFILE_NAME = "segmented_history_strict_geometry_v1"
+PROFILE_VERSION = 1
+
+
+def generation_profile_contract(generation_shape: Any) -> dict[str, Any]:
+    return {
+        "profile_name": str(generation_shape.get("profile_name", PROFILE_NAME)),
+        "profile_version": PROFILE_VERSION,
+        "order_mode": str(generation_shape.get("order_mode", "chunk")),
+        "history_frames": int(generation_shape.get("history_frames", 4)),
+        "chunk_size": int(generation_shape["chunk_size"]),
+        "window_size": int(generation_shape["window_size"]),
+        "geometry_relation": "strict_frame_history",
+        "x_to_g_relation": "strict_order",
+    }
+
+
+def validate_checkpoint_generation_profile(
+    checkpoint_path: str | Path,
+    generation_shape: Any,
+) -> None:
+    checkpoint_path = Path(checkpoint_path)
+    metadata_path = checkpoint_path / "checkpoint_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    actual = metadata.get("generation_profile")
+    expected = generation_profile_contract(generation_shape)
+    if actual != expected:
+        raise ValueError(
+            "Checkpoint generation profile does not match distillation policy: "
+            f"checkpoint={actual}, expected={expected}"
+        )
 
 
 def _segmented_frame_orders(
     *,
     num_frames: int,
+    history_frames: int,
     chunk_size: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if chunk_size <= 0:
-        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
-    split = num_frames // 2
-    first_half = torch.arange(split, device=device) // chunk_size * 2
-    second_half_start = ((split + chunk_size - 1) // chunk_size) * 2
-    second_half = (
-        torch.arange(num_frames - split, device=device) * 2
-        + second_half_start
+    video_order = segmented_orders(
+        torch.arange(num_frames, device=device),
+        history_frames=history_frames,
+        chunk_size=chunk_size,
     )
-    video_order = torch.cat([first_half, second_half])
     return video_order, video_order + 1
 
 
 def _apply_segmented_order(
     metadata: MOTMaskMetadata,
     *,
+    history_frames: int,
     chunk_size: int,
 ) -> MOTMaskMetadata:
     if metadata.frame_ids is None:
         raise ValueError("segmented distillation order requires frame_ids")
     video_order, action_order = _segmented_frame_orders(
         num_frames=int(metadata.frame_ids.max().item()) + 1,
+        history_frames=history_frames,
         chunk_size=chunk_size,
         device=metadata.device,
     )
@@ -60,6 +100,11 @@ def install_order_profile(model: Any, generation_shape: Any) -> None:
     if order_mode != "segmented":
         return
     if getattr(model, "_distillation_order_profile", None) == order_mode:
+        from distillation.self_rollout.training_policy import (
+            install_training_attention_policy,
+        )
+
+        install_training_attention_policy(model, generation_shape)
         return
 
     original_prepare_metadata = model._prepare_metadata
@@ -71,11 +116,26 @@ def install_order_profile(model: Any, generation_shape: Any) -> None:
             geometry,
         )
         chunk_size = int(input_dict.get("chunk_size", shape["chunk_size"]))
+        history_frames = int(shape.get("history_frames", 4))
         return (
-            _apply_segmented_order(x_meta, chunk_size=chunk_size),
-            _apply_segmented_order(mot_meta, chunk_size=chunk_size),
+            _apply_segmented_order(
+                x_meta,
+                history_frames=history_frames,
+                chunk_size=chunk_size,
+            ),
+            _apply_segmented_order(
+                mot_meta,
+                history_frames=history_frames,
+                chunk_size=chunk_size,
+            ),
             diagnostics,
         )
 
     model._prepare_metadata = prepare_metadata
     model._distillation_order_profile = order_mode
+
+    from distillation.self_rollout.training_policy import (
+        install_training_attention_policy,
+    )
+
+    install_training_attention_policy(model, generation_shape)

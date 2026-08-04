@@ -11,7 +11,13 @@ consistency_distillation_cfg.cfg_prob = 0.0
 consistency_distillation_cfg.distill = EasyDict(
     method="consistency_distillation",
     # distillation wrapper 在原生 metadata 上应用两段式 order；不改变物理 packing。
-    generation_shape={"order_mode": "segmented", "chunk_size": 4, "window_size": 16},
+    generation_shape={
+        "profile_name": "segmented_history_strict_geometry_v1",
+        "order_mode": "segmented",
+        "history_frames": 4,
+        "chunk_size": 4,
+        "window_size": 16,
+    },
     max_grad_norm=2.0,
     # 分别决定 scheduler 离散表上 t -> t_next 的跨度；不是每次 forward 数量。
     video_num_steps=2,
@@ -28,7 +34,10 @@ consistency_distillation_cfg.distill = EasyDict(
     rollout_interval=500,
     rollout_video_num_steps=2,
     rollout_action_num_steps=2,
-    rollout_chunk_pairs=1,
+    # T0 是已知 anchor，默认逐帧生成 T1/T2/T3。
+    rollout_horizon_frames=3,
+    rollout_gt_mode="none",
+    rollout_replacement_policy="require_ground_truth",
     # fresh run: student_init 初始化 raw student 和 EMA；teacher_checkpoint 冻结。
     # resume: DCP 会覆盖 raw student/optimizer/EMA，teacher 仍从来源重建。
     student_init=None,

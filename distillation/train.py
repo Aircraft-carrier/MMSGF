@@ -42,12 +42,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="Video denoising steps used by each training rollout.")
     parser.add_argument("--rollout-action-num-steps", default=None, type=int,
                         help="Action denoising steps used by each training rollout.")
-    parser.add_argument("--rollout-chunk-pairs", default=None, type=int,
-                        help="Number of autoregressive video/action chunk pairs per rollout.")
+    parser.add_argument("--rollout-horizon-frames", default=None, type=int,
+                        help="Logical target frames generated after the clean target anchor.")
+    parser.add_argument(
+        "--rollout-gt-mode",
+        default=None,
+        choices=("none", "offline", "provider"),
+        help="Choose no GT replacement, offline batch GT, or an explicit provider API.",
+    )
+    parser.add_argument(
+        "--rollout-replacement-policy",
+        default=None,
+        choices=("require_ground_truth", "recompute_predicted"),
+        help="How to rebuild downstream action state after a partial GT replacement.",
+    )
     parser.add_argument("--cfg-min", default=None, type=float,
                         help="Minimum teacher video CFG scale for consistency distillation.")
     parser.add_argument("--cfg-max", default=None, type=float,
                         help="Maximum teacher video CFG scale for consistency distillation.")
+    parser.add_argument("--teacher-cfg-min", default=None, type=float,
+                        help="Minimum frozen-teacher video CFG scale for SGF.")
+    parser.add_argument("--teacher-cfg-max", default=None, type=float,
+                        help="Maximum frozen-teacher video CFG scale for SGF.")
     parser.add_argument("--sigma-data", default=None, type=float,
                         help="Flash-WAM video consistency boundary scaling sigma_data.")
     return parser.parse_args(argv)
@@ -89,7 +105,7 @@ def run(args: argparse.Namespace) -> None:
         "rollout_interval",
         "rollout_video_num_steps",
         "rollout_action_num_steps",
-        "rollout_chunk_pairs",
+        "rollout_horizon_frames",
     ):
         value = getattr(args, name)
         if value is not None:
@@ -98,6 +114,14 @@ def run(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if value is not None:
             config.distill[name] = float(value)
+    for name in ("teacher_cfg_min", "teacher_cfg_max"):
+        value = getattr(args, name)
+        if value is not None:
+            config.distill[name] = float(value)
+    for name in ("rollout_gt_mode", "rollout_replacement_policy"):
+        value = getattr(args, name)
+        if value is not None:
+            config.distill[name] = str(value)
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size

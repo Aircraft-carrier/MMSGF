@@ -8,6 +8,11 @@ from wan_va.train_mot import MOTTrainer
 
 
 class AutoregressiveTrainer(MOTTrainer):
+    def _load_transformer(self):
+        model = super()._load_transformer()
+        install_order_profile(model, self.config.distill.generation_shape)
+        return model
+
     def __init__(self, config: Any):
         if config.distill.resume_from is not None:
             config.resume_from = str(config.distill.resume_from)

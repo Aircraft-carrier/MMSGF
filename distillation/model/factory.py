@@ -7,7 +7,10 @@ from typing import Any
 import torch
 
 from distillation.model.utils import freeze_model, set_trainable
-from distillation.mask_profile import install_order_profile
+from distillation.mask_profile import (
+    install_order_profile,
+    validate_checkpoint_generation_profile,
+)
 from wan_va.modules.model_3dva_mot import ThreeDVAMOTTransformer3DModel
 
 
@@ -25,6 +28,10 @@ def load_transformer_export(
 
     checkpoint_path = Path(checkpoint_path)
     MOTTrainer._validate_transformer_checkpoint_layout(checkpoint_path)
+    validate_checkpoint_generation_profile(
+        checkpoint_path,
+        config.distill.generation_shape,
+    )
     transformer_path = checkpoint_path / "transformer"
     return ThreeDVAMOTTransformer3DModel.from_pretrained(
         transformer_path,
@@ -68,6 +75,7 @@ def _configure_distillation_model(
     )
 
     execution_route = getattr(config, "execution_route", "joint")
+    install_order_profile(model, config.distill.generation_shape)
     if trainable:
         set_trainable(model)
         apply_mot_parameter_ownership(model, config.optimization_composition)
@@ -75,7 +83,6 @@ def _configure_distillation_model(
         apply_ac_vggto(model)
     else:
         freeze_model(model)
-    install_order_profile(model, config.distill.generation_shape)
     configured = _configure_model(
         model=model,
         shard_fn=partial(

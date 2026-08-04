@@ -10,10 +10,17 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
-from inference.mot_inference import run_mot_inference
 from wan_va.utils import FlowMatchScheduler
 
 from distillation.schema import ReplayContext, VAMasks, VAPrediction, VATimesteps
+
+
+def run_mot_inference(*args, **kwargs):
+    """Lazy legacy bridge; the new self_rollout path never calls this function."""
+
+    from inference.mot_inference import run_mot_inference as native_run
+
+    return native_run(*args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -281,10 +288,15 @@ def record_sgf_trajectory(
     action_timesteps = torch.where(action_mask.any(dim=(1, 3, 4)), action_timesteps, 0)
 
     return ReplayContext(
-        batch=recorded_batch,
-        timesteps=VATimesteps(video_timesteps, action_timesteps),
-        noisy=VAPrediction(noisy_video, noisy_action),
-        generated=generated,
+        student_batch=recorded_batch,
+        teacher_batch=dict(batch),
+        rollout_timesteps=VATimesteps(video_timesteps, action_timesteps),
+        rollout_noisy=VAPrediction(noisy_video, noisy_action),
+        pred_clean=generated,
+        teacher_clean=VAPrediction(
+            batch["latents"].detach(),
+            batch["actions"].detach(),
+        ),
         masks=VAMasks(video_mask, action_mask),
     )
 

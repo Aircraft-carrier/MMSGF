@@ -136,15 +136,16 @@ trainer._prepare_joint_input_dict(batch, add_noise=False)
 - geometry RGB、point、valid mask 和 slot mask 整理；
 - `stream_ids` 注入；
 - 原生物理 window shape 校验，然后由 distillation trainer 把 attention metadata
-  覆盖为所有阶段一致的 `generation_shape=1/16`；
+  覆盖为所有阶段一致的 `segmented_history_strict_geometry_v1` profile；
 - `validate_mot_batch_for_forward()` 完整 shape 校验。
 
 `add_noise=False` 只跳过原生 autoregressive objective 使用的随机 video/action noise、flow target 和 timestep，因为 consistency pipeline 会立即按 modality 构造自己的 timestep 与噪声。如果先走原生加噪再覆盖，会浪费显存带宽、随机数和临时 tensor。
 
 这里的 `generation_shape` 只描述 attention order/window，不改变真实 tensor 仍是
 8 latent frames、每 frame 16 个 action token 的物理打包。stage1、stage2、stage3
-训练 forward 都使用同一 `1/16` profile；rollout 推理仍按原生 4-frame chunk anchor
-协议执行。
+训练 forward 都使用同一 segmented profile。history frame 共享 order，target 从 T0
+开始按 `V/G=2,4,6,...`、`A=3,5,7,...` 递增；geometry query 只能读取严格更早
+的 geometry frame。
 
 ## 6. Mask 组合
 
@@ -297,19 +298,24 @@ training_loss = consistency_loss
 
 ## 10. 训练期 rollout
 
-每个成功 optimizer step 后，`rollout_interval > 0` 且命中周期时，所有 rank 使用 EMA student 参与 FSDP forward；rank 0 保存产物。每一对按原生推理路径执行：
+每个成功 optimizer step 后，`rollout_interval > 0` 且命中周期时，所有 rank 使用
+EMA student 参与 FSDP forward；rank 0 保存产物。rollout 调用 distillation 自有的
+`self_rollout`，不进入 `inference/mot_inference.py`：
 
 ```text
-history V/A/G
-  -> sample target video with rollout_video_num_steps and video CFG
-  -> decode generated video and recompute geometry
-  -> sample target action with rollout_action_num_steps
-  -> feed generated target V/A/G back as the next history
+GT history V -> sequential strict-history G -> history A
+  -> commit GT target anchor T0 V/G/A
+  -> sample T1 video -> encode/commit T1 geometry -> sample/commit T1 action
+  -> continue T2, T3 ... from committed semantic/cache state
 ```
 
 调用方也可以直接执行 `trainer.rollout(batch)`；该入口会完成 device transfer、缺失 latent 时的 VAE 编码，并返回 `RolloutResult`。
 
-标准训练 batch 只有一个 target chunk，因此默认 `rollout_chunk_pairs=1`。传入包含更多连续 target chunks 的 batch 时，可以增大该值；不足时会明确报出需要的 latent frame 数。每个 chunk 继续遵循原生 inference protocol，保留 clean target anchor。
+新接口使用 `rollout_horizon_frames` 表示 T0 之后要生成的逻辑 frame 数，默认是 3，
+即生成 T1..T3。`rollout_chunk_pairs` 属于旧 fixed-window rollout；配置中不得同时
+出现这两个字段。`rollout_gt_mode` 支持 `none`、`offline` 和由调用方显式传入
+provider 的 `provider`，GT replacement 后 prediction artifact 保留，后续 continuation
+使用替换后的 canonical state。
 
 rank 0 在 `save_root/rollouts/step_XXXXXXXX/` 保存：
 

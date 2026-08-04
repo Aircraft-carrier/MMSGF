@@ -18,9 +18,10 @@ from distillation.model.objectives import (
 )
 from distillation.pipeline.utils import (
     add_noise_to_va,
+    replace_text_condition,
     replace_va_streams,
 )
-from distillation.rollout import record_sgf_trajectory
+from distillation.self_rollout import SelfRolloutRecorder, self_rollout
 from distillation.scheduler import (
     broadcast_frame_values,
     flow_to_x0,
@@ -35,10 +36,10 @@ class SelfGradientForcingTrainingPipeline:
 
     ``H0 H1 H2 H3 | T0 T1 T2 T3``
 
-    ``H0`` 与 ``T0`` 是每个 chunk 的 clean anchor；真正 replay 的位置是
-    ``H1..H3`` 和 ``T1..T3``。stage3 先用 student 在 no_grad 下完整生成两次
-    V→G→A trajectory，并在随机 denoise step 记录 noisy/timestep；再选择以下
-    互斥路径之一：
+    ``H0..H3`` 是 GT history，``T0`` 是 GT target anchor；真正 replay 的位置
+    只有 ``T1..T3``。stage3 先用 student 在 no_grad 下执行一次增量
+    ``self_rollout``，逐帧生成 V→G→A，并在随机 denoise step 记录真实
+    noisy/timestep；再选择以下互斥路径之一：
 
     - student update：一次有梯度 replay + frozen real/fake score + DMD loss；
     - fake-score update：对 detached generated sample 人工加噪，回归精确 flow。
@@ -75,6 +76,22 @@ class SelfGradientForcingTrainingPipeline:
         )
         if self.score_t_min >= self.score_t_max:
             raise ValueError("score timestep range is empty")
+        self.rollout_video_num_steps = int(config.distill.rollout_video_num_steps)
+        self.rollout_action_num_steps = int(config.distill.rollout_action_num_steps)
+        self.rollout_horizon_frames = int(config.distill.rollout_horizon_frames)
+        if min(
+            self.rollout_video_num_steps,
+            self.rollout_action_num_steps,
+            self.rollout_horizon_frames,
+        ) <= 0:
+            raise ValueError("SGF rollout steps and horizon must be positive")
+        self.teacher_cfg_min = float(config.distill.teacher_cfg_min)
+        self.teacher_cfg_max = float(config.distill.teacher_cfg_max)
+        if self.teacher_cfg_min < 0.0 or self.teacher_cfg_max < self.teacher_cfg_min:
+            raise ValueError(
+                "SGF teacher CFG requires 0 <= teacher_cfg_min <= teacher_cfg_max, got "
+                f"{self.teacher_cfg_min} and {self.teacher_cfg_max}"
+            )
 
     def _sample_timesteps(
         self,
@@ -144,6 +161,183 @@ class SelfGradientForcingTrainingPipeline:
             noisy,
             clean,
             timesteps,
+        )
+
+    def _empty_text_condition(self, batch: dict, text_emb: torch.Tensor) -> torch.Tensor:
+        empty = batch.get("empty_text_emb")
+        if empty is None:
+            empty = self.trainer._get_empty_text_emb()
+        empty = empty.to(device=text_emb.device, dtype=text_emb.dtype)
+        while empty.ndim < text_emb.ndim:
+            empty = empty.unsqueeze(0)
+        if empty.shape[0] == 1 and text_emb.shape[0] > 1:
+            empty = empty.expand(text_emb.shape[0], *empty.shape[1:])
+        if empty.shape != text_emb.shape:
+            raise ValueError(
+                f"empty text embedding shape {tuple(empty.shape)} does not match "
+                f"text embedding {tuple(text_emb.shape)}"
+            )
+        return empty
+
+    def _teacher_cfg_flow(
+        self,
+        input_dict: dict,
+        batch: dict,
+    ) -> tuple[VAPrediction, float]:
+        conditioned = self.real_score(input_dict, mode="train")
+        text_emb = input_dict["latent_dict"]["text_emb"]
+        unconditioned = self.real_score(
+            replace_text_condition(
+                input_dict,
+                self._empty_text_condition(batch, text_emb),
+            ),
+            mode="train",
+        )
+        cfg_scale = self.teacher_cfg_min + torch.rand(()).item() * (
+            self.teacher_cfg_max - self.teacher_cfg_min
+        )
+        video = unconditioned["latent_pred"] + cfg_scale * (
+            conditioned["latent_pred"] - unconditioned["latent_pred"]
+        )
+        return VAPrediction(video, conditioned["action_pred"]), cfg_scale
+
+    @staticmethod
+    def _masked_noisy(
+        noisy: VAPrediction,
+        clean: VAPrediction,
+        masks: VAMasks,
+    ) -> VAPrediction:
+        return VAPrediction(
+            video=torch.where(
+                masks.video[:, None, :, None, None, None],
+                noisy.video,
+                clean.video,
+            ),
+            action=torch.where(masks.action, noisy.action, clean.action),
+        )
+
+    @staticmethod
+    def _frame_timestep(
+        timestep: torch.Tensor,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        timestep = torch.as_tensor(timestep, device=device, dtype=torch.float32)
+        if timestep.numel() == 1:
+            return timestep.reshape(1).expand(batch_size)
+        if timestep.numel() == batch_size:
+            return timestep.reshape(batch_size)
+        raise ValueError(
+            f"recorded timestep must be scalar or have {batch_size} values, got "
+            f"{tuple(timestep.shape)}"
+        )
+
+    def _build_replay_context(
+        self,
+        batch: dict,
+        rollout,
+        recorder: SelfRolloutRecorder,
+        *,
+        history_frames: int,
+    ) -> ReplayContext:
+        frames = int(batch["latents"].shape[2])
+        anchor = int(history_frames)
+        generated_start = anchor + 1
+        generated_end = generated_start + self.rollout_horizon_frames
+        if generated_end > frames:
+            raise ValueError(
+                f"SGF rollout target [{generated_start},{generated_end}) exceeds {frames} frames"
+            )
+        generated_ids = list(range(generated_start, generated_end))
+        recorder.require_frames(generated_ids)
+
+        generated_frames = torch.zeros(
+            (batch["latents"].shape[0], frames),
+            dtype=torch.bool,
+            device=batch["latents"].device,
+        )
+        generated_frames[:, generated_start:generated_end] = True
+        video_mask = (
+            batch["video_latent_valid_mask"].to(dtype=torch.bool)
+            & generated_frames
+        )
+        action_mask = (
+            batch["action_valid_mask"].to(dtype=torch.bool)
+            & generated_frames[:, None, :, None, None]
+        )
+
+        student_batch = dict(batch)
+        for key in ("latents", "actions", "geometry_rgb"):
+            student_batch[key] = batch[key].clone()
+        student_batch["latents"][:, :, generated_start:generated_end] = (
+            rollout.pred_latents[:, :, generated_start:generated_end]
+        )
+        student_batch["actions"][:, :, generated_start:generated_end] = (
+            rollout.pred_actions[:, :, generated_start:generated_end]
+        )
+        student_batch["geometry_rgb"][:, generated_start:generated_end] = (
+            rollout.pred_geometry_rgb[:, generated_start:generated_end]
+        )
+        student_batch["video_latent_loss_mask"] = video_mask
+        student_batch["action_loss_mask"] = action_mask
+
+        teacher_batch = dict(batch)
+        teacher_batch["video_latent_loss_mask"] = video_mask
+        teacher_batch["action_loss_mask"] = action_mask
+
+        pred_clean = VAPrediction(
+            student_batch["latents"].detach(),
+            student_batch["actions"].detach(),
+        )
+        teacher_clean = VAPrediction(
+            batch["latents"].detach(),
+            batch["actions"].detach(),
+        )
+        noisy_video = pred_clean.video.clone()
+        noisy_action = pred_clean.action.clone()
+        video_timesteps = torch.zeros(
+            (pred_clean.video.shape[0], frames),
+            dtype=torch.float32,
+            device=pred_clean.video.device,
+        )
+        action_timesteps = torch.zeros_like(video_timesteps)
+        for frame_id in generated_ids:
+            video_record = recorder.video[frame_id]
+            action_record = recorder.action[frame_id]
+            noisy_video[:, :, frame_id : frame_id + 1] = video_record.sample
+            noisy_action[:, :, frame_id : frame_id + 1] = action_record.sample
+            video_timesteps[:, frame_id] = self._frame_timestep(
+                video_record.timestep,
+                batch_size=pred_clean.video.shape[0],
+                device=pred_clean.video.device,
+            )
+            action_timesteps[:, frame_id] = self._frame_timestep(
+                action_record.timestep,
+                batch_size=pred_clean.video.shape[0],
+                device=pred_clean.video.device,
+            )
+
+        masks = VAMasks(video_mask, action_mask)
+        rollout_noisy = self._masked_noisy(
+            VAPrediction(noisy_video, noisy_action),
+            pred_clean,
+            masks,
+        )
+        video_timesteps = torch.where(video_mask, video_timesteps, 0)
+        action_timesteps = torch.where(
+            action_mask.any(dim=(1, 3, 4)),
+            action_timesteps,
+            0,
+        )
+        return ReplayContext(
+            student_batch=student_batch,
+            teacher_batch=teacher_batch,
+            rollout_timesteps=VATimesteps(video_timesteps, action_timesteps),
+            rollout_noisy=rollout_noisy,
+            pred_clean=pred_clean,
+            teacher_clean=teacher_clean,
+            masks=masks,
         )
 
     def _flow_targets(
@@ -221,47 +415,46 @@ class SelfGradientForcingTrainingPipeline:
 
     @torch.no_grad()
     def generate_and_record_context(self, batch: dict) -> ReplayContext:
-        """在 no_grad 下生成 self-forcing 数据，不使用真实 target 作 replay GT。
-
-        输入 batch 仍是 dataset 的 clean 8-frame window。假设随机抽到
-        ``video_record_step=7``、``action_record_step=19``：
-
-        1. 以 H0 为 anchor，生成 H1..H3；记录 video 第 7 步、action 第 19 步
-           的 noisy sample，同时继续 denoise 得到 final generated history；
-        2. 把 generated H1..H3 及其 decoded/recomputed geometry 写回工作 batch；
-        3. 以 T0 为第二个 anchor，在已经生成的 history 条件下生成 T1..T3，
-           并在相同 modality record step 记录第二组 noisy sample；
-        4. 返回 generated=[H0,pH1..pH3,T0,pT1..pT3]，mask 为
-           [0,1,1,1,0,1,1,1]，anchor/padding 保持 clean。
-
-        这一步不保留 student graph，控制显存；真正梯度在 replay 中重建。
-        """
+        """Generate only T1..T3 and record real intermediate V/A sampler states."""
         from wan_va.mot_spec import mot_spec_from_config
 
         video_record_step = int(
             torch.randint(
-                int(self.config.num_inference_steps),
+                self.rollout_video_num_steps,
                 (1,),
                 device=self.device,
             ).item()
         )
         action_record_step = int(
             torch.randint(
-                int(self.config.action_num_inference_steps),
+                self.rollout_action_num_steps,
                 (1,),
                 device=self.device,
             ).item()
         )
-        return record_sgf_trajectory(
+        recorder = SelfRolloutRecorder(
+            video_step=video_record_step,
+            action_step=action_record_step,
+        )
+        spec = mot_spec_from_config(self.config)
+        rollout = self_rollout(
             batch,
             transformer=self.student,
             config=self.config,
-            spec=mot_spec_from_config(self.config),
+            spec=spec,
             device=self.device,
             empty_text_emb=self.trainer._get_empty_text_emb(),
             decode_latents_to_rgb_views=self._decode_rollout_latents,
-            video_record_step=video_record_step,
-            action_record_step=action_record_step,
+            video_num_steps=self.rollout_video_num_steps,
+            action_num_steps=self.rollout_action_num_steps,
+            rollout_frames=self.rollout_horizon_frames,
+            recorder=recorder,
+        )
+        return self._build_replay_context(
+            batch,
+            rollout,
+            recorder,
+            history_frames=int(spec.history_latent_frames),
         )
 
     def replay_and_score(
@@ -274,7 +467,7 @@ class SelfGradientForcingTrainingPipeline:
 
         ``recorded noisy/t_context``
         ``-> student_flow (唯一有梯度的大模型 forward)``
-        ``-> replay_target=(noisy-generated)/sigma_context``
+        ``-> GT-clean teacher CFG flow at the same rollout state``
         ``-> student_x0=noisy-sigma_context*student_flow``
         ``-> 重新采样 score_t/noise``
         ``-> frozen real_x0 与 fake_x0``
@@ -284,22 +477,37 @@ class SelfGradientForcingTrainingPipeline:
         real/fake 接收完全相同的 score_noisy 和条件，差值才具有可比较意义；
         两者 forward 均在 no_grad 中，DMD gradient 只回到 student replay graph。
         """
-        noisy = context.noisy
-        generated = context.generated
+        noisy = context.rollout_noisy
+        generated = context.pred_clean
         replay_input = self._prepare_input(
-            context.batch,
+            context.student_batch,
             noisy,
             generated,
-            context.timesteps,
+            context.rollout_timesteps,
         )
-        # 1) recorded_batch 包含 generated V/A/G；noisy 与 timestep 来自 rollout
-        #    中实际记录的 sampler state，而不是重新随机合成。
+        # 1) Student clean/geometry 使用 rollout prediction；noisy 与 timestep
+        #    来自同一次 rollout 的真实 sampler state，而不是重新随机合成。
         student_out = self.student(replay_input, mode="train")
         student_flow = VAPrediction(
             student_out["latent_pred"],
             student_out["action_pred"],
         )
-        target_flow = self._flow_targets(noisy, generated, context.timesteps)
+        teacher_noisy = self._masked_noisy(
+            noisy,
+            context.teacher_clean,
+            context.masks,
+        )
+        teacher_input = self._prepare_input(
+            context.teacher_batch,
+            teacher_noisy,
+            context.teacher_clean,
+            context.rollout_timesteps,
+        )
+        with torch.no_grad():
+            target_flow, cfg_scale = self._teacher_cfg_flow(
+                teacher_input,
+                context.teacher_batch,
+            )
         replay_loss, replay_metrics = replay_target_loss(
             student_flow,
             target_flow,
@@ -314,17 +522,17 @@ class SelfGradientForcingTrainingPipeline:
             flow_to_x0(
                 student_flow.video,
                 noisy.video,
-                context.timesteps.video,
+                context.rollout_timesteps.video,
                 self.trainer.train_scheduler_latent,
             ),
             flow_to_x0(
                 student_flow.action,
                 noisy.action,
-                context.timesteps.action,
+                context.rollout_timesteps.action,
                 self.trainer.train_scheduler_action,
             ),
         )
-        # ``context.timesteps`` uses numeric 0 for anchors/padding, but the MOT
+        # ``rollout_timesteps`` uses numeric 0 for anchors/padding, but the MOT
         # training scheduler's last sigma is small rather than exactly zero.
         # Applying ``x0 = noisy - sigma * flow`` to those locations would subtly
         # modify H0/T0 and invalid action tokens.  They become conditioning for the
@@ -356,7 +564,7 @@ class SelfGradientForcingTrainingPipeline:
             context.masks,
         )
         score_input = self._prepare_input(
-            context.batch,
+            context.student_batch,
             score_noisy,
             student_x0,
             VATimesteps(score_t, score_t),
@@ -391,6 +599,7 @@ class SelfGradientForcingTrainingPipeline:
         return total, {
             **replay_metrics,
             **dmd_metrics,
+            "distill/sgf_teacher_cfg_scale": total.detach().new_tensor(cfg_scale),
             "distill/sgf_total_loss": total.detach(),
         }
 
@@ -400,12 +609,12 @@ class SelfGradientForcingTrainingPipeline:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """执行 fake-score optimizer 对应的一次精确 flow regression。
 
-        ``context.generated`` 已 detach。重新采样 ``score_t`` 和 Gaussian noise
+        ``context.pred_clean`` 已 detach。重新采样 ``score_t`` 和 Gaussian noise
         后，noisy/clean/sigma 都已知，因此 target flow 可直接反解，不需要
         real-score forward。只有 ``fake_score(...)`` 位于 autograd graph；
         student 只在前面的 trajectory record 中以 no_grad 方式出现。
         """
-        generated = context.generated
+        generated = context.pred_clean
         timesteps = self._sample_timesteps(
             generated,
             context.masks,
@@ -416,7 +625,7 @@ class SelfGradientForcingTrainingPipeline:
             context.masks,
         )
         score_input = self._prepare_input(
-            context.batch,
+            context.student_batch,
             noisy,
             generated,
             VATimesteps(timesteps, timesteps),

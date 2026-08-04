@@ -20,7 +20,13 @@ class _MetadataTrainer:
     optimizer_step = 10
     config = SimpleNamespace(
         distill=SimpleNamespace(
-            generation_shape={"chunk_size": 1, "window_size": 16},
+            generation_shape={
+                "profile_name": "segmented_history_strict_geometry_v1",
+                "order_mode": "segmented",
+                "history_frames": 4,
+                "chunk_size": 4,
+                "window_size": 16,
+            },
         )
     )
 
@@ -56,6 +62,16 @@ def test_distillation_metadata_remains_valid_next_stage_initialization(tmp_path:
     assert metadata["distill_method"] == CONSISTENCY_DISTILLATION
     assert metadata["exported_model"] == "ema_student"
     assert metadata["has_full_state"] is True
+    assert metadata["generation_profile"] == {
+        "profile_name": "segmented_history_strict_geometry_v1",
+        "profile_version": 1,
+        "order_mode": "segmented",
+        "history_frames": 4,
+        "chunk_size": 4,
+        "window_size": 16,
+        "geometry_relation": "strict_frame_history",
+        "x_to_g_relation": "strict_order",
+    }
 
 
 @pytest.mark.parametrize(

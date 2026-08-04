@@ -20,6 +20,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from distillation.configs import CONSISTENCY_DISTILLATION, SELF_GRADIENT_FORCING_DMD
+from distillation.mask_profile import generation_profile_contract
 from distillation.schema import CheckpointMetadata
 from wan_va.checkpoint_retention import prune_successful_checkpoints
 
@@ -174,6 +175,14 @@ class DistillationCheckpointIO:
             raise ValueError(
                 f"Unsupported checkpoint format version {metadata.format_version}"
             )
+        expected_profile = generation_profile_contract(
+            trainer.config.distill.generation_shape
+        )
+        if metadata.generation_profile != expected_profile:
+            raise ValueError(
+                "Checkpoint generation profile does not match trainer: "
+                f"checkpoint={metadata.generation_profile}, expected={expected_profile}"
+            )
 
         state = self._dcp_state_dict(trainer)
         dcp.load(
@@ -321,11 +330,7 @@ class DistillationCheckpointIO:
             ),
             step=int(trainer.step),
             optimizer_step=int(trainer.optimizer_step),
-            generation_profile={
-                "order_mode": str(shape.get("order_mode", "chunk")),
-                "chunk_size": int(shape["chunk_size"]),
-                "window_size": int(shape["window_size"]),
-            },
+            generation_profile=generation_profile_contract(shape),
         )
         (temp_dir / "checkpoint_metadata.json").write_text(
             json.dumps(asdict(metadata), indent=2),

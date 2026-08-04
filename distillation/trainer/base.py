@@ -8,7 +8,10 @@ from typing import Any, Literal
 import torch
 
 from distillation.checkpoint import DistillationCheckpointIO
-from distillation.mask_profile import install_order_profile
+from distillation.mask_profile import (
+    install_order_profile,
+    validate_checkpoint_generation_profile,
+)
 from distillation.schema import TrainingStepResult
 from wan_va.train_mot import MOTTrainer
 
@@ -41,6 +44,14 @@ class DistillationTrainerBase(MOTTrainer):
 
     method: str
 
+    def _load_transformer(self):
+        # MOTTrainer applies activation checkpoint wrappers immediately after
+        # this hook. Install the instance-local attention policy first so each
+        # wrapper preserves the patched block forward instead of being bypassed.
+        model = super()._load_transformer()
+        install_order_profile(model, self.config.distill.generation_shape)
+        return model
+
     def __init__(self, config: Any):
         self._resume_from = getattr(config.distill, "resume_from", None)
         student_init = getattr(config.distill, "student_init", None)
@@ -65,6 +76,10 @@ class DistillationTrainerBase(MOTTrainer):
         if self._resume_from is not None:
             config.initialize_from = str(Path(self._resume_from))
         elif student_init is not None:
+            validate_checkpoint_generation_profile(
+                student_init,
+                config.distill.generation_shape,
+            )
             config.initialize_from = str(Path(student_init))
         else:
             raise ValueError(

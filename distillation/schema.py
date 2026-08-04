@@ -81,14 +81,34 @@ class TrainingStepResult:
 class ReplayContext:
     """Stage3 no-grad record 与有梯度 replay 之间的完整边界。
 
-    ``batch`` 已写入 generated latent/action/geometry；``noisy`` 是 rollout 某
-    denoise step 的真实 sampler state；``generated`` 是该 rollout 最终 clean；
-    ``timesteps`` 与 noisy 一一对应；``masks`` 指明哪些值可用于 replay/DMD。
-    所有 generated/noisy tensor 都应已 detach，梯度只在 replay 时重新建立。
+    Student batch 使用预测 target V/A/G，teacher batch 保持 GT V/A/G；
+    ``rollout_noisy`` 是 rollout 某个真实 denoise step 的 sampler state，
+    ``pred_clean`` 是最终预测 clean，``teacher_clean`` 是 dataset GT clean。
+    所有 record tensor 都已 detach，梯度只在 replay 时重新建立。
     """
 
-    batch: dict[str, Any]
-    timesteps: VATimesteps
-    noisy: VAPrediction
-    generated: VAPrediction
+    student_batch: dict[str, Any]
+    teacher_batch: dict[str, Any]
+    rollout_timesteps: VATimesteps
+    rollout_noisy: VAPrediction
+    pred_clean: VAPrediction
+    teacher_clean: VAPrediction
     masks: VAMasks
+
+    @property
+    def batch(self) -> dict[str, Any]:
+        """Compatibility alias for the legacy student replay batch."""
+
+        return self.student_batch
+
+    @property
+    def timesteps(self) -> VATimesteps:
+        return self.rollout_timesteps
+
+    @property
+    def noisy(self) -> VAPrediction:
+        return self.rollout_noisy
+
+    @property
+    def generated(self) -> VAPrediction:
+        return self.pred_clean

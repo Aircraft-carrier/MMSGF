@@ -2,7 +2,7 @@
 
 Run directly from the repository root to regenerate the checked artifact:
 
-    python distillation/tests/test_visualize_x_metadata_mask.py
+    PYTHONPATH=. python distillation/tests/test_visualize_x_metadata_mask.py
 
 The x-axis is key (K), and the y-axis is query (Q).  Every visible cell is
 split diagonally: its lower-left triangle uses the query token color, and its
@@ -17,9 +17,21 @@ Joint:
 """
 
 from pathlib import Path
+import sys
+import types
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
+
+# Direct execution should not import ``wan_va.modules.__init__`` because that
+# eagerly loads optional FlashAttention model extensions unrelated to metadata
+# visualization.  Register only the package path, then import the target module.
+if "wan_va.modules" not in sys.modules:
+    modules_package = types.ModuleType("wan_va.modules")
+    modules_package.__path__ = [
+        str(Path(__file__).resolve().parents[2] / "wan_va" / "modules")
+    ]
+    sys.modules["wan_va.modules"] = modules_package
 
 from wan_va.modules.mot_attention import (
     NOISE_CLEAN,
@@ -33,10 +45,16 @@ from wan_va.modules.mot_attention import (
     build_mot_metadata,
     build_x_metadata,
 )
+from distillation.self_rollout.attention import (
+    build_cache_visibility,
+    from_mot_metadata,
+    segmented_orders,
+)
 
 
 DEFAULT_BATCH_SIZE = 1
 DEFAULT_NUM_FRAMES = 8
+DEFAULT_HISTORY_FRAMES = 4
 DEFAULT_CHUNK_SIZE = 4
 DEFAULT_WINDOW_SIZE = 10
 TOKENS_PER_FRAME = 1
@@ -116,11 +134,11 @@ def _build_sgf_orders(
     *, num_frames: int, chunk_size: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return SGF video/geometry and action clocks for one frame sequence."""
-    split = num_frames // 2
-    first_half = torch.arange(split, device=device) // chunk_size * 2
-    second_half_start = ((split + chunk_size - 1) // chunk_size) * 2
-    second_half = torch.arange(num_frames - split, device=device) * 2 + second_half_start
-    video_order = torch.cat([first_half, second_half])
+    video_order = segmented_orders(
+        torch.arange(num_frames, device=device),
+        history_frames=DEFAULT_HISTORY_FRAMES,
+        chunk_size=chunk_size,
+    )
     action_order = video_order + 1
     return video_order[None, :], action_order[None, :]
 
@@ -137,7 +155,12 @@ def build_default_mot_metadata_and_mask() -> tuple[MOTMaskMetadata, torch.Tensor
     """Build the configured 8-frame joint mask with one V/G/A token per frame."""
 
     metadata = build_mot_metadata4sgf()
-    return metadata, build_dense_mot_mask(metadata)[0]
+    policy_metadata = from_mot_metadata(metadata)
+    return metadata, build_cache_visibility(
+        policy_metadata,
+        policy_metadata,
+        window_size=metadata.window_size,
+    )[0]
 
 
 
@@ -354,6 +377,9 @@ def test_visualize_default_mot_metadata_mask(tmp_path):
     assert bool(mask[12, 16])
     assert bool(mask[8, 9])
     assert not bool(mask[8, 0])
+    assert not bool(mask[16, 16])
+    assert not bool(mask[16, 17])
+    assert bool(mask[20, 19])
 
     output_path = render_metadata_mask(
         metadata,
@@ -378,7 +404,7 @@ def _assert_png_colors(output_path: Path, expected_kinds: set[str]) -> None:
 
 
 # 直接在终端运行的生成指令：
-# PYTHONPATH=. python -c 'import runpy, sys; from pathlib import Path; from types import ModuleType; root = Path.cwd(); wan = ModuleType("wan_va"); wan.__path__ = [str(root / "wan_va")]; modules = ModuleType("wan_va.modules"); modules.__path__ = [str(root / "wan_va" / "modules")]; sys.modules["wan_va"] = wan; sys.modules["wan_va.modules"] = modules; runpy.run_path("distillation/tests/test_visualize_x_metadata_mask.py", run_name="__main__")'
+# PYTHONPATH=. python distillation/tests/test_visualize_x_metadata_mask.py
 if __name__ == "__main__":
     x_meta, x_dense_mask = build_default_x_metadata_and_mask()
     x_saved_path = render_metadata_mask(
