@@ -3,6 +3,17 @@
 This module intentionally has no dependency on ``wan_va.modules`` so cache and
 mask semantics can be tested on CPU without importing optional FlashAttention
 extensions.  The integer constants mirror ``wan_va.modules.mot_attention``.
+
+The rollout mask is rectangular: rows are the current query transaction and
+columns are committed K/V followed by the current transaction.  With ``1`` as
+visible and ``.`` as masked, the stream-level rule is::
+
+                     K: committed X  committed G  current X  current G
+        Q: current X          1            1           1          1
+        Q: current G          .            1           .          1
+
+``X`` means video or action.  Prediction transactions are discarded after one
+denoising query; commit transactions keep only clean video/action K/V.
 """
 from __future__ import annotations
 
@@ -286,7 +297,34 @@ def build_cache_visibility(
     *,
     window_size: int,
 ) -> torch.Tensor:
-    """Build the canonical rectangular ``[B,Q,K]`` allowed-form mask."""
+    """Build the commit-ordered rectangular ``[B,Q,K]`` visibility mask.
+
+    Committed K/V is historical by definition.  Video/action queries may read
+    every committed stream plus their own transaction.  Geometry queries are
+    isolated to committed geometry plus current-transaction geometry.
+
+    Geometry obtains its stage-specific topology from transaction boundaries::
+
+        history prefill (G0..G3 share one transaction)
+
+            Q\\K  G0 G1 G2 G3
+             G0   1  1  1  1
+             G1   1  1  1  1
+             G2   1  1  1  1
+             G3   1  1  1  1
+
+        anchor/rollout (one new transaction per group)
+
+            Q\\K  G0 G1 G2 G3 G4 G5 ...
+             G4   1  1  1  1  1  .  ...
+             G5   1  1  1  1  1  1  ...
+
+    Thus history groups are mutually visible, while each later group sees only
+    committed geometry and itself.  Geometry never reads video/action keys.
+
+    ``window_size`` remains part of the checkpoint/config contract, but does
+    not truncate inference visibility: commit order is the causal boundary.
+    """
 
     if query.batch_size != key.batch_size:
         raise ValueError("query/key batch sizes must match")
@@ -303,34 +341,16 @@ def build_cache_visibility(
 
     q_seq = query.seq_ids[:, :, None]
     k_seq = key.seq_ids[:, None, :]
-    q_frame = query.frame_ids[:, :, None]
-    k_frame = key.frame_ids[:, None, :]
-    q_order = query.order_ids[:, :, None]
-    k_order = key.order_ids[:, None, :]
     q_stream = query.stream_ids[:, :, None]
     k_stream = key.stream_ids[:, None, :]
-    q_noise = query.noise_ids[:, :, None]
-    k_noise = key.noise_ids[:, None, :]
 
     base = (
         (q_seq == k_seq)
         & (q_seq >= 0)
         & query.valid_ids[:, :, None]
         & key.valid_ids[:, None, :]
-        & ((q_order - k_order).abs() <= int(window_size))
     )
 
-    g_query = q_stream == STREAM_GEOMETRY
-    g_key = k_stream == STREAM_GEOMETRY
-    geometry_relation = (
-        g_query
-        & g_key
-        & key.committed_ids[:, None, :]
-        & (k_frame < q_frame)
-    )
-
-    x_query = (q_stream == STREAM_VIDEO) | (q_stream == STREAM_ACTION)
-    x_key = (k_stream == STREAM_VIDEO) | (k_stream == STREAM_ACTION)
     same_transaction = (
         (query.transaction_ids[:, :, None] >= 0)
         & (
@@ -340,26 +360,16 @@ def build_cache_visibility(
     )
     readable = key.committed_ids[:, None, :] | same_transaction
 
-    clean_to_clean = (
-        (q_noise == NOISE_CLEAN)
-        & (k_noise == NOISE_CLEAN)
-        & (k_order <= q_order)
+    geometry_relation = (
+        (q_stream == STREAM_GEOMETRY)
+        & (k_stream == STREAM_GEOMETRY)
+        & readable
     )
-    noisy_to_clean = (
-        (q_noise == NOISE_NOISY)
-        & (k_noise == NOISE_CLEAN)
-        & (k_order < q_order)
+    x_relation = (
+        ((q_stream == STREAM_VIDEO) | (q_stream == STREAM_ACTION))
+        & readable
     )
-    noisy_to_noisy = (
-        (q_noise == NOISE_NOISY)
-        & (k_noise == NOISE_NOISY)
-        & (k_order == q_order)
-    )
-    x_relation = x_query & x_key & readable & (
-        clean_to_clean | noisy_to_clean | noisy_to_noisy
-    )
-    x_to_g = x_query & g_key & readable & (k_order < q_order)
-    return base & (geometry_relation | x_relation | x_to_g)
+    return base & (geometry_relation | x_relation)
 
 
 def incremental_attention(

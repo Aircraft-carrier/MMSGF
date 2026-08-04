@@ -35,7 +35,16 @@ class _StreamInput:
 
 
 class MOTIncrementalAdapter:
-    """Run one or more current X streams against committed rectangular K/V."""
+    """Run current video/action streams against committed rectangular K/V.
+
+    The two transaction lifetimes are intentionally small::
+
+        prediction: [committed K/V | current noisy K/V] -> output -> discard
+        commit:     [committed K/V | current clean K/V] -> output -> commit
+
+    A commit never creates a noisy cache segment.  Noisy K/V exists only so a
+    denoising query can attend to its own transaction during that model call.
+    """
 
     def __init__(
         self,
@@ -118,6 +127,31 @@ class MOTIncrementalAdapter:
                 f"timesteps must broadcast to [{batch_size},{frames}], got {tuple(timesteps.shape)}"
             )
         return timesteps
+
+    def _stream_axes(
+        self,
+        sample: torch.Tensor,
+        *,
+        frame_ids: Iterable[int] | torch.Tensor,
+        timesteps: float | int | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize the shared frame/timestep axes for video and action."""
+
+        batch_size, _channels, frames = sample.shape[:3]
+        return (
+            self._normalize_frame_ids(
+                frame_ids,
+                batch_size=batch_size,
+                frames=frames,
+                device=sample.device,
+            ),
+            self._normalize_timesteps(
+                timesteps,
+                batch_size=batch_size,
+                frames=frames,
+                device=sample.device,
+            ),
+        )
 
     def _video_rotary(
         self,
@@ -357,6 +391,51 @@ class MOTIncrementalAdapter:
             ]
         return hidden_states
 
+    def _run_transaction(
+        self,
+        stream: _StreamInput,
+        *,
+        text_emb: torch.Tensor,
+        state: RolloutState,
+        transaction_id: int,
+        commit_source: CacheSource | None = None,
+    ) -> torch.Tensor:
+        """Run one stream, optionally commit it, and always clear transaction state."""
+
+        try:
+            hidden = self._run_streams(
+                [stream],
+                text_emb=text_emb,
+                state=state,
+                transaction_id=transaction_id,
+            )[0]
+            if commit_source is not None:
+                state.mot_cache.commit_transaction(
+                    transaction_id,
+                    source_id=int(commit_source),
+                )
+            return hidden
+        finally:
+            state.mot_cache.discard_transaction(transaction_id)
+
+    def _assert_clean_commit(
+        self,
+        state: RolloutState,
+        *,
+        frame_id: int,
+        stream_id: int,
+        source: CacheSource,
+        version_id: int,
+    ) -> None:
+        state.mot_cache.assert_committed_frame(
+            range(len(self.model.mot_blocks)),
+            frame_id=frame_id,
+            stream_id=stream_id,
+            noise_ids=(NOISE_CLEAN,),
+            source_id=int(source),
+            version_id=version_id,
+        )
+
     def predict_video(
         self,
         sample: torch.Tensor,
@@ -368,20 +447,13 @@ class MOTIncrementalAdapter:
         state: RolloutState,
         valid_frames: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        batch_size, _channels, frames = sample.shape[:3]
+        frames = sample.shape[2]
         if frames != 1:
             raise ValueError("predict_video expects exactly one logical frame")
-        frame_ids = self._normalize_frame_ids(
-            [frame_id],
-            batch_size=batch_size,
-            frames=1,
-            device=sample.device,
-        )
-        timesteps = self._normalize_timesteps(
-            timestep,
-            batch_size=batch_size,
-            frames=1,
-            device=sample.device,
+        frame_ids, timesteps = self._stream_axes(
+            sample,
+            frame_ids=[frame_id],
+            timesteps=timestep,
         )
         transaction_id = state.new_transaction_id()
         stream, shape = self._video_input(
@@ -396,16 +468,13 @@ class MOTIncrementalAdapter:
             version_id=0,
             valid_frames=valid_frames,
         )
-        try:
-            hidden = self._run_streams(
-                [stream],
-                text_emb=text_emb,
-                state=state,
-                transaction_id=transaction_id,
-            )[0]
-            return self.model._final_video(hidden, timesteps, shape)
-        finally:
-            state.mot_cache.discard_transaction(transaction_id)
+        hidden = self._run_transaction(
+            stream,
+            text_emb=text_emb,
+            state=state,
+            transaction_id=transaction_id,
+        )
+        return self.model._final_video(hidden, timesteps, shape)
 
     def predict_action(
         self,
@@ -417,20 +486,13 @@ class MOTIncrementalAdapter:
         state: RolloutState,
         valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        batch_size, _channels, frames = sample.shape[:3]
+        frames = sample.shape[2]
         if frames != 1:
             raise ValueError("predict_action expects exactly one logical frame")
-        frame_ids = self._normalize_frame_ids(
-            [frame_id],
-            batch_size=batch_size,
-            frames=1,
-            device=sample.device,
-        )
-        timesteps = self._normalize_timesteps(
-            timestep,
-            batch_size=batch_size,
-            frames=1,
-            device=sample.device,
+        frame_ids, timesteps = self._stream_axes(
+            sample,
+            frame_ids=[frame_id],
+            timesteps=timestep,
         )
         transaction_id = state.new_transaction_id()
         stream = self._action_input(
@@ -444,16 +506,13 @@ class MOTIncrementalAdapter:
             version_id=0,
             valid_mask=valid_mask,
         )
-        try:
-            hidden = self._run_streams(
-                [stream],
-                text_emb=text_emb,
-                state=state,
-                transaction_id=transaction_id,
-            )[0]
-            return self.model._final_action(hidden, timesteps, tuple(sample.shape))
-        finally:
-            state.mot_cache.discard_transaction(transaction_id)
+        hidden = self._run_transaction(
+            stream,
+            text_emb=text_emb,
+            state=state,
+            transaction_id=transaction_id,
+        )
+        return self.model._final_action(hidden, timesteps, tuple(sample.shape))
 
     def commit_video(
         self,
@@ -467,28 +526,13 @@ class MOTIncrementalAdapter:
         version_id: int,
         valid_frames: torch.Tensor | None = None,
     ) -> None:
-        batch_size, _channels, frames = latents.shape[:3]
-        frame_ids = self._normalize_frame_ids(
-            frame_ids,
-            batch_size=batch_size,
-            frames=frames,
-            device=latents.device,
-        )
-        zeros = torch.zeros((batch_size, frames), device=latents.device)
-        transaction_id = state.new_transaction_id()
-        noisy, _shape = self._video_input(
+        frame_ids, zeros = self._stream_axes(
             latents,
             frame_ids=frame_ids,
-            timesteps=zeros,
-            stream_ids=stream_ids,
-            noise_id=NOISE_NOISY,
-            committed=False,
-            transaction_id=transaction_id,
-            source=source,
-            version_id=version_id,
-            valid_frames=valid_frames,
+            timesteps=0,
         )
-        clean, _shape = self._video_input(
+        transaction_id = state.new_transaction_id()
+        clean, _ = self._video_input(
             latents,
             frame_ids=frame_ids,
             timesteps=zeros,
@@ -500,20 +544,13 @@ class MOTIncrementalAdapter:
             version_id=version_id,
             valid_frames=valid_frames,
         )
-        try:
-            self._run_streams(
-                [noisy, clean],
-                text_emb=text_emb,
-                state=state,
-                transaction_id=transaction_id,
-            )
-            state.mot_cache.commit_transaction(
-                transaction_id,
-                source_id=int(source),
-            )
-        except Exception:
-            state.mot_cache.discard_transaction(transaction_id)
-            raise
+        self._run_transaction(
+            clean,
+            text_emb=text_emb,
+            state=state,
+            transaction_id=transaction_id,
+            commit_source=source,
+        )
 
     def commit_action(
         self,
@@ -526,26 +563,12 @@ class MOTIncrementalAdapter:
         version_id: int,
         valid_mask: torch.Tensor | None = None,
     ) -> None:
-        batch_size, _channels, frames = actions.shape[:3]
-        frame_ids = self._normalize_frame_ids(
-            frame_ids,
-            batch_size=batch_size,
-            frames=frames,
-            device=actions.device,
-        )
-        zeros = torch.zeros((batch_size, frames), device=actions.device)
-        transaction_id = state.new_transaction_id()
-        noisy = self._action_input(
+        frame_ids, zeros = self._stream_axes(
             actions,
             frame_ids=frame_ids,
-            timesteps=zeros,
-            noise_id=NOISE_NOISY,
-            committed=False,
-            transaction_id=transaction_id,
-            source=source,
-            version_id=version_id,
-            valid_mask=valid_mask,
+            timesteps=0,
         )
+        transaction_id = state.new_transaction_id()
         clean = self._action_input(
             actions,
             frame_ids=frame_ids,
@@ -557,20 +580,13 @@ class MOTIncrementalAdapter:
             version_id=version_id,
             valid_mask=valid_mask,
         )
-        try:
-            self._run_streams(
-                [noisy, clean],
-                text_emb=text_emb,
-                state=state,
-                transaction_id=transaction_id,
-            )
-            state.mot_cache.commit_transaction(
-                transaction_id,
-                source_id=int(source),
-            )
-        except Exception:
-            state.mot_cache.discard_transaction(transaction_id)
-            raise
+        self._run_transaction(
+            clean,
+            text_emb=text_emb,
+            state=state,
+            transaction_id=transaction_id,
+            commit_source=source,
+        )
 
     def assert_video_commit(
         self,
@@ -580,12 +596,11 @@ class MOTIncrementalAdapter:
         source: CacheSource,
         version_id: int,
     ) -> None:
-        state.mot_cache.assert_committed_frame(
-            range(len(self.model.mot_blocks)),
+        self._assert_clean_commit(
+            state,
             frame_id=frame_id,
             stream_id=STREAM_VIDEO,
-            noise_ids=(NOISE_NOISY, NOISE_CLEAN),
-            source_id=int(source),
+            source=source,
             version_id=version_id,
         )
 
@@ -597,11 +612,10 @@ class MOTIncrementalAdapter:
         source: CacheSource,
         version_id: int,
     ) -> None:
-        state.mot_cache.assert_committed_frame(
-            range(len(self.model.mot_blocks)),
+        self._assert_clean_commit(
+            state,
             frame_id=frame_id,
             stream_id=STREAM_ACTION,
-            noise_ids=(NOISE_NOISY, NOISE_CLEAN),
-            source_id=int(source),
+            source=source,
             version_id=version_id,
         )

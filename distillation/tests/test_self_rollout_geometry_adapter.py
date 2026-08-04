@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
 
+import distillation.self_rollout.geometry_cache as geometry_cache_module
 from distillation.self_rollout.geometry_cache import (
     GeometryIncrementalAdapter,
     GeometryRolloutCache,
@@ -150,7 +152,7 @@ def _rgb(value: float) -> torch.Tensor:
     return torch.full((1, 1, 2, 1, 3, 1, 1), value)
 
 
-def test_geometry_adapter_commits_both_joint_and_relation_caches_and_truncates() -> None:
+def test_geometry_history_groups_are_mutually_visible_and_commit_together() -> None:
     adapter = GeometryIncrementalAdapter(
         _Model(),
         history_frames=2,
@@ -158,25 +160,37 @@ def test_geometry_adapter_commits_both_joint_and_relation_caches_and_truncates()
         window_size=16,
     )
     state = RolloutState(geometry_cache=GeometryRolloutCache())
-    first = adapter.encode_and_commit(
-        _rgb(1),
-        frame_id=0,
-        slot_valid_mask=torch.ones(1, 1, 2, dtype=torch.bool),
-        state=state,
-        source=CacheSource.HISTORY,
-        version_id=1,
-    )
-    second = adapter.encode_and_commit(
-        _rgb(2),
-        frame_id=1,
-        slot_valid_mask=torch.ones(1, 1, 2, dtype=torch.bool),
-        state=state,
-        source=CacheSource.HISTORY,
-        version_id=1,
-    )
+    visibility_calls = []
+    real_visibility = geometry_cache_module.build_cache_visibility
+
+    def record_visibility(query, key, *, window_size):
+        mask = real_visibility(query, key, window_size=window_size)
+        visibility_calls.append((query, key, mask))
+        return mask
+
+    with patch.object(
+        geometry_cache_module,
+        "build_cache_visibility",
+        new=record_visibility,
+    ):
+        first, second = adapter.encode_history_and_commit(
+            torch.cat([_rgb(1), _rgb(2)], dim=1),
+            frame_ids=[0, 1],
+            slot_valid_mask=torch.ones(1, 2, 2, dtype=torch.bool),
+            state=state,
+            source=CacheSource.HISTORY,
+            version_id=1,
+        )
 
     assert first.final_tokens.shape == second.final_tokens.shape == (1, 2, 2, 2)
     assert torch.isfinite(first.final_tokens).all()
+    assert len(visibility_calls) == 2
+    for query, key, mask in visibility_calls:
+        frame_zero_queries = query.frame_ids == 0
+        frame_one_keys = key.frame_ids == 1
+        assert frame_zero_queries.any()
+        assert frame_one_keys.any()
+        assert mask[frame_zero_queries][:, frame_one_keys[0]].all()
     adapter.assert_geometry_commit(
         state,
         frame_id=0,

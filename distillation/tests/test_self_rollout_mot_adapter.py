@@ -138,7 +138,7 @@ class _FailingMOTBlock(_MOTBlock):
         raise RuntimeError("injected layer failure")
 
 
-def test_mot_adapter_prediction_is_temporary_and_canonical_commit_is_persistent() -> None:
+def test_mot_adapter_prediction_is_temporary_and_clean_commit_is_persistent() -> None:
     model = _TinyModel()
     adapter = MOTIncrementalAdapter(
         model,
@@ -160,7 +160,7 @@ def test_mot_adapter_prediction_is_temporary_and_canonical_commit_is_persistent(
         source=CacheSource.HISTORY,
         version_id=1,
     )
-    assert state.mot_cache.committed_token_count(0) == 4
+    assert state.mot_cache.committed_token_count(0) == 2
     before = state.mot_cache.snapshot()
     output = adapter.predict_video(
         torch.ones(1, 2, 1, 1, 1, 1),
@@ -172,7 +172,7 @@ def test_mot_adapter_prediction_is_temporary_and_canonical_commit_is_persistent(
     )
     assert output.shape == (1, 2, 1, 1, 1, 1)
     state.mot_cache.assert_no_transactions()
-    assert state.mot_cache.committed_token_count(0) == 4
+    assert state.mot_cache.committed_token_count(0) == 2
     assert state.mot_cache.snapshot().committed.keys() == before.committed.keys()
 
     adapter.commit_video(
@@ -184,7 +184,7 @@ def test_mot_adapter_prediction_is_temporary_and_canonical_commit_is_persistent(
         source=CacheSource.PREDICTED,
         version_id=1,
     )
-    assert state.mot_cache.committed_token_count(0) == 6
+    assert state.mot_cache.committed_token_count(0) == 3
     adapter.assert_video_commit(
         state,
         frame_id=2,
@@ -193,7 +193,7 @@ def test_mot_adapter_prediction_is_temporary_and_canonical_commit_is_persistent(
     )
 
 
-def test_action_commit_uses_na_and_ca_and_respects_token_validity() -> None:
+def test_action_commit_uses_only_clean_kv_and_respects_token_validity() -> None:
     adapter = MOTIncrementalAdapter(
         _TinyModel(),
         history_frames=2,
@@ -213,8 +213,8 @@ def test_action_commit_uses_na_and_ca_and_respects_token_validity() -> None:
         valid_mask=valid,
     )
     _key, _value, metadata = state.mot_cache.materialize(0)
-    assert metadata.seq_len == 4
-    assert metadata.valid_ids.tolist() == [[True, False, True, False]]
+    assert metadata.seq_len == 2
+    assert metadata.valid_ids.tolist() == [[True, False]]
     adapter.assert_action_commit(
         state,
         frame_id=2,

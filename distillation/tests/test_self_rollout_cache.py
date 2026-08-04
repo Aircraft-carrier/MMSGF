@@ -117,7 +117,7 @@ def test_truncate_splits_a_multi_frame_prefill_segment() -> None:
     assert remaining.frame_ids.tolist() == [[0, 1]]
 
 
-def test_geometry_visibility_is_strictly_earlier_and_committed() -> None:
+def test_geometry_visibility_uses_commit_order_and_stays_geometry_only() -> None:
     query = _meta(
         5,
         stream=STREAM_GEOMETRY,
@@ -130,36 +130,28 @@ def test_geometry_visibility_is_strictly_earlier_and_committed() -> None:
             _meta(4, stream=STREAM_GEOMETRY, noise=NOISE_GEOMETRY, committed=True),
             _meta(5, stream=STREAM_GEOMETRY, noise=NOISE_GEOMETRY, committed=True),
             _meta(
-                3,
+                5,
                 stream=STREAM_GEOMETRY,
                 noise=NOISE_GEOMETRY,
                 committed=False,
                 transaction_id=10,
             ),
-            _meta(6, stream=STREAM_GEOMETRY, noise=NOISE_GEOMETRY, committed=True),
+            _meta(
+                5,
+                stream=STREAM_GEOMETRY,
+                noise=NOISE_GEOMETRY,
+                committed=False,
+                transaction_id=11,
+            ),
             _meta(4, stream=STREAM_VIDEO, noise=NOISE_CLEAN, committed=True),
         ]
     )
     mask = build_cache_visibility(query, keys, window_size=16)[0, 0]
-    assert mask.tolist() == [True, False, False, False, False]
+    assert mask.tolist() == [True, True, True, False, False]
 
 
-def test_history_block_prefill_matches_full_policy_and_framewise_prefill_does_not() -> None:
+def test_multi_frame_transaction_is_one_current_commit_unit() -> None:
     frames = torch.arange(4)
-    noisy = build_token_metadata(
-        batch_size=1,
-        frame_ids=frames,
-        tokens_per_frame=1,
-        stream_id=STREAM_VIDEO,
-        noise_id=NOISE_NOISY,
-        history_frames=4,
-        chunk_size=4,
-        device=torch.device("cpu"),
-        committed=False,
-        transaction_id=7,
-        source_id=SOURCE_HISTORY,
-        version_id=1,
-    )
     clean = build_token_metadata(
         batch_size=1,
         frame_ids=frames,
@@ -174,25 +166,16 @@ def test_history_block_prefill_matches_full_policy_and_framewise_prefill_does_no
         source_id=SOURCE_HISTORY,
         version_id=1,
     )
-    block = TokenMetadataBatch.cat([noisy, clean])
-    full_history_mask = build_cache_visibility(block, block, window_size=16)
+    mask = build_cache_visibility(clean, clean, window_size=16)
+    assert mask.shape == (1, 4, 4)
+    assert mask.all()
 
-    # The incremental history prefill is one transaction containing every
-    # same-order history frame, so its rectangular mask is exactly the full
-    # training-policy history submatrix.
-    incremental_history_mask = build_cache_visibility(block, block, window_size=16)
-    assert torch.equal(incremental_history_mask, full_history_mask)
-    assert full_history_mask[0, 0, 3]
-
-    # A frame-at-a-time prefill of H0 would expose only H0 and lose the allowed
-    # H0->H1/H2/H3 same-order relation, proving why history must be one block.
-    first_frame = TokenMetadataBatch.cat([noisy.slice(0, 1), clean.slice(0, 1)])
+    first_frame = clean.slice(0, 1)
     framewise_mask = build_cache_visibility(first_frame, first_frame, window_size=16)
-    assert framewise_mask.shape[-1] == 2
-    assert full_history_mask.shape[-1] == 8
+    assert framewise_mask.shape == (1, 1, 1)
 
 
-def test_current_video_and_action_follow_no_leak_and_phase_order() -> None:
+def test_video_and_action_read_all_committed_kv_and_their_own_transaction() -> None:
     current_nv = _meta(
         5,
         stream=STREAM_VIDEO,
@@ -201,8 +184,8 @@ def test_current_video_and_action_follow_no_leak_and_phase_order() -> None:
         transaction_id=11,
     )
     current_nv_key = current_nv
-    current_cv = _meta(5, stream=STREAM_VIDEO, noise=NOISE_CLEAN, committed=True)
-    current_g = _meta(5, stream=STREAM_GEOMETRY, noise=NOISE_GEOMETRY, committed=True)
+    committed_video = _meta(5, stream=STREAM_VIDEO, noise=NOISE_CLEAN, committed=True)
+    committed_geometry = _meta(5, stream=STREAM_GEOMETRY, noise=NOISE_GEOMETRY, committed=True)
     current_na = _meta(
         5,
         stream=STREAM_ACTION,
@@ -210,17 +193,28 @@ def test_current_video_and_action_follow_no_leak_and_phase_order() -> None:
         committed=False,
         transaction_id=12,
     )
-    future_cv = _meta(6, stream=STREAM_VIDEO, noise=NOISE_CLEAN, committed=True)
-    video_keys = TokenMetadataBatch.cat([current_nv_key, current_cv, current_g, future_cv])
+    committed_action = _meta(6, stream=STREAM_ACTION, noise=NOISE_CLEAN, committed=True)
+    other_transaction = _meta(
+        5,
+        stream=STREAM_VIDEO,
+        noise=NOISE_NOISY,
+        committed=False,
+        transaction_id=99,
+    )
+    video_keys = TokenMetadataBatch.cat(
+        [current_nv_key, committed_video, committed_geometry, committed_action, other_transaction]
+    )
     video_mask = build_cache_visibility(current_nv, video_keys, window_size=16)[0, 0]
-    assert video_mask.tolist() == [True, False, False, False]
+    assert video_mask.tolist() == [True, True, True, True, False]
 
-    action_keys = TokenMetadataBatch.cat([current_na, current_cv, current_g, future_cv])
+    action_keys = TokenMetadataBatch.cat(
+        [current_na, committed_video, committed_geometry, committed_action, other_transaction]
+    )
     action_mask = build_cache_visibility(current_na, action_keys, window_size=16)[0, 0]
-    assert action_mask.tolist() == [True, True, True, False]
+    assert action_mask.tolist() == [True, True, True, True, False]
 
 
-def test_visibility_respects_window_and_other_transactions() -> None:
+def test_visibility_ignores_frame_window_but_rejects_other_transactions() -> None:
     query = _meta(
         9,
         stream=STREAM_ACTION,
@@ -241,7 +235,7 @@ def test_visibility_respects_window_and_other_transactions() -> None:
         TokenMetadataBatch.cat([old, other_tx]),
         window_size=4,
     )[0, 0]
-    assert mask.tolist() == [False, False]
+    assert mask.tolist() == [True, False]
 
 
 def test_incremental_attention_handles_empty_or_fully_masked_keys() -> None:
@@ -371,7 +365,7 @@ def test_cache_version_assertion_rejects_stale_committed_kv() -> None:
         raise AssertionError("stale K/V version was not rejected")
 
 
-def test_canonical_barrier_rejects_missing_layer_or_clean_stream() -> None:
+def test_canonical_barrier_requires_one_clean_stream_per_layer() -> None:
     cache = SelfRolloutKVCache()
     noisy = _meta(
         4,
@@ -389,8 +383,7 @@ def test_canonical_barrier_rejects_missing_layer_or_clean_stream() -> None:
         source=SOURCE_PREDICTED,
         version=2,
     )
-    cache.append_committed(0, _segment(noisy, 1))
-    cache.append_committed(0, _segment(clean, 2))
+    cache.append_committed(0, _segment(clean, 1))
     cache.append_committed(1, _segment(noisy, 3))
 
     try:
@@ -398,7 +391,7 @@ def test_canonical_barrier_rejects_missing_layer_or_clean_stream() -> None:
             range(3),
             frame_id=4,
             stream_id=STREAM_VIDEO,
-            noise_ids=(NOISE_NOISY, NOISE_CLEAN),
+            noise_ids=(NOISE_CLEAN,),
             source_id=SOURCE_PREDICTED,
             version_id=2,
         )

@@ -66,6 +66,28 @@ class _FakeGeometryAdapter:
     def __init__(self):
         self.events = []
 
+    def encode_history_and_commit(
+        self,
+        rgb,
+        *,
+        frame_ids,
+        slot_valid_mask,
+        state,
+        source,
+        **kwargs,
+    ):
+        return [
+            self.encode_and_commit(
+                rgb[:, index : index + 1],
+                frame_id=frame_id,
+                slot_valid_mask=slot_valid_mask[:, index : index + 1],
+                state=state,
+                source=source,
+                **kwargs,
+            )
+            for index, frame_id in enumerate(frame_ids)
+        ]
+
     def encode_and_commit(self, rgb, *, frame_id, state, source, **kwargs):
         del kwargs
         self.events.append((frame_id, source.name, rgb.detach().clone()))

@@ -1,4 +1,17 @@
-"""End-to-end latent -> geometry -> action incremental self rollout."""
+"""End-to-end latent -> geometry -> action incremental self rollout.
+
+The cache is built in semantic commit order::
+
+    history:  clean V[0:H] -> mutually-visible G[0:H] -> clean A[0:H]
+    anchor:   clean V[H]   -> G[H]                  -> clean A[H]
+    frame f:  predict V[f] -> commit clean V[f]
+              derive G[f]  -> commit G[f]
+              predict A[f] -> commit clean A[f]
+
+Prediction transactions contain noisy query K/V only temporarily and are
+discarded after each denoising call.  A commit is the causal boundary seen by
+all later video/action queries; geometry additionally filters keys by stream.
+"""
 from __future__ import annotations
 
 from typing import Any, Callable
@@ -272,42 +285,14 @@ def self_rollout(
             action_num_steps=action_num_steps,
         )
 
-    def assert_video_phase(
+    def assert_phase(
+        adapter,
+        barrier_name: str,
         frame_id: int,
         source: CacheSource,
         version_id: int,
     ) -> None:
-        barrier = getattr(mot_adapter, "assert_video_commit", None)
-        if barrier is not None:
-            barrier(
-                state,
-                frame_id=frame_id,
-                source=source,
-                version_id=version_id,
-            )
-        state.assert_cache_versions()
-
-    def assert_geometry_phase(
-        frame_id: int,
-        source: CacheSource,
-        version_id: int,
-    ) -> None:
-        barrier = getattr(geometry_adapter, "assert_geometry_commit", None)
-        if barrier is not None:
-            barrier(
-                state,
-                frame_id=frame_id,
-                source=source,
-                version_id=version_id,
-            )
-        state.assert_cache_versions()
-
-    def assert_action_phase(
-        frame_id: int,
-        source: CacheSource,
-        version_id: int,
-    ) -> None:
-        barrier = getattr(mot_adapter, "assert_action_commit", None)
+        barrier = getattr(adapter, barrier_name, None)
         if barrier is not None:
             barrier(
                 state,
@@ -345,6 +330,105 @@ def self_rollout(
     target_actions = actions.clone()
     target_geometry_rgb = geometry_rgb.clone()
 
+    def commit_video_phase(
+        frame_id: int,
+        video: torch.Tensor,
+        *,
+        source: CacheSource,
+        version_id: int,
+        save_next_checkpoint: bool = True,
+    ) -> None:
+        """Commit clean video K/V and advance the semantic frame to geometry."""
+
+        mot_adapter.commit_video(
+            video,
+            frame_ids=[frame_id],
+            stream_ids=stream_ids,
+            text_emb=text_emb,
+            state=state,
+            source=source,
+            version_id=version_id,
+            valid_frames=_frame_video_valid(working_batch, frame_id, device),
+        )
+        frame = state.frame(frame_id)
+        frame.video_latent = video
+        frame.video_source = source
+        frame.video_version = version_id
+        assert_phase(
+            mot_adapter,
+            "assert_video_commit",
+            frame_id,
+            source,
+            version_id,
+        )
+        if save_next_checkpoint:
+            state.save_phase_checkpoint(frame_id, RolloutPhase.GEOMETRY)
+
+    def commit_geometry_phase(
+        frame_id: int,
+        geometry: torch.Tensor,
+        *,
+        source: CacheSource,
+        version_id: int,
+        save_next_checkpoint: bool = True,
+    ) -> None:
+        """Commit geometry K/V and advance the semantic frame to action."""
+
+        encoded = geometry_adapter.encode_and_commit(
+            geometry,
+            frame_id=frame_id,
+            slot_valid_mask=_frame_geometry_valid(working_batch, frame_id, device),
+            state=state,
+            source=source,
+            version_id=version_id,
+        )
+        frame = state.frame(frame_id)
+        frame.geometry_rgb = geometry
+        frame.geometry_state = encoded
+        frame.geometry_source = source
+        frame.geometry_version = version_id
+        assert_phase(
+            geometry_adapter,
+            "assert_geometry_commit",
+            frame_id,
+            source,
+            version_id,
+        )
+        if save_next_checkpoint:
+            state.save_phase_checkpoint(frame_id, RolloutPhase.ACTION)
+
+    def commit_action_phase(
+        frame_id: int,
+        action: torch.Tensor,
+        *,
+        source: CacheSource,
+        version_id: int,
+    ) -> None:
+        """Commit clean action K/V and finish one semantic frame."""
+
+        mot_adapter.commit_action(
+            action,
+            frame_ids=[frame_id],
+            text_emb=text_emb,
+            state=state,
+            source=source,
+            version_id=version_id,
+            valid_mask=_frame_action_valid(working_batch, frame_id, device),
+        )
+        frame = state.frame(frame_id)
+        frame.action = action
+        frame.action_source = source
+        frame.action_version = version_id
+        assert_phase(
+            mot_adapter,
+            "assert_action_commit",
+            frame_id,
+            source,
+            version_id,
+        )
+
+    # Stage 1: history V/A are batched commits; all history G groups share one
+    # transaction so the G-history mask is a full square rather than triangular.
     history_ids = list(range(history_frames))
     mot_adapter.commit_video(
         latents[:, :, :history_frames],
@@ -364,22 +448,41 @@ def self_rollout(
         frame.video_source = CacheSource.HISTORY
         frame.video_version = 1
     for frame_id in history_ids:
-        assert_video_phase(frame_id, CacheSource.HISTORY, 1)
-    for frame_id in history_ids:
-        encoded = geometry_adapter.encode_and_commit(
-            geometry_rgb[:, frame_id : frame_id + 1],
-            frame_id=frame_id,
-            slot_valid_mask=_frame_geometry_valid(working_batch, frame_id, device),
-            state=state,
-            source=CacheSource.HISTORY,
-            version_id=1,
+        assert_phase(
+            mot_adapter,
+            "assert_video_commit",
+            frame_id,
+            CacheSource.HISTORY,
+            1,
         )
+    history_geometry = geometry_adapter.encode_history_and_commit(
+        geometry_rgb[:, :history_frames],
+        frame_ids=history_ids,
+        slot_valid_mask=working_batch["geometry_group_valid_mask"][
+            :, :history_frames
+        ],
+        state=state,
+        source=CacheSource.HISTORY,
+        version_id=1,
+    )
+    if len(history_geometry) != history_frames:
+        raise RuntimeError(
+            "history geometry prefill returned "
+            f"{len(history_geometry)} groups for {history_frames} frames"
+        )
+    for frame_id, encoded in zip(history_ids, history_geometry):
         frame = state.frame(frame_id)
         frame.geometry_rgb = geometry_rgb[:, frame_id : frame_id + 1]
         frame.geometry_state = encoded
         frame.geometry_source = CacheSource.HISTORY
         frame.geometry_version = 1
-        assert_geometry_phase(frame_id, CacheSource.HISTORY, 1)
+        assert_phase(
+            geometry_adapter,
+            "assert_geometry_commit",
+            frame_id,
+            CacheSource.HISTORY,
+            1,
+        )
     mot_adapter.commit_action(
         actions[:, :, :history_frames],
         frame_ids=history_ids,
@@ -397,49 +500,36 @@ def self_rollout(
         frame.action_source = CacheSource.HISTORY
         frame.action_version = 1
     for frame_id in history_ids:
-        assert_action_phase(frame_id, CacheSource.HISTORY, 1)
+        assert_phase(
+            mot_adapter,
+            "assert_action_commit",
+            frame_id,
+            CacheSource.HISTORY,
+            1,
+        )
 
-    mot_adapter.commit_video(
+    # Stage 2: the anchor establishes the first strictly incremental V -> G -> A
+    # boundary.  It does not need replay checkpoints because it is never replaced.
+    commit_video_phase(
+        anchor,
         latents[:, :, anchor : anchor + 1],
-        frame_ids=[anchor],
-        stream_ids=stream_ids,
-        text_emb=text_emb,
-        state=state,
         source=CacheSource.ANCHOR,
         version_id=1,
-        valid_frames=_frame_video_valid(working_batch, anchor, device),
+        save_next_checkpoint=False,
     )
-    anchor_state = state.frame(anchor)
-    anchor_state.video_latent = latents[:, :, anchor : anchor + 1]
-    anchor_state.video_source = CacheSource.ANCHOR
-    anchor_state.video_version = 1
-    assert_video_phase(anchor, CacheSource.ANCHOR, 1)
-    anchor_geometry = geometry_adapter.encode_and_commit(
+    commit_geometry_phase(
+        anchor,
         geometry_rgb[:, anchor : anchor + 1],
-        frame_id=anchor,
-        slot_valid_mask=_frame_geometry_valid(working_batch, anchor, device),
-        state=state,
         source=CacheSource.ANCHOR,
         version_id=1,
+        save_next_checkpoint=False,
     )
-    anchor_state.geometry_rgb = geometry_rgb[:, anchor : anchor + 1]
-    anchor_state.geometry_state = anchor_geometry
-    anchor_state.geometry_source = CacheSource.ANCHOR
-    anchor_state.geometry_version = 1
-    assert_geometry_phase(anchor, CacheSource.ANCHOR, 1)
-    mot_adapter.commit_action(
+    commit_action_phase(
+        anchor,
         actions[:, :, anchor : anchor + 1],
-        frame_ids=[anchor],
-        text_emb=text_emb,
-        state=state,
         source=CacheSource.ANCHOR,
         version_id=1,
-        valid_mask=_frame_action_valid(working_batch, anchor, device),
     )
-    anchor_state.action = actions[:, :, anchor : anchor + 1]
-    anchor_state.action_source = CacheSource.ANCHOR
-    anchor_state.action_version = 1
-    assert_action_phase(anchor, CacheSource.ANCHOR, 1)
 
     pending_ground_truth: dict[int, GroundTruthStep] = {}
 
@@ -535,63 +625,6 @@ def self_rollout(
             if valid is not None:
                 sample = sample * valid.to(dtype=sample.dtype)
         return sample
-
-    def commit_frame(
-        frame_id: int,
-        *,
-        video: torch.Tensor,
-        geometry: torch.Tensor,
-        action: torch.Tensor,
-        video_source: CacheSource,
-        geometry_source: CacheSource,
-        action_source: CacheSource,
-        video_version: int,
-        geometry_version: int,
-        action_version: int,
-    ) -> None:
-        mot_adapter.commit_video(
-            video,
-            frame_ids=[frame_id],
-            stream_ids=stream_ids,
-            text_emb=text_emb,
-            state=state,
-            source=video_source,
-            version_id=video_version,
-            valid_frames=_frame_video_valid(working_batch, frame_id, device),
-        )
-        frame = state.frame(frame_id)
-        frame.video_latent = video
-        frame.video_source = video_source
-        frame.video_version = video_version
-        assert_video_phase(frame_id, video_source, video_version)
-        state.save_phase_checkpoint(frame_id, RolloutPhase.GEOMETRY)
-        encoded = geometry_adapter.encode_and_commit(
-            geometry,
-            frame_id=frame_id,
-            slot_valid_mask=_frame_geometry_valid(working_batch, frame_id, device),
-            state=state,
-            source=geometry_source,
-            version_id=geometry_version,
-        )
-        frame.geometry_rgb = geometry
-        frame.geometry_state = encoded
-        frame.geometry_source = geometry_source
-        frame.geometry_version = geometry_version
-        assert_geometry_phase(frame_id, geometry_source, geometry_version)
-        state.save_phase_checkpoint(frame_id, RolloutPhase.ACTION)
-        mot_adapter.commit_action(
-            action,
-            frame_ids=[frame_id],
-            text_emb=text_emb,
-            state=state,
-            source=action_source,
-            version_id=action_version,
-            valid_mask=_frame_action_valid(working_batch, frame_id, device),
-        )
-        frame.action = action
-        frame.action_source = action_source
-        frame.action_version = action_version
-        assert_action_phase(frame_id, action_source, action_version)
 
     def replace_current(
         frame_id: int,
@@ -690,51 +723,26 @@ def self_rollout(
                 action_source = CacheSource.GROUND_TRUTH
             elif replacement_policy == "recompute_predicted":
                 # V/G must be committed before action is recomputed.
-                mot_adapter.commit_video(
+                commit_video_phase(
+                    frame_id,
                     video,
-                    frame_ids=[frame_id],
-                    stream_ids=stream_ids,
-                    text_emb=text_emb,
-                    state=state,
                     source=video_source,
                     version_id=video_version,
-                    valid_frames=_frame_video_valid(working_batch, frame_id, device),
                 )
-                frame = state.frame(frame_id)
-                frame.video_latent = video
-                frame.video_source = video_source
-                frame.video_version = video_version
-                assert_video_phase(frame_id, video_source, video_version)
-                state.save_phase_checkpoint(frame_id, RolloutPhase.GEOMETRY)
-                encoded = geometry_adapter.encode_and_commit(
+                commit_geometry_phase(
+                    frame_id,
                     geometry,
-                    frame_id=frame_id,
-                    slot_valid_mask=_frame_geometry_valid(working_batch, frame_id, device),
-                    state=state,
                     source=geometry_source,
                     version_id=geometry_version,
                 )
-                frame.geometry_rgb = geometry
-                frame.geometry_state = encoded
-                frame.geometry_source = geometry_source
-                frame.geometry_version = geometry_version
-                assert_geometry_phase(frame_id, geometry_source, geometry_version)
-                state.save_phase_checkpoint(frame_id, RolloutPhase.ACTION)
                 action = sample_action(frame_id)
                 action_source = CacheSource.PREDICTED
-                mot_adapter.commit_action(
+                commit_action_phase(
+                    frame_id,
                     action,
-                    frame_ids=[frame_id],
-                    text_emb=text_emb,
-                    state=state,
                     source=action_source,
                     version_id=action_version,
-                    valid_mask=_frame_action_valid(working_batch, frame_id, device),
                 )
-                frame.action = action
-                frame.action_source = action_source
-                frame.action_version = action_version
-                assert_action_phase(frame_id, action_source, action_version)
                 action = None
             else:
                 raise ValueError(
@@ -742,41 +750,34 @@ def self_rollout(
                     "use replacement_policy='recompute_predicted'"
                 )
             if action is not None:
-                commit_frame(
+                commit_video_phase(
                     frame_id,
-                    video=video,
-                    geometry=geometry,
-                    action=action,
-                    video_source=video_source,
-                    geometry_source=geometry_source,
-                    action_source=action_source,
-                    video_version=video_version,
-                    geometry_version=geometry_version,
-                    action_version=action_version,
+                    video,
+                    source=video_source,
+                    version_id=video_version,
+                )
+                commit_geometry_phase(
+                    frame_id,
+                    geometry,
+                    source=geometry_source,
+                    version_id=geometry_version,
+                )
+                commit_action_phase(
+                    frame_id,
+                    action,
+                    source=action_source,
+                    version_id=action_version,
                 )
         elif gt_geometry_rgb is not None:
             state.delete_predicted(frame_id, RolloutPhase.GEOMETRY)
-            frame = state.frame(frame_id)
             geometry = checked("geometry_rgb", gt_geometry_rgb, geometry_reference)
             target_geometry_rgb[:, frame_id : frame_id + 1] = geometry
-            encoded = geometry_adapter.encode_and_commit(
+            commit_geometry_phase(
+                frame_id,
                 geometry,
-                frame_id=frame_id,
-                slot_valid_mask=_frame_geometry_valid(working_batch, frame_id, device),
-                state=state,
                 source=CacheSource.GROUND_TRUTH,
                 version_id=geometry_version,
             )
-            frame.geometry_rgb = geometry
-            frame.geometry_state = encoded
-            frame.geometry_source = CacheSource.GROUND_TRUTH
-            frame.geometry_version = geometry_version
-            assert_geometry_phase(
-                frame_id,
-                CacheSource.GROUND_TRUTH,
-                geometry_version,
-            )
-            state.save_phase_checkpoint(frame_id, RolloutPhase.ACTION)
             if gt.action is not None:
                 action = checked("action", gt.action, action_reference)
                 target_actions[:, :, frame_id : frame_id + 1] = action
@@ -789,40 +790,21 @@ def self_rollout(
                     "geometry replacement invalidates action; provide gt.action or "
                     "use replacement_policy='recompute_predicted'"
                 )
-            mot_adapter.commit_action(
+            commit_action_phase(
+                frame_id,
                 action,
-                frame_ids=[frame_id],
-                text_emb=text_emb,
-                state=state,
                 source=action_source,
                 version_id=action_version,
-                valid_mask=_frame_action_valid(working_batch, frame_id, device),
             )
-            frame.action = action
-            frame.action_source = action_source
-            frame.action_version = action_version
-            assert_action_phase(frame_id, action_source, action_version)
         elif gt.action is not None:
             state.delete_predicted(frame_id, RolloutPhase.ACTION)
             action = checked("action", gt.action, action_reference)
             target_actions[:, :, frame_id : frame_id + 1] = action
-            mot_adapter.commit_action(
+            commit_action_phase(
+                frame_id,
                 action,
-                frame_ids=[frame_id],
-                text_emb=text_emb,
-                state=state,
                 source=CacheSource.GROUND_TRUTH,
                 version_id=action_version,
-                valid_mask=_frame_action_valid(working_batch, frame_id, device),
-            )
-            frame = state.frame(frame_id)
-            frame.action = action
-            frame.action_source = CacheSource.GROUND_TRUTH
-            frame.action_version = action_version
-            assert_action_phase(
-                frame_id,
-                CacheSource.GROUND_TRUTH,
-                action_version,
             )
         state.generator.set_state(prediction_generator_state)
         state.predictions.replacements.append(
@@ -842,60 +824,37 @@ def self_rollout(
             }
         )
 
+    # Stage 3: each predicted frame crosses three commit barriers.  The phase
+    # checkpoints let a ground-truth replacement replay only its downstream work.
     for frame_id in range(anchor + 1, end_frame + 1):
         state.save_checkpoint_before(frame_id)
         try:
             predicted_video = sample_video(frame_id)
             state.predictions.video[frame_id] = predicted_video.detach().clone()
-            mot_adapter.commit_video(
+            commit_video_phase(
+                frame_id,
                 predicted_video,
-                frame_ids=[frame_id],
-                stream_ids=stream_ids,
-                text_emb=text_emb,
-                state=state,
                 source=CacheSource.PREDICTED,
                 version_id=1,
-                valid_frames=_frame_video_valid(working_batch, frame_id, device),
             )
-            frame = state.frame(frame_id)
-            frame.video_latent = predicted_video
-            frame.video_source = CacheSource.PREDICTED
-            frame.video_version = 1
-            assert_video_phase(frame_id, CacheSource.PREDICTED, 1)
-            state.save_phase_checkpoint(frame_id, RolloutPhase.GEOMETRY)
 
             predicted_geometry = predicted_geometry_for(frame_id, predicted_video)
             state.predictions.geometry[frame_id] = predicted_geometry.detach().clone()
-            encoded = geometry_adapter.encode_and_commit(
+            commit_geometry_phase(
+                frame_id,
                 predicted_geometry,
-                frame_id=frame_id,
-                slot_valid_mask=_frame_geometry_valid(working_batch, frame_id, device),
-                state=state,
                 source=CacheSource.PREDICTED,
                 version_id=1,
             )
-            frame.geometry_rgb = predicted_geometry
-            frame.geometry_state = encoded
-            frame.geometry_source = CacheSource.PREDICTED
-            frame.geometry_version = 1
-            assert_geometry_phase(frame_id, CacheSource.PREDICTED, 1)
-            state.save_phase_checkpoint(frame_id, RolloutPhase.ACTION)
 
             predicted_action = sample_action(frame_id)
             state.predictions.action[frame_id] = predicted_action.detach().clone()
-            mot_adapter.commit_action(
+            commit_action_phase(
+                frame_id,
                 predicted_action,
-                frame_ids=[frame_id],
-                text_emb=text_emb,
-                state=state,
                 source=CacheSource.PREDICTED,
                 version_id=1,
-                valid_mask=_frame_action_valid(working_batch, frame_id, device),
             )
-            frame.action = predicted_action
-            frame.action_source = CacheSource.PREDICTED
-            frame.action_version = 1
-            assert_action_phase(frame_id, CacheSource.PREDICTED, 1)
             prediction_generator_state = state.generator.get_state().clone()
             action_snapshot = state.phase_checkpoints[
                 (frame_id, RolloutPhase.ACTION)

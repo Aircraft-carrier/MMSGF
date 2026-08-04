@@ -45,11 +45,7 @@ from wan_va.modules.mot_attention import (
     build_mot_metadata,
     build_x_metadata,
 )
-from distillation.self_rollout.attention import (
-    build_cache_visibility,
-    from_mot_metadata,
-    segmented_orders,
-)
+from distillation.self_rollout.attention import segmented_orders
 
 
 DEFAULT_BATCH_SIZE = 1
@@ -125,6 +121,7 @@ def build_mot_metadata4sgf() -> MOTMaskMetadata:
     metadata.order_ids = torch.cat(
         [video_order, video_order, video_order, action_order, action_order], dim=1
     )
+
     metadata.cache_key = None
     metadata.structure_cache_key = None
     return metadata
@@ -152,17 +149,10 @@ def build_default_x_metadata_and_mask() -> tuple[MOTMaskMetadata, torch.Tensor]:
 
 
 def build_default_mot_metadata_and_mask() -> tuple[MOTMaskMetadata, torch.Tensor]:
-    """Build the configured 8-frame joint mask with one V/G/A token per frame."""
+    """Build the configured training-time 8-frame joint MOT mask."""
 
     metadata = build_mot_metadata4sgf()
-    policy_metadata = from_mot_metadata(metadata)
-    return metadata, build_cache_visibility(
-        policy_metadata,
-        policy_metadata,
-        window_size=metadata.window_size,
-    )[0]
-
-
+    return metadata, build_dense_mot_mask(metadata)[0]
 
 
 def render_metadata_mask(
@@ -377,9 +367,18 @@ def test_visualize_default_mot_metadata_mask(tmp_path):
     assert bool(mask[12, 16])
     assert bool(mask[8, 9])
     assert not bool(mask[8, 0])
-    assert not bool(mask[16, 16])
-    assert not bool(mask[16, 17])
+    assert bool(mask[16, 16])
+    assert bool(mask[16, 17])
     assert bool(mask[20, 19])
+
+    geometry = mask[16:24, 16:24]
+    assert bool(geometry[:4, :4].all())
+    assert not bool(geometry[:4, 4:].any())
+    for frame in range(4, 8):
+        assert bool(geometry[frame, : frame + 1].all())
+        assert not bool(geometry[frame, frame + 1 :].any())
+    assert not bool(mask[16:24, :16].any())
+    assert not bool(mask[16:24, 24:].any())
 
     output_path = render_metadata_mask(
         metadata,

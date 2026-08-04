@@ -1,4 +1,4 @@
-"""Incremental VGGTO geometry encoding with strict historical attention."""
+"""Incremental VGGTO geometry encoding with commit-ordered attention."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -64,7 +64,22 @@ class GeometryRolloutCache:
 
 
 class GeometryIncrementalAdapter:
-    """Encode one geometry group while reading only earlier committed G K/V."""
+    """Encode geometry from committed and current-transaction G K/V.
+
+    History groups are intentionally encoded in one transaction, so their mask
+    is a full ``H x H`` square.  Anchor and rollout groups use one transaction
+    each, which produces the causal extension below::
+
+        history              anchor / rollout
+        G0 G1 G2 G3          G0 G1 G2 G3 | G4 G5 ...
+        1  1  1  1       G4  1  1  1  1 | 1  .
+        1  1  1  1       G5  1  1  1  1 | 1  1
+        1  1  1  1
+        1  1  1  1
+
+    The same policy is used by VGGTO relation attention and joint MOT geometry
+    registers; only their physical caches differ.
+    """
 
     def __init__(
         self,
@@ -150,8 +165,8 @@ class GeometryIncrementalAdapter:
         *,
         batch_size: int,
         views: int,
-        frame_id: int,
-        tokens_per_view: int,
+        frame_ids: torch.Tensor,
+        tokens_per_group: int,
         slot_valid_mask: torch.Tensor | None,
         transaction_id: int,
         source: CacheSource,
@@ -161,23 +176,17 @@ class GeometryIncrementalAdapter:
         valid = None
         if slot_valid_mask is not None:
             slots = slot_valid_mask.shape[-1]
-            tokens_per_slot = tokens_per_view // slots
+            tokens_per_slot = tokens_per_group // slots
             valid = (
-                slot_valid_mask[:, 0, :]
-                .to(device=device, dtype=torch.bool)[:, None]
-                .expand(-1, views, -1)
-                .reshape(batch_size * views, slots)
+                slot_valid_mask.to(device=device, dtype=torch.bool)[:, None]
+                .expand(-1, views, -1, -1)
+                .reshape(batch_size * views, -1)
                 .repeat_interleave(tokens_per_slot, dim=1)
             )
         return build_token_metadata(
             batch_size=batch_size * views,
-            frame_ids=torch.full(
-                (batch_size * views, 1),
-                int(frame_id),
-                dtype=torch.long,
-                device=device,
-            ),
-            tokens_per_frame=tokens_per_view,
+            frame_ids=frame_ids,
+            tokens_per_frame=tokens_per_group,
             stream_id=STREAM_GEOMETRY,
             noise_id=NOISE_GEOMETRY,
             history_frames=self.history_frames,
@@ -190,77 +199,113 @@ class GeometryIncrementalAdapter:
             version_id=version_id,
         )
 
-    def _run_history_relation(
+    def _attend_transaction(
+        self,
+        *,
+        query: torch.Tensor,
+        current_key: torch.Tensor,
+        current_value: torch.Tensor,
+        metadata,
+        cache: SelfRolloutKVCache,
+        layer_id: int,
+        transaction_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append current K/V, attend over committed+self, and return visibility."""
+
+        cache.append_transaction(
+            layer_id,
+            transaction_id,
+            KVSegment(current_key, current_value, metadata),
+        )
+        key, value, key_meta = cache.materialize(
+            layer_id,
+            transaction_id=transaction_id,
+        )
+        mask = build_cache_visibility(
+            metadata,
+            key_meta,
+            window_size=self.window_size,
+        )
+        return incremental_attention(query, key, value, mask), mask.any(dim=-1)
+
+    def _run_relation_attention(
         self,
         grouped_tokens: torch.Tensor,
         *,
         patch_hw: tuple[int, int],
         layer_id: int,
-        frame_id: int,
+        frame_ids: torch.Tensor,
         slot_valid_mask: torch.Tensor | None,
         transaction_id: int,
         source: CacheSource,
         version_id: int,
         cache: GeometryRolloutCache,
     ) -> torch.Tensor:
-        batch_size, _groups, slots, views, num_tokens, channels = grouped_tokens.shape
+        batch_size, groups, slots, views, num_tokens, channels = grouped_tokens.shape
         view_major = grouped_tokens.permute(0, 3, 1, 2, 4, 5)
-        values = view_major.reshape(batch_size * views, slots * num_tokens, channels)
+        values = view_major.reshape(
+            batch_size * views,
+            groups * slots * num_tokens,
+            channels,
+        )
         block = self.vggto.inter_frame_blocks[layer_id]
         rope = self.vggto._full_token_rope(
             patch_hw,
-            slots,
+            groups * slots,
             values.device,
         )
         query, current_key, current_value = self._apply_vggto_qkv(block, values, rope)
         metadata = self._relation_metadata(
             batch_size=batch_size,
             views=views,
-            frame_id=frame_id,
-            tokens_per_view=slots * num_tokens,
+            frame_ids=frame_ids,
+            tokens_per_group=slots * num_tokens,
             slot_valid_mask=slot_valid_mask,
             transaction_id=transaction_id,
             source=source,
             version_id=version_id,
             device=values.device,
         )
-        cache.relation_cache.append_transaction(
-            layer_id,
-            transaction_id,
-            KVSegment(current_key, current_value, metadata),
-        )
-        key, value, key_meta = cache.relation_cache.materialize(
-            layer_id,
+        attended, visible = self._attend_transaction(
+            query=query,
+            current_key=current_key,
+            current_value=current_value,
+            metadata=metadata,
+            cache=cache.relation_cache,
+            layer_id=layer_id,
             transaction_id=transaction_id,
         )
-        mask = build_cache_visibility(metadata, key_meta, window_size=self.window_size)
-        attended = incremental_attention(query, key, value, mask)
         projected = block.attn.proj(attended.flatten(2, 3))
         projected = block.attn.proj_drop(projected)
-        visible = mask.any(dim=-1)
         projected = torch.where(visible[:, :, None], projected, torch.zeros_like(projected))
         values = values + block.ls1(projected)
         values = values + block.ls2(block.mlp(block.norm2(values)))
         return (
-            values.reshape(batch_size, views, 1, slots, num_tokens, channels)
+            values.reshape(batch_size, views, groups, slots, num_tokens, channels)
             .permute(0, 2, 3, 1, 4, 5)
-            .reshape(batch_size, slots * views, num_tokens, channels)
+            .reshape(batch_size, groups * slots * views, num_tokens, channels)
         )
 
     def _register_rotary(
         self,
         *,
         batch_size: int,
-        frame_id: int,
+        frame_ids: torch.Tensor,
         slots: int,
         views: int,
         register_tokens: int,
         device: torch.device,
     ) -> torch.Tensor:
-        frame = torch.full(
-            (slots, views, register_tokens),
-            float(frame_id),
+        frame_ids = torch.as_tensor(
+            frame_ids,
             device=device,
+            dtype=torch.float32,
+        )
+        frame = frame_ids[:, None, None, None].expand(
+            -1,
+            slots,
+            views,
+            register_tokens,
         )
         spatial = torch.full_like(frame, -1.0)
         grid = torch.stack(
@@ -273,7 +318,7 @@ class GeometryIncrementalAdapter:
         self,
         *,
         batch_size: int,
-        frame_id: int,
+        frame_ids: torch.Tensor,
         slots: int,
         views: int,
         registers: int,
@@ -286,19 +331,14 @@ class GeometryIncrementalAdapter:
         valid = None
         if slot_valid_mask is not None:
             valid = (
-                slot_valid_mask[:, 0, :, None, None]
+                slot_valid_mask[:, :, :, None, None]
                 .to(device=device, dtype=torch.bool)
-                .expand(-1, slots, views, registers)
+                .expand(-1, -1, -1, views, registers)
                 .reshape(batch_size, -1)
             )
         return build_token_metadata(
             batch_size=batch_size,
-            frame_ids=torch.full(
-                (batch_size, 1),
-                int(frame_id),
-                dtype=torch.long,
-                device=device,
-            ),
+            frame_ids=frame_ids,
             tokens_per_frame=slots * views * registers,
             stream_id=STREAM_GEOMETRY,
             noise_id=NOISE_GEOMETRY,
@@ -317,7 +357,8 @@ class GeometryIncrementalAdapter:
         registers: torch.Tensor,
         *,
         layer_id: int,
-        frame_id: int,
+        frame_ids: torch.Tensor,
+        groups: int,
         slots: int,
         views: int,
         slot_valid_mask: torch.Tensor | None,
@@ -330,7 +371,7 @@ class GeometryIncrementalAdapter:
         geometry_stream = self.model.mot_blocks[layer_id].geometry
         rotary = self._register_rotary(
             batch_size=batch_size,
-            frame_id=frame_id,
+            frame_ids=frame_ids,
             slots=slots,
             views=views,
             register_tokens=register_tokens,
@@ -342,7 +383,7 @@ class GeometryIncrementalAdapter:
         )
         metadata = self._joint_metadata(
             batch_size=batch_size,
-            frame_id=frame_id,
+            frame_ids=frame_ids,
             slots=slots,
             views=views,
             registers=register_tokens,
@@ -352,21 +393,19 @@ class GeometryIncrementalAdapter:
             version_id=version_id,
             device=registers.device,
         )
-        state.mot_cache.append_transaction(
-            layer_id,
-            transaction_id,
-            KVSegment(current_key, current_value, metadata),
-        )
-        key, value, key_meta = state.mot_cache.materialize(
-            layer_id,
+        attended, visible = self._attend_transaction(
+            query=query,
+            current_key=current_key,
+            current_value=current_value,
+            metadata=metadata,
+            cache=state.mot_cache,
+            layer_id=layer_id,
             transaction_id=transaction_id,
         )
-        mask = build_cache_visibility(metadata, key_meta, window_size=self.window_size)
-        attended = incremental_attention(query, key, value, mask)
         delta = geometry_stream.attn_delta(attended).reshape_as(registers)
-        visible = mask.any(dim=-1).reshape(
+        visible = visible.reshape(
             batch_size,
-            slots * views,
+            groups * slots * views,
             register_tokens,
         )
         delta = torch.where(visible[:, :, :, None], delta, torch.zeros_like(delta))
@@ -374,10 +413,10 @@ class GeometryIncrementalAdapter:
         updated = residual + geometry_stream.ffn_delta(residual)
         if slot_valid_mask is not None:
             valid = (
-                slot_valid_mask[:, 0, :, None]
+                slot_valid_mask[:, :, :, None]
                 .to(device=updated.device, dtype=torch.bool)
-                .expand(-1, slots, views)
-                .reshape(batch_size, slots * views)
+                .expand(-1, -1, -1, views)
+                .reshape(batch_size, groups * slots * views)
             )
             updated = torch.where(
                 valid[:, :, None, None],
@@ -386,27 +425,36 @@ class GeometryIncrementalAdapter:
             )
         return updated
 
-    def encode_and_commit(
+    def _encode_groups_and_commit(
         self,
         rgb: torch.Tensor,
         *,
-        frame_id: int,
+        frame_ids: torch.Tensor,
         slot_valid_mask: torch.Tensor | None,
         state: RolloutState,
         source: CacheSource,
         version_id: int,
         return_points: bool = False,
-    ) -> EncodedGeometryFrame:
-        if rgb.ndim != 7 or rgb.shape[1] != 1:
+    ) -> list[EncodedGeometryFrame]:
+        if rgb.ndim != 7:
             raise ValueError(
-                "geometry transaction expects [B,1,S,V,3,H,W], "
+                "geometry transaction expects [B,G,S,V,3,H,W], "
                 f"got {tuple(rgb.shape)}"
             )
-        batch_size, _groups, slots, views, channels, height, width = rgb.shape
+        batch_size, groups, slots, views, channels, height, width = rgb.shape
         if channels != 3:
             raise ValueError("geometry RGB must have three channels")
+        frame_ids = torch.as_tensor(
+            frame_ids,
+            dtype=torch.long,
+            device=rgb.device,
+        )
+        if tuple(frame_ids.shape) != (groups,):
+            raise ValueError(
+                f"frame_ids must be [{groups}], got {tuple(frame_ids.shape)}"
+            )
         if slot_valid_mask is not None:
-            expected = (batch_size, 1, slots)
+            expected = (batch_size, groups, slots)
             if tuple(slot_valid_mask.shape) != expected:
                 raise ValueError(
                     f"slot_valid_mask must be {expected}, got {tuple(slot_valid_mask.shape)}"
@@ -437,7 +485,8 @@ class GeometryIncrementalAdapter:
                     updated = self._run_joint_registers(
                         registers,
                         layer_id=layer_id,
-                        frame_id=frame_id,
+                        frame_ids=frame_ids,
+                        groups=groups,
                         slots=slots,
                         views=views,
                         slot_valid_mask=slot_valid_mask,
@@ -455,16 +504,16 @@ class GeometryIncrementalAdapter:
                         frame_tokens,
                         geometry_state.patch_hw,
                         layer_id,
-                        groups=1,
+                        groups=groups,
                         group_size=slots,
                         views=views,
                         slot_valid_mask=slot_valid_mask,
                     )
-                    tokens = self._run_history_relation(
+                    tokens = self._run_relation_attention(
                         grouped,
                         patch_hw=geometry_state.patch_hw,
                         layer_id=layer_id,
-                        frame_id=frame_id,
+                        frame_ids=frame_ids,
                         slot_valid_mask=slot_valid_mask,
                         transaction_id=transaction_id,
                         source=source,
@@ -488,7 +537,7 @@ class GeometryIncrementalAdapter:
 
             source_images = rgb.reshape(
                 batch_size,
-                slots * views,
+                groups * slots * views,
                 channels,
                 height,
                 width,
@@ -497,26 +546,97 @@ class GeometryIncrementalAdapter:
             if return_points:
                 depth, depth_conf = self.vggto.dense_forward(cached_outputs, source_images)
                 points, points_conf = self.vggto.point_forward(cached_outputs, source_images)
-            encoded = EncodedGeometryFrame(
-                frame_id=int(frame_id),
-                rgb=rgb,
-                final_tokens=tokens,
-                patch_hw=geometry_state.patch_hw,
-                image_hw=geometry_state.image_hw,
-                patch_token_start=geometry_state.patch_token_start,
-                cached_outputs=cached_outputs,
-                layer_registers=layer_registers,
-                depth=depth,
-                depth_conf=depth_conf,
-                points=points,
-                points_conf=points_conf,
-            )
-            geometry_cache.frames[int(frame_id)] = encoded
-            return encoded
+            images_per_group = slots * views
+            encoded_frames = []
+            for group_index, frame_id in enumerate(frame_ids.tolist()):
+                start = group_index * images_per_group
+                end = start + images_per_group
+                frame_cached_outputs = [
+                    value[:, start:end].contiguous() if value is not None else None
+                    for value in cached_outputs
+                ]
+                frame_registers = {
+                    layer_id: value[:, start:end].contiguous()
+                    for layer_id, value in layer_registers.items()
+                }
+
+                def frame_slice(value: torch.Tensor | None):
+                    if value is None:
+                        return None
+                    return value[:, start:end].contiguous()
+
+                encoded = EncodedGeometryFrame(
+                    frame_id=int(frame_id),
+                    rgb=rgb[:, group_index : group_index + 1],
+                    final_tokens=tokens[:, start:end].contiguous(),
+                    patch_hw=geometry_state.patch_hw,
+                    image_hw=geometry_state.image_hw,
+                    patch_token_start=geometry_state.patch_token_start,
+                    cached_outputs=frame_cached_outputs,
+                    layer_registers=frame_registers,
+                    depth=frame_slice(depth),
+                    depth_conf=frame_slice(depth_conf),
+                    points=frame_slice(points),
+                    points_conf=frame_slice(points_conf),
+                )
+                geometry_cache.frames[int(frame_id)] = encoded
+                encoded_frames.append(encoded)
+            return encoded_frames
         except Exception:
             state.mot_cache.restore(state_snapshot)
             geometry_cache.restore(geometry_snapshot)
             raise
+
+    def encode_history_and_commit(
+        self,
+        rgb: torch.Tensor,
+        *,
+        frame_ids: list[int] | tuple[int, ...] | torch.Tensor,
+        slot_valid_mask: torch.Tensor | None,
+        state: RolloutState,
+        source: CacheSource,
+        version_id: int,
+    ) -> list[EncodedGeometryFrame]:
+        """Prefill all history geometry groups in one mutually visible transaction."""
+
+        if source is not CacheSource.HISTORY:
+            raise ValueError("encode_history_and_commit requires HISTORY source")
+        return self._encode_groups_and_commit(
+            rgb,
+            frame_ids=torch.as_tensor(frame_ids, device=rgb.device),
+            slot_valid_mask=slot_valid_mask,
+            state=state,
+            source=source,
+            version_id=version_id,
+        )
+
+    def encode_and_commit(
+        self,
+        rgb: torch.Tensor,
+        *,
+        frame_id: int,
+        slot_valid_mask: torch.Tensor | None,
+        state: RolloutState,
+        source: CacheSource,
+        version_id: int,
+        return_points: bool = False,
+    ) -> EncodedGeometryFrame:
+        """Encode one anchor/rollout geometry group and commit it atomically."""
+
+        if rgb.ndim != 7 or rgb.shape[1] != 1:
+            raise ValueError(
+                "single geometry transaction expects [B,1,S,V,3,H,W], "
+                f"got {tuple(rgb.shape)}"
+            )
+        return self._encode_groups_and_commit(
+            rgb,
+            frame_ids=torch.tensor([frame_id], device=rgb.device),
+            slot_valid_mask=slot_valid_mask,
+            state=state,
+            source=source,
+            version_id=version_id,
+            return_points=return_points,
+        )[0]
 
     def assert_geometry_commit(
         self,
