@@ -135,8 +135,23 @@ class GeometryIncrementalAdapter:
                 )
 
     @staticmethod
+    def _norm_input_dtype(block, fallback: torch.dtype) -> torch.dtype:
+        norm = getattr(block, "norm1", None)
+        weight = getattr(norm, "weight", None)
+        return getattr(weight, "dtype", fallback)
+
+    @staticmethod
+    def _module_parameter_dtype(module, fallback: torch.dtype) -> torch.dtype:
+        if module is None:
+            return fallback
+        for parameter in module.parameters():
+            return parameter.dtype
+        return fallback
+
+    @staticmethod
     def _apply_vggto_qkv(block, values: torch.Tensor, rope):
         attention = block.attn
+        values = values.to(dtype=GeometryIncrementalAdapter._norm_input_dtype(block, values.dtype))
         batch_size, tokens, channels = values.shape
         qkv = attention.qkv(block.norm1(values)).reshape(
             batch_size,
@@ -260,6 +275,7 @@ class GeometryIncrementalAdapter:
             channels,
         )
         block = self.vggto.inter_frame_blocks[layer_id]
+        values = values.to(dtype=self._norm_input_dtype(block, values.dtype))
         rope = self.vggto._full_token_rope(
             patch_hw,
             groups * slots,
@@ -380,6 +396,9 @@ class GeometryIncrementalAdapter:
     ) -> torch.Tensor:
         batch_size, _images, register_tokens, _channels = registers.shape
         geometry_stream = self.model.mot_blocks[layer_id].geometry
+        registers = registers.to(
+            dtype=self._norm_input_dtype(geometry_stream, registers.dtype)
+        )
         rotary = self._register_rotary(
             batch_size=batch_size,
             frame_ids=frame_ids,
@@ -388,10 +407,15 @@ class GeometryIncrementalAdapter:
             register_tokens=register_tokens,
             device=registers.device,
         )
-        query, current_key, current_value = geometry_stream.qkv_project(
-            registers.flatten(1, 2),
-            rotary,
-        )
+        with torch.autocast(
+            device_type=registers.device.type,
+            dtype=torch.bfloat16,
+            enabled=registers.device.type == "cuda",
+        ):
+            query, current_key, current_value = geometry_stream.qkv_project(
+                registers.flatten(1, 2),
+                rotary,
+            )
         metadata = self._joint_metadata(
             batch_size=batch_size,
             frame_ids=frame_ids,
@@ -413,7 +437,12 @@ class GeometryIncrementalAdapter:
             layer_id=layer_id,
             transaction_id=transaction_id,
         )
-        delta = geometry_stream.attn_delta(attended).reshape_as(registers)
+        with torch.autocast(
+            device_type=registers.device.type,
+            dtype=torch.bfloat16,
+            enabled=registers.device.type == "cuda",
+        ):
+            delta = geometry_stream.attn_delta(attended).reshape_as(registers)
         visible = visible.reshape(
             batch_size,
             groups * slots * views,
@@ -421,7 +450,12 @@ class GeometryIncrementalAdapter:
         )
         delta = torch.where(visible[:, :, :, None], delta, torch.zeros_like(delta))
         residual = registers + delta
-        updated = residual + geometry_stream.ffn_delta(residual)
+        with torch.autocast(
+            device_type=residual.device.type,
+            dtype=torch.bfloat16,
+            enabled=residual.device.type == "cuda",
+        ):
+            updated = residual + geometry_stream.ffn_delta(residual)
         if slot_valid_mask is not None:
             valid = (
                 slot_valid_mask[:, :, :, None]
@@ -481,17 +515,48 @@ class GeometryIncrementalAdapter:
         geometry_snapshot = geometry_cache.snapshot()
         # [B,G,S,V,3,H,W] -> [B, F, 3, H, W] -> [B*F, (H/patch_size)*(W/patch_size), embed_dim] 
         # -> [B, F, patch_tokens, embed_dim] -> [B, F, patch_tokens + register_tokens, embed_dim]
-        geometry_state = self.vggto.encode_grouped(rgb, slot_valid_mask=slot_valid_mask)
+        patch_embed = getattr(self.vggto, "patch_embed", None)
+        patch_projection = getattr(
+            getattr(patch_embed, "patch_embed", None),
+            "proj",
+            None,
+        )
+        patch_embed_dtype = getattr(
+            getattr(patch_projection, "weight", None),
+            "dtype",
+            self._module_parameter_dtype(patch_embed, rgb.dtype),
+        )
+        rgb_for_model = rgb.to(dtype=patch_embed_dtype)
+        autocast_enabled = rgb_for_model.device.type == "cuda"
+        with torch.autocast(
+            device_type=rgb_for_model.device.type,
+            dtype=torch.bfloat16,
+            enabled=autocast_enabled,
+        ):
+            geometry_state = self.vggto.encode_grouped(
+                rgb_for_model,
+                slot_valid_mask=slot_valid_mask,
+            )
         tokens = geometry_state.tokens
         cached_outputs: list[torch.Tensor | None] = [None] * self.vggto.depth
         layer_registers: dict[int, torch.Tensor] = {}
         try:
             for layer_id in range(self.vggto.depth):
-                frame_tokens = self.vggto.run_frame_block(
-                    tokens,
-                    geometry_state.patch_hw,
-                    layer_id,
-                ) # [B, F, L, D] -> [B*F, L, D]  frame token interaction
+                frame_blocks = getattr(self.vggto, "frame_blocks", None)
+                frame_block = frame_blocks[layer_id] if frame_blocks is not None else None
+                frame_tokens_input = tokens.to(
+                    dtype=self._norm_input_dtype(frame_block, tokens.dtype)
+                )
+                with torch.autocast(
+                    device_type=frame_tokens_input.device.type,
+                    dtype=torch.bfloat16,
+                    enabled=frame_tokens_input.device.type == "cuda",
+                ):
+                    frame_tokens = self.vggto.run_frame_block(
+                        frame_tokens_input,
+                        geometry_state.patch_hw,
+                        layer_id,
+                    ) # [B, F, L, D] -> [B*F, L, D]  frame token interaction
                 if layer_id in self.vggto.register_attention_indices:
                     registers = frame_tokens[:, :, : self.vggto.patch_start_idx]
                     layer_registers[layer_id] = registers.contiguous()
@@ -513,15 +578,20 @@ class GeometryIncrementalAdapter:
                         dim=2,
                     )
                 else:
-                    grouped = self.vggto._run_cross_view_block(
-                        frame_tokens,
-                        geometry_state.patch_hw,
-                        layer_id,
-                        groups=groups,
-                        group_size=slots,
-                        views=views,
-                        slot_valid_mask=slot_valid_mask,
-                    ) # [B, G, S, V, L, D] -> [B*G*S, V*L, D]  cross-view token interaction
+                    with torch.autocast(
+                        device_type=frame_tokens.device.type,
+                        dtype=torch.bfloat16,
+                        enabled=frame_tokens.device.type == "cuda",
+                    ):
+                        grouped = self.vggto._run_cross_view_block(
+                            frame_tokens,
+                            geometry_state.patch_hw,
+                            layer_id,
+                            groups=groups,
+                            group_size=slots,
+                            views=views,
+                            slot_valid_mask=slot_valid_mask,
+                        ) # [B, G, S, V, L, D] -> [B*G*S, V*L, D]  cross-view token interaction
                     tokens = self._run_relation_attention(
                         grouped,
                         patch_hw=geometry_state.patch_hw,
@@ -548,6 +618,9 @@ class GeometryIncrementalAdapter:
                 source_id=int(source),
             )
 
+            # Keep the source image in its caller-owned dtype.  The geometry
+            # tower may need a cast for its patch projection, but depth/point
+            # heads and GT replacement must retain the original RGB values.
             source_images = rgb.reshape(
                 batch_size,
                 groups * slots * views,

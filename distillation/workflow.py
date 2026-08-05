@@ -209,7 +209,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         MethodRun(
             name=SELF_GRADIENT_FORCING_DMD,
             student_init=consistency_checkpoint,
-            real_score_checkpoint=autoregressive_checkpoint,
+            real_score_checkpoint=Path(args.student_init),
             fake_score_init=autoregressive_checkpoint,
             resume_from=(
                 resume_from

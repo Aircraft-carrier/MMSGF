@@ -7,6 +7,10 @@ from typing import Any
 import torch
 
 from distillation.configs import CONSISTENCY_DISTILLATION
+from distillation.model.utils import (
+    temporary_fsdp_unshard,
+    temporary_masked_attention_backend,
+)
 from distillation.trainer.base import DistillationTrainerBase, OptimizationTarget
 from wan_va.mot_spec import mot_spec_from_config
 
@@ -84,26 +88,31 @@ class ConsistencyTrainer(DistillationTrainerBase):
             ground_truth_provider,
         )
 
-        return self_rollout(
-            batch,
-            transformer=self.method_model.ema_student,
-            config=self.config,
-            spec=mot_spec_from_config(self.config),
-            device=self.device,
-            empty_text_emb=self._get_empty_text_emb(),
-            decode_latents_to_rgb_views=self._decode_rollout_latents,
-            video_num_steps=int(self.config.distill.rollout_video_num_steps),
-            action_num_steps=int(self.config.distill.rollout_action_num_steps),
-            rollout_frames=int(self.config.distill.rollout_horizon_frames),
-            ground_truth_provider=ground_truth_provider,
-            replacement_policy=str(
-                getattr(
-                    self.config.distill,
-                    "rollout_replacement_policy",
-                    "require_ground_truth",
-                )
-            ),
-        )
+        rollout_backend = getattr(self.config.distill, "rollout_masked_attn_backend", "dense")
+        with temporary_masked_attention_backend(
+            self.method_model.ema_student,
+            rollout_backend,
+        ), temporary_fsdp_unshard(self.method_model.ema_student):
+            return self_rollout(
+                batch,
+                transformer=self.method_model.ema_student,
+                config=self.config,
+                spec=mot_spec_from_config(self.config),
+                device=self.device,
+                empty_text_emb=self._get_empty_text_emb(),
+                decode_latents_to_rgb_views=self._decode_rollout_latents,
+                video_num_steps=int(self.config.distill.rollout_video_num_steps),
+                action_num_steps=int(self.config.distill.rollout_action_num_steps),
+                rollout_frames=int(self.config.distill.rollout_horizon_frames),
+                ground_truth_provider=ground_truth_provider,
+                replacement_policy=str(
+                    getattr(
+                        self.config.distill,
+                        "rollout_replacement_policy",
+                        "require_ground_truth",
+                    )
+                ),
+            )
 
     @torch.no_grad()
     def rollout(self, batch: dict, *, ground_truth_provider=None):

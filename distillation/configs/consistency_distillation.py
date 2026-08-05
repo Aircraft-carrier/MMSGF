@@ -3,9 +3,11 @@ import copy
 
 from easydict import EasyDict
 
+from distillation.configs.runtime_dataset import apply_distillation_runtime_overrides
 from wan_va.configs import VA_CONFIGS
 
 consistency_distillation_cfg = EasyDict(copy.deepcopy(VA_CONFIGS["umi_3dwam_train"]))
+apply_distillation_runtime_overrides(consistency_distillation_cfg)
 consistency_distillation_cfg.optimization_composition = "va"
 consistency_distillation_cfg.cfg_prob = 0.0
 consistency_distillation_cfg.distill = EasyDict(
@@ -39,6 +41,7 @@ consistency_distillation_cfg.distill = EasyDict(
     rollout_horizon_frames=3,
     rollout_gt_mode="none",
     rollout_replacement_policy="require_ground_truth",
+    rollout_masked_attn_backend="dense",
     # fresh run: student_init 初始化 raw student 和 EMA；teacher_checkpoint 冻结。
     # resume: DCP 会覆盖 raw student/optimizer/EMA，teacher 仍从来源重建。
     student_init=None,

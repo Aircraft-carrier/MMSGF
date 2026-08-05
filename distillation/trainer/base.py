@@ -92,6 +92,23 @@ class DistillationTrainerBase(MOTTrainer):
         self.method_model = self._build_method_model(config)
         self.checkpoint_io = DistillationCheckpointIO()
 
+    @staticmethod
+    def _local_metric_value(value: Any) -> Any:
+        try:
+            from torch.distributed.tensor import DTensor
+        except Exception:
+            DTensor = ()
+        if torch.is_tensor(value) and isinstance(value, DTensor):
+            return value.to_local()
+        return value
+
+    def _aggregate_log_records(self, records: list[dict[str, Any]]) -> dict[str, float]:
+        local_records = [
+            {key: self._local_metric_value(value) for key, value in record.items()}
+            for record in records
+        ]
+        return super()._aggregate_log_records(local_records)
+
     def _build_method_model(self, config: Any):
         raise NotImplementedError
 

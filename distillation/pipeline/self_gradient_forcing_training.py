@@ -16,6 +16,10 @@ from distillation.model.objectives import (
     fake_score_flow_loss,
     replay_target_loss,
 )
+from distillation.model.utils import (
+    temporary_fsdp_unshard,
+    temporary_masked_attention_backend,
+)
 from distillation.pipeline.utils import (
     add_noise_to_va,
     replace_text_condition,
@@ -437,19 +441,24 @@ class SelfGradientForcingTrainingPipeline:
             action_step=action_record_step,
         )
         spec = mot_spec_from_config(self.config)
-        rollout = self_rollout(
-            batch,
-            transformer=self.student,
-            config=self.config,
-            spec=spec,
-            device=self.device,
-            empty_text_emb=self.trainer._get_empty_text_emb(),
-            decode_latents_to_rgb_views=self._decode_rollout_latents,
-            video_num_steps=self.rollout_video_num_steps,
-            action_num_steps=self.rollout_action_num_steps,
-            rollout_frames=self.rollout_horizon_frames,
-            recorder=recorder,
-        )
+        rollout_backend = getattr(self.config.distill, "rollout_masked_attn_backend", "dense")
+        with temporary_masked_attention_backend(
+            self.student,
+            rollout_backend,
+        ), temporary_fsdp_unshard(self.student):
+            rollout = self_rollout(
+                batch,
+                transformer=self.student,
+                config=self.config,
+                spec=spec,
+                device=self.device,
+                empty_text_emb=self.trainer._get_empty_text_emb(),
+                decode_latents_to_rgb_views=self._decode_rollout_latents,
+                video_num_steps=self.rollout_video_num_steps,
+                action_num_steps=self.rollout_action_num_steps,
+                rollout_frames=self.rollout_horizon_frames,
+                recorder=recorder,
+            )
         return self._build_replay_context(
             batch,
             rollout,

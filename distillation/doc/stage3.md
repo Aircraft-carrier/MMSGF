@@ -16,8 +16,9 @@ loss mask:    0  0  0  0 |  0  1  1  1
 ```
 
 `H0..H3` 是 GT history，`T0` 是 GT target anchor。SGF 只生成和监督
-`T1..T3`，因此和 AR、Consistency 使用同一个
-`segmented_history_strict_geometry_v1` profile。
+`T1..T3`。Student 和 fake-score 继续使用和 AR、Consistency 一致的
+`segmented_history_strict_geometry_v1` profile；real-score teacher 保留原始
+wan_va mask profile。
 
 Geometry 继续满足严格历史约束：
 
@@ -30,11 +31,13 @@ G_query(frame=i) 只能读取 frame_id < i 的 committed geometry
 | 模型 | 初始化来源 | 梯度 | 作用 |
 | --- | --- | --- | --- |
 | student | stage2 consistency EMA export | 可训练 | no-grad rollout、SGF replay、DMD student update |
-| real-score / teacher | stage1 AR export | 永久冻结 | GT-clean CFG teacher、DMD real score |
+| real-score / teacher | stage1 初始源 teacher export | 永久冻结 | GT-clean CFG teacher、DMD real score；保留原始 wan_va mask |
 | fake-score | stage1 AR export | 独立 optimizer | DMD fake score、fake-score regression |
 
-Frozen teacher 保持 `eval()` 和 `requires_grad=False`，但所有 full-window joint
-forward 都调用：
+Frozen teacher 保持 `eval()` 和 `requires_grad=False`。它加载 stage1 自回归训练前
+使用的源 teacher checkpoint，且不安装 distillation 的
+`segmented_history_strict_geometry_v1` order wrapper，因此 forward 使用原始
+wan_va mask 语义。所有 full-window joint forward 仍调用：
 
 ```python
 model(input_dict, mode="train")
@@ -163,13 +166,17 @@ mask 外显式恢复 `pred_clean`，防止 scheduler 数值 timestep 0 对应非
 score_noisy = (1 - sigma_score) * student_x0 + sigma_score * Gaussian noise
 ```
 
-real-score 和 fake-score 在 `torch.no_grad()` 中接收完全相同的：
+real-score 和 fake-score 在 `torch.no_grad()` 中接收相同的数值输入：
 
 - `score_noisy`；
 - score timestep；
 - `student_x0` clean condition；
 - predicted geometry；
-- mask、order 和 text condition。
+- valid/loss mask 字段；
+- text condition。
+
+两者的模型侧 attention profile 不同：real-score teacher 使用原始 wan_va mask，
+fake-score 使用 distillation 的自回归/segmented mask。
 
 因此两者差值仍具有可比性：
 
@@ -222,8 +229,10 @@ gradient accumulation 期间 `optimizer_step` 不变，因此同一 accumulation
 | fake-score | 1 次 no-grad incremental rollout | 0 | 1 次有梯度 full-window forward |
 | student | 1 次 no-grad incremental rollout + 1 次有梯度 full-window forward | 2 次 teacher CFG + 1 次 DMD real-score | 1 次 no-grad DMD fake-score |
 
-所有 full-window forward 都使用 `mode="train"` 和同一个 segmented strict-geometry
-attention policy。
+Student 和 fake-score 的 full-window forward 使用 `mode="train"` 并保留
+distillation 的 segmented strict-geometry/autoregressive attention policy。
+Real-score teacher 的 full-window forward 也使用 `mode="train"` 路由，但其模型对象
+保留原始 wan_va mask profile，不使用 distillation segmented wrapper。
 
 ## 10. 关键配置
 

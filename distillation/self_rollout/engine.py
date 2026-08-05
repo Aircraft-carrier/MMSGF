@@ -476,6 +476,7 @@ def self_rollout(
         frame.geometry_state = encoded
         frame.geometry_source = CacheSource.HISTORY
         frame.geometry_version = 1
+    for frame_id in history_ids:
         assert_phase(
             geometry_adapter,
             "assert_geometry_commit",

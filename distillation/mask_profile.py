@@ -24,6 +24,220 @@ PROFILE_NAME = "segmented_history_strict_geometry_v1"
 PROFILE_VERSION = 2
 
 
+def _ensure_vggto_mot_mask_metadata_support() -> None:
+    from wan_va.modules.fa4_attention import fa4_attention_from_meta
+    from wan_va.modules.vggto_vendored.layers.attention import SelfAttention
+    from wan_va.modules.vggto_vendored.layers.block import SelfAttentionBlock
+
+    if not getattr(SelfAttention, "_distillation_mot_mask_metadata", False):
+        original_attention_forward = SelfAttention.forward
+
+        def attention_forward(
+            self,
+            x,
+            attn_bias=None,
+            rope=None,
+            chunk_causal_spec=None,
+            attention_backend: str = "dense",
+            row_valid_mask=None,
+            *,
+            mot_mask_metadata=None,
+        ):
+            if mot_mask_metadata is None:
+                return original_attention_forward(
+                    self,
+                    x,
+                    attn_bias=attn_bias,
+                    rope=rope,
+                    chunk_causal_spec=chunk_causal_spec,
+                    attention_backend=attention_backend,
+                    row_valid_mask=row_valid_mask,
+                )
+            if attention_backend != "fa4":
+                raise ValueError("mot_mask_metadata requires attention_backend='fa4'")
+            if attn_bias is not None or chunk_causal_spec is not None or row_valid_mask is not None:
+                raise ValueError("mot_mask_metadata cannot be combined with other attention masks")
+
+            batch_size, seq_len, _ = x.shape
+            channels = self.qkv.in_features
+            qkv = self.qkv(x).reshape(
+                batch_size,
+                seq_len,
+                3,
+                self.num_heads,
+                channels // self.num_heads,
+            )
+            query, key, value = qkv.unbind(dim=2)
+            if self.use_qk_norm:
+                query = self.q_norm(query)
+                key = self.k_norm(key)
+            if rope is not None:
+                query_heads, key_heads = query.transpose(1, 2), key.transpose(1, 2)
+                query_heads, key_heads = self.apply_rope(query_heads, key_heads, rope)
+                query, key = query_heads.transpose(1, 2), key_heads.transpose(1, 2)
+
+            out = fa4_attention_from_meta(query, key, value, mot_mask_metadata)
+            out = self.proj(out.reshape(batch_size, seq_len, channels))
+            return self.proj_drop(out)
+
+        SelfAttention.forward = attention_forward
+        SelfAttention._distillation_mot_mask_metadata = True
+
+    if not getattr(SelfAttentionBlock, "_distillation_mot_mask_metadata", False):
+        original_block_forward = SelfAttentionBlock.forward
+
+        def block_forward(
+            self,
+            x_or_x_list,
+            rope_or_rope_list=None,
+            attn_bias=None,
+            chunk_causal_spec=None,
+            attention_backend: str = "dense",
+            row_valid_mask=None,
+            *,
+            mot_mask_metadata=None,
+        ):
+            if mot_mask_metadata is None:
+                return original_block_forward(
+                    self,
+                    x_or_x_list,
+                    rope_or_rope_list,
+                    attn_bias=attn_bias,
+                    chunk_causal_spec=chunk_causal_spec,
+                    attention_backend=attention_backend,
+                    row_valid_mask=row_valid_mask,
+                )
+            if not torch.is_tensor(x_or_x_list):
+                raise TypeError("mot_mask_metadata requires a single tensor input")
+            x_attn = x_or_x_list + self.ls1(
+                self.attn(
+                    self.norm1(x_or_x_list),
+                    rope=rope_or_rope_list,
+                    mot_mask_metadata=mot_mask_metadata,
+                    attention_backend=attention_backend,
+                )
+            )
+            return x_attn + self.ls2(self.mlp(self.norm2(x_attn)))
+
+        SelfAttentionBlock.forward = block_forward
+        SelfAttentionBlock._distillation_mot_mask_metadata = True
+
+
+def _patch_attention_instance_for_mot_metadata(attention: Any) -> None:
+    if getattr(attention, "_distillation_mot_mask_metadata_instance", False):
+        return
+
+    from wan_va.modules.fa4_attention import fa4_attention_from_meta
+
+    original_forward = attention.forward
+
+    def attention_forward(
+        self,
+        x,
+        attn_bias=None,
+        rope=None,
+        chunk_causal_spec=None,
+        attention_backend: str = "dense",
+        row_valid_mask=None,
+        *,
+        mot_mask_metadata=None,
+    ):
+        if mot_mask_metadata is None:
+            return original_forward(
+                x,
+                attn_bias=attn_bias,
+                rope=rope,
+                chunk_causal_spec=chunk_causal_spec,
+                attention_backend=attention_backend,
+                row_valid_mask=row_valid_mask,
+            )
+        if attention_backend != "fa4":
+            raise ValueError("mot_mask_metadata requires attention_backend='fa4'")
+        if attn_bias is not None or chunk_causal_spec is not None or row_valid_mask is not None:
+            raise ValueError("mot_mask_metadata cannot be combined with other attention masks")
+
+        batch_size, seq_len, _ = x.shape
+        channels = self.qkv.in_features
+        qkv = self.qkv(x).reshape(
+            batch_size,
+            seq_len,
+            3,
+            self.num_heads,
+            channels // self.num_heads,
+        )
+        query, key, value = qkv.unbind(dim=2)
+        if self.use_qk_norm:
+            query = self.q_norm(query)
+            key = self.k_norm(key)
+        if rope is not None:
+            query_heads, key_heads = query.transpose(1, 2), key.transpose(1, 2)
+            query_heads, key_heads = self.apply_rope(query_heads, key_heads, rope)
+            query, key = query_heads.transpose(1, 2), key_heads.transpose(1, 2)
+
+        out = fa4_attention_from_meta(query, key, value, mot_mask_metadata)
+        out = self.proj(out.reshape(batch_size, seq_len, channels))
+        return self.proj_drop(out)
+
+    attention.forward = MethodType(attention_forward, attention)
+    attention._distillation_mot_mask_metadata_instance = True
+
+
+def _patch_block_instance_for_mot_metadata(block: Any) -> None:
+    """Patch the concrete block reached through checkpoint/FSDP wrappers.
+
+    Class-level monkeypatching is normally enough, but PyTorch activation
+    checkpoint wrappers may retain a wrapped module whose forward resolution no
+    longer observes later class edits in all distributed wrapping orders.  This
+    distillation-local instance patch targets the exact module called by the
+    wrapper while preserving the native path for non-MOT masks.
+    """
+
+    module = getattr(block, "_checkpoint_wrapped_module", block)
+    module = getattr(module, "_fsdp_wrapped_module", module)
+    if getattr(module, "_distillation_mot_mask_metadata_instance", False):
+        return
+    if not all(hasattr(module, name) for name in ("attn", "norm1", "ls1", "norm2", "mlp", "ls2")):
+        return
+
+    _patch_attention_instance_for_mot_metadata(module.attn)
+    original_forward = module.forward
+
+    def block_forward(
+        self,
+        x_or_x_list,
+        rope_or_rope_list=None,
+        attn_bias=None,
+        chunk_causal_spec=None,
+        attention_backend: str = "dense",
+        row_valid_mask=None,
+        *,
+        mot_mask_metadata=None,
+    ):
+        if mot_mask_metadata is None:
+            return original_forward(
+                x_or_x_list,
+                rope_or_rope_list,
+                attn_bias=attn_bias,
+                chunk_causal_spec=chunk_causal_spec,
+                attention_backend=attention_backend,
+                row_valid_mask=row_valid_mask,
+            )
+        if not torch.is_tensor(x_or_x_list):
+            raise TypeError("mot_mask_metadata requires a single tensor input")
+        x_attn = x_or_x_list + self.ls1(
+            self.attn(
+                self.norm1(x_or_x_list),
+                rope=rope_or_rope_list,
+                mot_mask_metadata=mot_mask_metadata,
+                attention_backend=attention_backend,
+            )
+        )
+        return x_attn + self.ls2(self.mlp(self.norm2(x_attn)))
+
+    module.forward = MethodType(block_forward, module)
+    module._distillation_mot_mask_metadata_instance = True
+
+
 def generation_profile_contract(generation_shape: Any) -> dict[str, Any]:
     return {
         "profile_name": str(generation_shape.get("profile_name", PROFILE_NAME)),
@@ -176,27 +390,7 @@ def _run_segmented_vggto_inter_frame_fa4(
     num_tokens: int,
     image_valid_mask: torch.Tensor | None,
 ) -> torch.Tensor:
-    from wan_va.modules.fa4_attention import fa4_attention_from_meta
-
-    block = self.inter_frame_blocks[layer_id]
-    attention = block.attn
-    hidden = block.norm1(values)
-    qkv = attention.qkv(hidden).reshape(
-        values.shape[0],
-        values.shape[1],
-        3,
-        attention.num_heads,
-        values.shape[-1] // attention.num_heads,
-    )
-    query, key, value = qkv.unbind(dim=2)
-    if attention.use_qk_norm:
-        query = attention.q_norm(query)
-        key = attention.k_norm(key)
-    rope = self._full_token_rope(patch_hw, groups * group_size, values.device)
-    query_heads, key_heads = query.transpose(1, 2), key.transpose(1, 2)
-    query_heads, key_heads = attention.apply_rope(query_heads, key_heads, rope)
-    query, key = query_heads.transpose(1, 2), key_heads.transpose(1, 2)
-
+    _ensure_vggto_mot_mask_metadata_support()
     metadata = _build_segmented_vggto_inter_frame_metadata(
         batch_size=values.shape[0],
         groups=groups,
@@ -208,11 +402,14 @@ def _run_segmented_vggto_inter_frame_fa4(
         device=values.device,
         image_valid_mask=image_valid_mask,
     )
-    attended = fa4_attention_from_meta(query, key, value, metadata)
-    projected = attention.proj(attended.flatten(2, 3))
-    projected = attention.proj_drop(projected)
-    values = values + block.ls1(projected)
-    return values + block.ls2(block.mlp(block.norm2(values)))
+    block = self.inter_frame_blocks[layer_id]
+    _patch_block_instance_for_mot_metadata(block)
+    return block(
+        values,
+        self._full_token_rope(patch_hw, groups * group_size, values.device),
+        mot_mask_metadata=metadata,
+        attention_backend="fa4",
+    )
 
 
 def _segmented_same_view_inter_frame(
@@ -278,6 +475,7 @@ def _segmented_same_view_inter_frame(
 
 
 def _install_segmented_vggto_inter_frame(model: Any, generation_shape: Any) -> None:
+    _ensure_vggto_mot_mask_metadata_support()
     vggto = getattr(model, "vggto", None)
     if vggto is None:
         return

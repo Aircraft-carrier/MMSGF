@@ -27,6 +27,7 @@
 
 - `MOT_DATASET_ROOT=${REPO_ROOT}/data/umi_distill_train`
 - `DISTILL_DEFAULT_STUDENT_INIT=${REPO_ROOT}/models/uni3dwam_video_only_step62000`
+- `DISTILL_DEFAULT_STAGE1_TEACHER_CHECKPOINT=${DISTILL_DEFAULT_STUDENT_INIT}`
 - `DISTILL_DEFAULT_GEOMETRY_INIT=${REPO_ROOT}/models/uni3dwam_geometry_only_step60000`
 - `DISTILL_DEFAULT_VIDEO_FROM_WAN_INIT=${REPO_ROOT}/models/uni3dwam_video_from_wan_step20000`
 - `MOT_POINTCLOUD_SAMPLE_PERIOD=8`
@@ -62,7 +63,7 @@
   - 不再错误地默认从源 MOT checkpoint 直接启动。
   - 单独跑时必须设置 `DISTILL_AR_CHECKPOINT`，或显式设置 `DISTILL_STUDENT_INIT` 和 `DISTILL_TEACHER_CHECKPOINT`。
 - `1shell/distill/train_distill_self_gradient_forcing_dmd_4gpu.sh`
-  - 单独跑时必须设置 `DISTILL_CONSISTENCY_CHECKPOINT` 和 `DISTILL_AR_CHECKPOINT`，或显式设置 `DISTILL_STUDENT_INIT`、`DISTILL_REAL_SCORE_CHECKPOINT`、`DISTILL_FAKE_SCORE_INIT`。
+  - 单独跑时必须设置 `DISTILL_CONSISTENCY_CHECKPOINT` 和 `DISTILL_AR_CHECKPOINT`；`DISTILL_REAL_SCORE_CHECKPOINT` 默认取 stage1 初始 teacher checkpoint，也可以用 `DISTILL_STAGE1_TEACHER_CHECKPOINT` 显式覆盖。
 - `1shell/distill/train_distill_pipeline_4gpu.sh`
   - `STUDENT_INIT` 不再必填，默认使用 `models/uni3dwam_video_only_step62000`。
   - 启动前检查默认数据和初始 checkpoint。
@@ -98,7 +99,8 @@ train_logs/distill_pipeline/<MMDD_HHMMSS>/
 
 - stage1 AR 输出传给 stage2 的 `student_init` 和 `teacher_checkpoint`
 - stage2 consistency 输出传给 stage3 的 `student_init`
-- stage1 AR 输出传给 stage3 的 `real_score_checkpoint` 和 `fake_score_init`
+- stage1 初始 teacher checkpoint 传给 stage3 的 `real_score_checkpoint`
+- stage1 AR 输出传给 stage3 的 `fake_score_init`
 
 指定输出目录：
 
@@ -183,12 +185,15 @@ DISTILL_ROLLOUT_HORIZON_FRAMES=3
 
 ### Stage 3: self-gradient-forcing DMD
 
-Stage 3 需要 stage2 consistency checkpoint 作为 student，并需要 stage1 AR checkpoint 作为 real/fake score 初始化：
+Stage 3 需要 stage2 consistency checkpoint 作为 student，stage1 初始 teacher
+checkpoint 作为 frozen real-score teacher，并需要 stage1 AR checkpoint 作为
+fake-score 初始化：
 
 ```bash
 cd /zsh/code/MMSGF
 
 DISTILL_CONSISTENCY_CHECKPOINT=/zsh/code/MMSGF/train_logs/distill_pipeline/my_run/consistency_distillation/checkpoints/checkpoint_step_<N> \
+DISTILL_STAGE1_TEACHER_CHECKPOINT=/zsh/code/MMSGF/models/uni3dwam_video_only_step62000 \
 DISTILL_AR_CHECKPOINT=/zsh/code/MMSGF/train_logs/distill_pipeline/my_run/autoregressive_training/checkpoints/checkpoint_step_<M> \
 DISTILL_SAVE_ROOT=/zsh/code/MMSGF/train_logs/distill/sgf_dmd_test \
 NGPU=4 \
@@ -200,7 +205,7 @@ MASTER_PORT=29561 \
 
 ```bash
 DISTILL_STUDENT_INIT=/path/to/consistency/checkpoint_step_<N> \
-DISTILL_REAL_SCORE_CHECKPOINT=/path/to/ar/checkpoint_step_<M> \
+DISTILL_REAL_SCORE_CHECKPOINT=/path/to/stage1/initial_teacher/checkpoint \
 DISTILL_FAKE_SCORE_INIT=/path/to/ar/checkpoint_step_<M> \
 1shell/distill/train_distill_self_gradient_forcing_dmd_4gpu.sh
 ```

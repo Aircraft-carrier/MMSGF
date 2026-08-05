@@ -17,6 +17,8 @@ from wan_va.modules.model_3dva_mot import ThreeDVAMOTTransformer3DModel
 def load_transformer_export(
     checkpoint_path: str | Path,
     config: Any,
+    *,
+    validate_distillation_profile: bool = True,
 ) -> ThreeDVAMOTTransformer3DModel:
     """Load only a published cross-stage ``transformer/`` export.
 
@@ -28,33 +30,72 @@ def load_transformer_export(
 
     checkpoint_path = Path(checkpoint_path)
     MOTTrainer._validate_transformer_checkpoint_layout(checkpoint_path)
-    validate_checkpoint_generation_profile(
-        checkpoint_path,
-        config.distill.generation_shape,
-    )
+    if validate_distillation_profile:
+        validate_checkpoint_generation_profile(
+            checkpoint_path,
+            config.distill.generation_shape,
+        )
     transformer_path = checkpoint_path / "transformer"
-    return ThreeDVAMOTTransformer3DModel.from_pretrained(
+    model = ThreeDVAMOTTransformer3DModel.from_pretrained(
         transformer_path,
         torch_dtype=config.param_dtype,
     )
+    masked_attn_backend = getattr(config, "masked_attn_backend", None)
+    if masked_attn_backend is not None:
+        model.masked_attn_backend = str(masked_attn_backend)
+        if hasattr(model, "vggto"):
+            model.vggto.masked_attn_backend = str(masked_attn_backend)
+    return model
 
 
 def build_frozen_transformer(
     checkpoint_path: str | Path,
     config: Any,
     device: torch.device,
+    *,
+    install_distillation_profile: bool = True,
+    validate_distillation_profile: bool = True,
 ) -> ThreeDVAMOTTransformer3DModel:
-    model = load_transformer_export(checkpoint_path, config)
-    return _configure_distillation_model(model, config, device, trainable=False)
+    """Load a frozen transformer.
+
+    Stage2 teachers and EMA targets use the default distillation profile checks.
+    Stage3's real-score teacher intentionally disables both switches so the
+    source teacher checkpoint keeps its original wan_va attention mask.
+    """
+    model = load_transformer_export(
+        checkpoint_path,
+        config,
+        validate_distillation_profile=validate_distillation_profile,
+    )
+    return _configure_distillation_model(
+        model,
+        config,
+        device,
+        trainable=False,
+        install_distillation_profile=install_distillation_profile,
+    )
 
 
 def build_trainable_transformer(
     checkpoint_path: str | Path,
     config: Any,
     device: torch.device,
+    *,
+    install_distillation_profile: bool = True,
+    validate_distillation_profile: bool = True,
 ) -> ThreeDVAMOTTransformer3DModel:
-    model = load_transformer_export(checkpoint_path, config)
-    return _configure_distillation_model(model, config, device, trainable=True)
+    model = load_transformer_export(
+        checkpoint_path,
+        config,
+        validate_distillation_profile=validate_distillation_profile,
+    )
+    return _configure_distillation_model(
+        model,
+        config,
+        device,
+        trainable=True,
+        install_distillation_profile=install_distillation_profile,
+    )
 
 
 def _configure_distillation_model(
@@ -63,6 +104,7 @@ def _configure_distillation_model(
     device: torch.device,
     *,
     trainable: bool,
+    install_distillation_profile: bool = True,
 ) -> ThreeDVAMOTTransformer3DModel:
     from functools import partial
 
@@ -75,7 +117,8 @@ def _configure_distillation_model(
     )
 
     execution_route = getattr(config, "execution_route", "joint")
-    install_order_profile(model, config.distill.generation_shape)
+    if install_distillation_profile:
+        install_order_profile(model, config.distill.generation_shape)
     if trainable:
         set_trainable(model)
         apply_mot_parameter_ownership(model, config.optimization_composition)

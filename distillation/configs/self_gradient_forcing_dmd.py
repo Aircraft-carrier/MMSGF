@@ -3,9 +3,11 @@ import copy
 
 from easydict import EasyDict
 
+from distillation.configs.runtime_dataset import apply_distillation_runtime_overrides
 from wan_va.configs import VA_CONFIGS
 
 self_gradient_forcing_dmd_cfg = EasyDict(copy.deepcopy(VA_CONFIGS["umi_3dwam_train"]))
+apply_distillation_runtime_overrides(self_gradient_forcing_dmd_cfg)
 self_gradient_forcing_dmd_cfg.optimization_composition = "va"
 self_gradient_forcing_dmd_cfg.distill = EasyDict(
     method="self_gradient_forcing_dmd",
@@ -23,6 +25,7 @@ self_gradient_forcing_dmd_cfg.distill = EasyDict(
     rollout_video_num_steps=2,
     rollout_action_num_steps=2,
     rollout_horizon_frames=3,
+    rollout_masked_attn_backend="dense",
     # Frozen real-score 作为 SGF teacher；CFG 只作用于 video，action 用 conditional。
     teacher_cfg_min=2.0,
     teacher_cfg_max=10.0,
@@ -33,7 +36,8 @@ self_gradient_forcing_dmd_cfg.distill = EasyDict(
     # DMD normalizer 和 flow 反解的数值安全下界；不改变 mask 语义。
     dmd_normalizer_eps=1e-6,
     flow_target_eps=1e-6,
-    # student 来自 stage2 EMA export；real/fake score 通常都来自 stage1 AR。
+    # student 来自 stage2 EMA export；real-score/teacher 来自 stage1 使用的源
+    # teacher checkpoint 并保留原始 wan_va mask；fake-score 通常来自 stage1 AR。
     # DCP resume 会恢复 student/fake-score 双 optimizer 的精确状态。
     student_init=None,
     real_score_checkpoint=None,
