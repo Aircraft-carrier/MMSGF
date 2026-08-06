@@ -8,7 +8,6 @@ import torch
 
 from distillation.configs import CONSISTENCY_DISTILLATION
 from distillation.model.utils import (
-    temporary_fsdp_unshard,
     temporary_masked_attention_backend,
 )
 from distillation.trainer.base import DistillationTrainerBase, OptimizationTarget
@@ -92,7 +91,7 @@ class ConsistencyTrainer(DistillationTrainerBase):
         with temporary_masked_attention_backend(
             self.method_model.ema_student,
             rollout_backend,
-        ), temporary_fsdp_unshard(self.method_model.ema_student):
+        ):
             return self_rollout(
                 batch,
                 transformer=self.method_model.ema_student,

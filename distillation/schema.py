@@ -53,6 +53,7 @@ class CheckpointMetadata:
     step: int
     optimizer_step: int
     generation_profile: dict[str, Any]
+    model_architecture: str = "autoregressive_mot_v1"
 
 
 @dataclass(frozen=True, slots=True)

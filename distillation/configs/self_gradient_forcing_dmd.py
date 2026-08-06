@@ -11,6 +11,7 @@ apply_distillation_runtime_overrides(self_gradient_forcing_dmd_cfg)
 self_gradient_forcing_dmd_cfg.optimization_composition = "va"
 self_gradient_forcing_dmd_cfg.distill = EasyDict(
     method="self_gradient_forcing_dmd",
+    model_architecture="autoregressive_mot_v1",
     generation_shape={
         "profile_name": "segmented_history_strict_geometry_v1",
         "order_mode": "segmented",

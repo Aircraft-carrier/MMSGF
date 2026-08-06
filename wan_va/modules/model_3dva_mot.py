@@ -613,7 +613,7 @@ class ThreeDVAMOTTransformer3DModel(ModelMixin, ConfigMixin):
         )
         del self.action_condition_embedder.text_embedder
 
-        self.vggto = VGGTOGeometryTower(
+        self.vggto = self._build_vggto_tower(
             patch_size=vggto_patch_size,
             num_register_tokens=vggto_num_register_tokens,
             depth=vggto_depth,
@@ -625,8 +625,8 @@ class ThreeDVAMOTTransformer3DModel(ModelMixin, ConfigMixin):
         register_layers = self.vggto.register_attention_indices
         self.mot_blocks = nn.ModuleList(
             [
-                ThreeDVAMOTBlock(
-                    WanTransformerBlock(
+                self._build_mot_block(
+                    video_block=WanTransformerBlock(
                         self.inner_dim,
                         ffn_dim,
                         self.num_attention_heads,
@@ -634,7 +634,7 @@ class ThreeDVAMOTTransformer3DModel(ModelMixin, ConfigMixin):
                         eps,
                         attn_mode="torch",
                     ),
-                    ActionTransformerBlock(
+                    action_block=ActionTransformerBlock(
                         self.action_hidden_dim,
                         self.action_ffn_dim,
                         self.inner_dim,
@@ -692,6 +692,21 @@ class ThreeDVAMOTTransformer3DModel(ModelMixin, ConfigMixin):
                 for name, (observed, expected_value) in mismatches.items()
             )
             raise ValueError(f"unsupported model topology: {details}")
+
+    def _build_vggto_tower(self, **kwargs) -> VGGTOGeometryTower:
+        """Construct the geometry tower.
+
+        Subclasses may override this hook to select a compatible tower with
+        different execution semantics.  The default path deliberately returns
+        the original implementation so native MOT behavior is unchanged.
+        """
+
+        return VGGTOGeometryTower(**kwargs)
+
+    def _build_mot_block(self, **kwargs) -> ThreeDVAMOTBlock:
+        """Construct one V/A/G block while preserving the parent topology."""
+
+        return ThreeDVAMOTBlock(**kwargs)
 
     @torch.no_grad()
     def _init_stream_embedding(self) -> None:

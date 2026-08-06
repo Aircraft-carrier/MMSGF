@@ -1,4 +1,4 @@
-"""CPU-only phase trace for the real ``MOTIncrementalAdapter``.
+"""CPU-only phase trace for the AR MoT self-rollout path.
 
 No checkpoint, dataset, GPU, or production model is required.  Video/action
 inputs use the production UMI MOT packing, while only model depth and hidden
@@ -15,9 +15,9 @@ Run the printable trace directly::
     PYTHONPATH=. python \
         distillation/tests/test_mot_incremental_adapter_ipdb_trace.py
 
-Enter ipdb immediately before the first adapter phase::
+Enter ipdb immediately before the first AR rollout phase::
 
-    MOT_ADAPTER_IPDB=1 PYTHONPATH=. python \
+    MOT_AR_IPDB=1 PYTHONPATH=. python \
         distillation/tests/test_mot_incremental_adapter_ipdb_trace.py
 """
 from __future__ import annotations
@@ -26,14 +26,18 @@ from collections import Counter
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from torch import nn
 
-import distillation.self_rollout.mot_adapter as mot_adapter_module
+import distillation.self_rollout.attention as attention_module
+from distillation.model.autoregressive_mot import (
+    AutoregressiveThreeDVAMOTTransformer3DModel,
+)
+from distillation.model.autoregressive_types import AutoregressiveProfile
 from distillation.self_rollout.attention import (
     NOISE_CLEAN,
     NOISE_GEOMETRY,
@@ -45,7 +49,6 @@ from distillation.self_rollout.attention import (
     build_token_metadata,
 )
 from distillation.self_rollout.cache import KVSegment
-from distillation.self_rollout.mot_adapter import MOTIncrementalAdapter
 from distillation.self_rollout.state import CacheSource, RolloutState
 
 
@@ -319,7 +322,7 @@ class _VisibilityRecorder:
     def __init__(self) -> None:
         self.phase = "unassigned"
         self.events: list[_AttentionEvent] = []
-        self._real_build = mot_adapter_module.build_cache_selection
+        self._real_build = attention_module.build_cache_selection
 
     def __call__(
         self,
@@ -427,21 +430,61 @@ def _commit_geometry_groups_stub(
             stream_id=STREAM_GEOMETRY,
         )
         del materialized_key
-        mot_adapter_module.build_cache_selection(
+        attention_module.build_cache_selection(
             metadata,
             key_metadata,
         )
     state.mot_cache.commit_transaction(transaction_id, source_id=int(source))
 
 
-def _run_trace() -> _TraceResult:
-    model = _TinyMOTModel()
-    adapter = MOTIncrementalAdapter(
-        model,
+def _attach_ar_mot_methods(model: _TinyMOTModel) -> _TinyMOTModel:
+    model.generation_profile = AutoregressiveProfile(
+        profile_name="segmented_history_strict_geometry_v1",
+        profile_version=2,
+        order_mode="segmented",
         history_frames=HISTORY_FRAMES,
         chunk_size=HISTORY_FRAMES,
         window_size=16,
+        geometry_relation="segmented_order_causal",
+        x_to_g_relation="strict_order",
     )
+    for name in ("_normalize_frame_ids", "_normalize_timesteps"):
+        setattr(
+            model,
+            name,
+            getattr(AutoregressiveThreeDVAMOTTransformer3DModel, name),
+        )
+    for name in (
+        "_text",
+        "_stream_axes",
+        "_video_rotary",
+        "_action_rotary",
+        "_video_input",
+        "_action_input",
+        "_run_streams",
+        "_run_transaction",
+        "_assert_clean_commit",
+        "predict_video",
+        "predict_action",
+        "commit_video",
+        "commit_action",
+        "assert_video_commit",
+        "assert_action_commit",
+    ):
+        setattr(
+            model,
+            name,
+            MethodType(
+                getattr(AutoregressiveThreeDVAMOTTransformer3DModel, name),
+                model,
+            ),
+        )
+    return model
+
+
+def _run_trace() -> _TraceResult:
+    model = _attach_ar_mot_methods(_TinyMOTModel())
+    adapter = model
     state = RolloutState()
     recorder = _VisibilityRecorder()
     text_emb = torch.ones(BATCH_SIZE, 1, HIDDEN_DIM)
@@ -450,13 +493,13 @@ def _run_trace() -> _TraceResult:
     action_predictions: dict[int, torch.Tensor] = {}
     temporary_cache_counts: dict[str, tuple[int, int]] = {}
 
-    if os.getenv("MOT_ADAPTER_IPDB"):
+    if os.getenv("MOT_AR_IPDB"):
         import ipdb
 
         ipdb.set_trace()
 
     with patch.object(
-        mot_adapter_module,
+        attention_module,
         "build_cache_selection",
         new=recorder,
     ):
@@ -874,10 +917,10 @@ def _render_phase_masks(
 def main() -> None:
     result = _run_trace()
     _assert_trace(result)
-    mask_dir = Path(os.getenv("MOT_ADAPTER_MASK_DIR", str(DEFAULT_MASK_DIR)))
+    mask_dir = Path(os.getenv("MOT_AR_MASK_DIR", str(DEFAULT_MASK_DIR)))
     mask_paths = _render_phase_masks(result.events, mask_dir)
 
-    print("MOTIncrementalAdapter CPU rollout trace: PASS")
+    print("AR MoT CPU rollout trace: PASS")
     print(
         "production video shape: "
         f"[{BATCH_SIZE},{VIDEO_CHANNELS},{TOTAL_FRAMES},{VIEWS},"

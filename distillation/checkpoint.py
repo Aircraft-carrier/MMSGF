@@ -171,6 +171,19 @@ class DistillationCheckpointIO:
                 f"Checkpoint method {metadata.distill_method} does not match "
                 f"trainer method {trainer.method}"
             )
+        expected_architecture = str(
+            getattr(
+                trainer.config.distill,
+                "model_architecture",
+                "autoregressive_mot_v1",
+            )
+        )
+        if getattr(metadata, "model_architecture", expected_architecture) != expected_architecture:
+            raise ValueError(
+                "Checkpoint model architecture does not match trainer: "
+                f"checkpoint={getattr(metadata, 'model_architecture', None)}, "
+                f"expected={expected_architecture}"
+            )
         if metadata.format_version != CHECKPOINT_FORMAT_VERSION:
             raise ValueError(
                 f"Unsupported checkpoint format version {metadata.format_version}"
@@ -331,6 +344,13 @@ class DistillationCheckpointIO:
             step=int(trainer.step),
             optimizer_step=int(trainer.optimizer_step),
             generation_profile=generation_profile_contract(shape),
+            model_architecture=str(
+                getattr(
+                    trainer.config.distill,
+                    "model_architecture",
+                    "autoregressive_mot_v1",
+                )
+            ),
         )
         (temp_dir / "checkpoint_metadata.json").write_text(
             json.dumps(asdict(metadata), indent=2),

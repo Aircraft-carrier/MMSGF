@@ -12,6 +12,7 @@ consistency_distillation_cfg.optimization_composition = "va"
 consistency_distillation_cfg.cfg_prob = 0.0
 consistency_distillation_cfg.distill = EasyDict(
     method="consistency_distillation",
+    model_architecture="autoregressive_mot_v1",
     # distillation wrapper 在原生 metadata 上应用两段式 order；不改变物理 packing。
     generation_shape={
         "profile_name": "segmented_history_strict_geometry_v1",
