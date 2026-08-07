@@ -56,10 +56,22 @@ from distillation.configs.autoregressive_training import (
 from distillation.configs.consistency_distillation import (
     consistency_distillation_cfg,
 )
-from distillation.mask_profile import (
-    _apply_segmented_order,
-    _build_segmented_vggto_inter_frame_mask,
-    _build_segmented_vggto_inter_frame_metadata,
+from distillation.model.autoregressive_mot import (
+    AutoregressiveThreeDVAMOTTransformer3DModel,
+)
+from distillation.model.autoregressive_vggto import (
+    AutoregressiveVGGTOGeometryTower,
+)
+
+# Segmented mask construction is owned by the AR model classes.  Keep local
+# aliases in this visualization test so the fixtures read like the profile
+# contract while exercising the production owners directly.
+_apply_segmented_order = AutoregressiveThreeDVAMOTTransformer3DModel._apply_segmented_order
+_build_segmented_vggto_inter_frame_mask = (
+    AutoregressiveVGGTOGeometryTower._build_segmented_inter_frame_mask
+)
+_build_segmented_vggto_inter_frame_metadata = (
+    AutoregressiveVGGTOGeometryTower._build_segmented_inter_frame_metadata
 )
 
 

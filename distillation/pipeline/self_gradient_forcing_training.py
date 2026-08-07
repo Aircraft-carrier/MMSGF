@@ -17,7 +17,6 @@ from distillation.model.objectives import (
     replay_target_loss,
 )
 from distillation.model.utils import (
-    temporary_fsdp_unshard,
     temporary_masked_attention_backend,
 )
 from distillation.pipeline.utils import (
@@ -445,7 +444,7 @@ class SelfGradientForcingTrainingPipeline:
         with temporary_masked_attention_backend(
             self.student,
             rollout_backend,
-        ), temporary_fsdp_unshard(self.student):
+        ):
             rollout = self_rollout(
                 batch,
                 transformer=self.student,

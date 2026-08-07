@@ -8,9 +8,9 @@ from typing import Any, Literal
 import torch
 
 from distillation.checkpoint import DistillationCheckpointIO
-from distillation.mask_profile import (
-    install_order_profile,
-    validate_checkpoint_generation_profile,
+from distillation.mask_profile import validate_checkpoint_generation_profile
+from distillation.model.autoregressive_mot import (
+    AutoregressiveThreeDVAMOTTransformer3DModel,
 )
 from distillation.schema import TrainingStepResult
 from wan_va.train_mot import MOTTrainer
@@ -43,14 +43,13 @@ class DistillationTrainerBase(MOTTrainer):
     """
 
     method: str
+    transformer_model_cls = AutoregressiveThreeDVAMOTTransformer3DModel
 
     def _load_transformer(self):
-        # MOTTrainer applies activation checkpoint wrappers immediately after
-        # this hook. Install the instance-local attention policy first so each
-        # wrapper preserves the patched block forward instead of being bypassed.
-        model = super()._load_transformer()
-        install_order_profile(model, self.config.distill.generation_shape)
-        return model
+        # MOTTrainer applies activation checkpoint wrappers after this hook.
+        # The AR model already owns its attention policy at construction time,
+        # so no post-construction method registration is needed here.
+        return super()._load_transformer()
 
     def __init__(self, config: Any):
         self._resume_from = getattr(config.distill, "resume_from", None)
@@ -87,7 +86,7 @@ class DistillationTrainerBase(MOTTrainer):
             )
 
         super().__init__(config)
-        install_order_profile(self.transformer, config.distill.generation_shape)
+        self.transformer.configure_generation_profile(config.distill.generation_shape)
 
         self.method_model = self._build_method_model(config)
         self.checkpoint_io = DistillationCheckpointIO()

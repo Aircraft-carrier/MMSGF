@@ -1,4 +1,4 @@
-"""CPU-only phase trace for the real ``GeometryIncrementalAdapter``.
+"""CPU-only phase trace for the AR VGGTO geometry self-rollout path.
 
 No checkpoint, dataset, GPU, or production model is required.  Geometry RGB
 inputs use the production rollout packing ``[B,F,S,V,3,H,W]`` while token width,
@@ -15,9 +15,9 @@ Run the printable trace directly::
     PYTHONPATH=. python \
         distillation/tests/test_geometry_incremental_adapter_ipdb_trace.py
 
-Enter ipdb immediately before the first adapter phase::
+Enter ipdb immediately before the first AR geometry phase::
 
-    GEOMETRY_ADAPTER_IPDB=1 PYTHONPATH=. python \
+    GEOMETRY_AR_IPDB=1 PYTHONPATH=. python \
         distillation/tests/test_geometry_incremental_adapter_ipdb_trace.py
 """
 from __future__ import annotations
@@ -26,23 +26,22 @@ from collections import Counter
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from torch import nn
 
-import distillation.self_rollout.geometry_cache as geometry_cache_module
+import distillation.self_rollout.attention as attention_module
+from distillation.model.autoregressive_types import AutoregressiveProfile
+from distillation.model.autoregressive_vggto import AutoregressiveVGGTOGeometryTower
 from distillation.self_rollout.attention import (
     NOISE_GEOMETRY,
     STREAM_GEOMETRY,
     TokenMetadataBatch,
 )
-from distillation.self_rollout.geometry_cache import (
-    GeometryIncrementalAdapter,
-    GeometryRolloutCache,
-)
+from distillation.self_rollout.cache import GeometryRolloutCache
 from distillation.self_rollout.state import CacheSource, RolloutState
 
 
@@ -260,7 +259,7 @@ class _VisibilityRecorder:
     def __init__(self) -> None:
         self.phase = "unassigned"
         self.events: list[_AttentionEvent] = []
-        self._real_build = geometry_cache_module.build_cache_selection
+        self._real_build = attention_module.build_cache_selection
 
     def __call__(
         self,
@@ -307,24 +306,62 @@ def _slot_valid(frames: int) -> torch.Tensor:
     return torch.ones(BATCH_SIZE, frames, GROUP_SLOTS, dtype=torch.bool)
 
 
+class _GeometryARHarness:
+    def __init__(self, model: _TinyMOTModel) -> None:
+        self.model = model
+        self.vggto = model.vggto
+        self.vggto.generation_profile = AutoregressiveProfile(
+            profile_name="segmented_history_strict_geometry_v1",
+            profile_version=2,
+            order_mode="segmented",
+            history_frames=HISTORY_FRAMES,
+            chunk_size=HISTORY_FRAMES,
+            window_size=WINDOW_SIZE,
+            geometry_relation="segmented_order_causal",
+            x_to_g_relation="strict_order",
+        )
+        for name in ("_norm_input_dtype", "_module_parameter_dtype"):
+            setattr(self.vggto, name, getattr(AutoregressiveVGGTOGeometryTower, name))
+        for name in (
+            "_relation_metadata",
+            "_run_relation_attention_incremental",
+            "_register_rotary",
+            "_joint_metadata",
+            "_run_joint_registers_incremental",
+            "_encode_groups_and_commit",
+            "encode_history_and_commit",
+            "encode_and_commit",
+            "assert_geometry_commit",
+        ):
+            setattr(
+                self.vggto,
+                name,
+                MethodType(getattr(AutoregressiveVGGTOGeometryTower, name), self.vggto),
+            )
+
+    def encode_history_and_commit(self, rgb: torch.Tensor, **payload):
+        return self.vggto.encode_history_and_commit(self.model, rgb, **payload)
+
+    def encode_and_commit(self, rgb: torch.Tensor, **payload):
+        return self.vggto.encode_and_commit(self.model, rgb, **payload)
+
+    def assert_geometry_commit(self, *args, **kwargs) -> None:
+        self.vggto.assert_geometry_commit(*args, **kwargs)
+
+
 def _run_trace() -> _TraceResult:
     model = _TinyMOTModel()
-    adapter = GeometryIncrementalAdapter(
-        model,
-        history_frames=HISTORY_FRAMES,
-        chunk_size=HISTORY_FRAMES,
-        window_size=WINDOW_SIZE,
-    )
+    adapter = _GeometryARHarness(model)
     state = RolloutState(geometry_cache=GeometryRolloutCache())
     recorder = _VisibilityRecorder()
 
-    if os.getenv("GEOMETRY_ADAPTER_IPDB"):
+    if os.getenv("GEOMETRY_AR_IPDB"):
         import ipdb
 
         ipdb.set_trace()
 
     with patch.object(
-        geometry_cache_module,
+        attention_module,
         "build_cache_selection",
         new=recorder,
     ):
@@ -613,10 +650,10 @@ def _render_phase_masks(
 def main() -> None:
     result = _run_trace()
     _assert_trace(result)
-    mask_dir = Path(os.getenv("GEOMETRY_ADAPTER_MASK_DIR", str(DEFAULT_MASK_DIR)))
+    mask_dir = Path(os.getenv("GEOMETRY_AR_MASK_DIR", str(DEFAULT_MASK_DIR)))
     mask_paths = _render_phase_masks(result.events, mask_dir)
 
-    print("GeometryIncrementalAdapter CPU rollout trace: PASS")
+    print("AR VGGTO geometry CPU rollout trace: PASS")
     print(
         "production geometry shape: "
         f"[{BATCH_SIZE},{TOTAL_FRAMES},{GROUP_SLOTS},{VIEWS},"

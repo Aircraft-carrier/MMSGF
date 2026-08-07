@@ -1349,6 +1349,9 @@ def _make_nan_log_record(
 
 
 class MOTTrainer:
+    # Subclasses such as distillation's autoregressive trainer override this
+    # without changing the native MOT trainer's model family.
+    transformer_model_cls = ThreeDVAMOTTransformer3DModel
     def __init__(self, config):
         self.config = config
         self.optimization_composition = validate_mot_training_config(config)
@@ -1577,7 +1580,8 @@ class MOTTrainer:
             transformer_path = checkpoint_path / "transformer"
             if self.config.rank == 0:
                 logger.info(f"Preparing MOT transformer for full-state resume: {transformer_path}")
-            model_config = ThreeDVAMOTTransformer3DModel.load_config(transformer_path)
+            model_cls = self.transformer_model_cls
+            model_config = model_cls.load_config(transformer_path)
             saved_backend = model_config.get("masked_attn_backend", "fa4")
             current_backend = getattr(self.config, "masked_attn_backend", "fa4")
             if saved_backend != current_backend:
@@ -1586,7 +1590,7 @@ class MOTTrainer:
                     f"checkpoint={saved_backend}, current={current_backend}"
                 )
             with torch.device("meta"):
-                model = ThreeDVAMOTTransformer3DModel.from_config(model_config)
+                model = model_cls.from_config(model_config)
             model.to_empty(device=self.device)
             return model
 
@@ -1596,7 +1600,7 @@ class MOTTrainer:
             transformer_path = checkpoint_path / "transformer"
             if self.config.rank == 0:
                 logger.info(f"Initializing MOT stage from complete transformer: {transformer_path}")
-            return ThreeDVAMOTTransformer3DModel.from_pretrained(
+            return self.transformer_model_cls.from_pretrained(
                 transformer_path,
                 torch_dtype=torch.float32,
             )
@@ -1641,7 +1645,7 @@ class MOTTrainer:
                 "Constructing a new MOT transformer requires source checkpoints: "
                 + ", ".join(missing_sources)
             )
-        model, report = ThreeDVAMOTTransformer3DModel.from_lingbot_and_vggto(
+        model, report = self.transformer_model_cls.from_lingbot_and_vggto(
             video_transformer_path,
             source_paths["vggto_checkpoint_path"],
             source_paths["vggt_checkpoint_path"],
@@ -3352,7 +3356,11 @@ class MOTTrainer:
         transformer_dir.mkdir(parents=True, exist_ok=False)
         config_dict = dict(self.transformer.config)
         config_dict.pop("_name_or_path", None)
-        config_dict["_class_name"] = "ThreeDVAMOTTransformer3DModel"
+        config_dict["_class_name"] = self.transformer_model_cls.__name__
+        profile_owner = getattr(self.transformer, "module", self.transformer)
+        profile = getattr(profile_owner, "generation_profile", None)
+        if profile is not None and hasattr(profile, "as_dict"):
+            config_dict["generation_profile"] = profile.as_dict()
         with (transformer_dir / "config.json").open("w", encoding="utf-8") as f:
             json.dump(config_dict, f, indent=2)
         return transformer_dir

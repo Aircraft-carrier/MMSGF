@@ -5,15 +5,15 @@ import json
 from pathlib import Path
 from typing import Any
 
-from distillation.mask_profile import generation_profile_contract, install_order_profile
+from distillation.mask_profile import generation_profile_contract
+from distillation.model.autoregressive_mot import (
+    AutoregressiveThreeDVAMOTTransformer3DModel,
+)
 from wan_va.train_mot import MOTTrainer
 
 
 class AutoregressiveTrainer(MOTTrainer):
-    def _load_transformer(self):
-        model = super()._load_transformer()
-        install_order_profile(model, self.config.distill.generation_shape)
-        return model
+    transformer_model_cls = AutoregressiveThreeDVAMOTTransformer3DModel
 
     def __init__(self, config: Any):
         if config.distill.resume_from is not None:
@@ -22,7 +22,7 @@ class AutoregressiveTrainer(MOTTrainer):
         elif config.distill.student_init is not None:
             config.initialize_from = str(config.distill.student_init)
         super().__init__(config)
-        install_order_profile(self.transformer, config.distill.generation_shape)
+        self.transformer.configure_generation_profile(config.distill.generation_shape)
 
     def _write_checkpoint_metadata(self, checkpoint_dir: Path, *, has_full_state: bool) -> None:
         super()._write_checkpoint_metadata(checkpoint_dir, has_full_state=has_full_state)
@@ -34,6 +34,7 @@ class AutoregressiveTrainer(MOTTrainer):
                 "exported_model": "student",
                 "step": int(self.step),
                 "optimizer_step": int(self.optimizer_step),
+                "model_architecture": "autoregressive_mot_v1",
                 "generation_profile": generation_profile_contract(
                     self.config.distill.generation_shape
                 ),

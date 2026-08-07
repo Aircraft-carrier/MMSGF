@@ -7,9 +7,9 @@ from typing import Any
 import torch
 
 from distillation.model.utils import freeze_model, set_trainable
-from distillation.mask_profile import (
-    install_order_profile,
-    validate_checkpoint_generation_profile,
+from distillation.mask_profile import validate_checkpoint_generation_profile
+from distillation.model.autoregressive_mot import (
+    AutoregressiveThreeDVAMOTTransformer3DModel,
 )
 from wan_va.modules.model_3dva_mot import ThreeDVAMOTTransformer3DModel
 
@@ -19,7 +19,8 @@ def load_transformer_export(
     config: Any,
     *,
     validate_distillation_profile: bool = True,
-) -> ThreeDVAMOTTransformer3DModel:
+    autoregressive: bool = True,
+) -> AutoregressiveThreeDVAMOTTransformer3DModel:
     """Load only a published cross-stage ``transformer/`` export.
 
     checkpoint root 必须有 ``_SUCCESS``、MOT-compatible metadata、config 和
@@ -36,10 +37,17 @@ def load_transformer_export(
             config.distill.generation_shape,
         )
     transformer_path = checkpoint_path / "transformer"
-    model = ThreeDVAMOTTransformer3DModel.from_pretrained(
+    model_cls = (
+        AutoregressiveThreeDVAMOTTransformer3DModel
+        if autoregressive
+        else ThreeDVAMOTTransformer3DModel
+    )
+    model = model_cls.from_pretrained(
         transformer_path,
         torch_dtype=config.param_dtype,
     )
+    if autoregressive:
+        model.configure_generation_profile(config.distill.generation_shape)
     masked_attn_backend = getattr(config, "masked_attn_backend", None)
     if masked_attn_backend is not None:
         model.masked_attn_backend = str(masked_attn_backend)
@@ -55,7 +63,8 @@ def build_frozen_transformer(
     *,
     install_distillation_profile: bool = True,
     validate_distillation_profile: bool = True,
-) -> ThreeDVAMOTTransformer3DModel:
+    autoregressive: bool = True,
+) -> AutoregressiveThreeDVAMOTTransformer3DModel:
     """Load a frozen transformer.
 
     Stage2 teachers and EMA targets use the default distillation profile checks.
@@ -66,6 +75,7 @@ def build_frozen_transformer(
         checkpoint_path,
         config,
         validate_distillation_profile=validate_distillation_profile,
+        autoregressive=autoregressive,
     )
     return _configure_distillation_model(
         model,
@@ -83,11 +93,13 @@ def build_trainable_transformer(
     *,
     install_distillation_profile: bool = True,
     validate_distillation_profile: bool = True,
-) -> ThreeDVAMOTTransformer3DModel:
+    autoregressive: bool = True,
+) -> AutoregressiveThreeDVAMOTTransformer3DModel:
     model = load_transformer_export(
         checkpoint_path,
         config,
         validate_distillation_profile=validate_distillation_profile,
+        autoregressive=autoregressive,
     )
     return _configure_distillation_model(
         model,
@@ -117,8 +129,8 @@ def _configure_distillation_model(
     )
 
     execution_route = getattr(config, "execution_route", "joint")
-    if install_distillation_profile:
-        install_order_profile(model, config.distill.generation_shape)
+    if autoregressive and hasattr(model, "configure_generation_profile"):
+        model.configure_generation_profile(config.distill.generation_shape)
     if trainable:
         set_trainable(model)
         apply_mot_parameter_ownership(model, config.optimization_composition)

@@ -41,6 +41,7 @@ class SGFDMDModel:
             device,
             install_distillation_profile=False,
             validate_distillation_profile=False,
+            autoregressive=False,
         )
         self.fake_score = build_trainable_transformer(fake_score_init, config, device)
 

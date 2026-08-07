@@ -18,13 +18,15 @@ from typing import Any, Callable
 
 import torch
 
-from .geometry_cache import GeometryIncrementalAdapter, GeometryRolloutCache
-from .mot_adapter import MOTIncrementalAdapter
+from .cache import GeometryRolloutCache
 from .provider import GroundTruthProvider, GroundTruthStep
 from .recorder import SelfRolloutRecorder
 from .result import RolloutResult
 from .scheduler import RolloutSchedulers, build_rollout_schedulers
 from .state import CacheSource, RolloutPhase, RolloutState
+from distillation.model.autoregressive_types import (
+    AutoregressiveModelRequest,
+)
 
 
 def decoded_rgb_to_geometry_groups(
@@ -217,8 +219,6 @@ def self_rollout(
     ground_truth_provider: GroundTruthProvider | None = None,
     replacement_policy: str = "require_ground_truth",
     generator: torch.Generator | None = None,
-    mot_adapter: MOTIncrementalAdapter | None = None,
-    geometry_adapter: GeometryIncrementalAdapter | None = None,
     schedulers: RolloutSchedulers | None = None,
     recorder: SelfRolloutRecorder | None = None,
 ) -> RolloutResult:
@@ -252,8 +252,6 @@ def self_rollout(
             "generation_shape.history_frames must match MOT spec: "
             f"{configured_history} != {history_frames}"
         )
-    chunk_size = int(shape["chunk_size"])
-    window_size = int(shape["window_size"])
     if str(shape.get("order_mode", "segmented")) != "segmented":
         raise ValueError("self_rollout requires generation_shape.order_mode='segmented'")
 
@@ -262,18 +260,16 @@ def self_rollout(
         generator = torch.Generator(device=device)
         generator.manual_seed(int(getattr(config, "seed", 0)))
     state = RolloutState(geometry_cache=geometry_cache, generator=generator)
-    mot_adapter = mot_adapter or MOTIncrementalAdapter(
-        transformer,
-        history_frames=history_frames,
-        chunk_size=chunk_size,
-        window_size=window_size,
-    )
-    geometry_adapter = geometry_adapter or GeometryIncrementalAdapter(
-        transformer,
-        history_frames=history_frames,
-        chunk_size=chunk_size,
-        window_size=window_size,
-    )
+    native_model = getattr(transformer, "module", transformer)
+    if not hasattr(native_model, "forward_autoregressive"):
+        raise TypeError(
+            "self_rollout requires an autoregressive model boundary; "
+            "use AutoregressiveThreeDVAMOTTransformer3DModel"
+        )
+
+    def invoke_model(operation: str, **payload):
+        request = AutoregressiveModelRequest(operation=operation, payload=payload)
+        return transformer(request, mode="self_rollout")
     schedulers = schedulers or build_rollout_schedulers(
         config,
         video_num_steps=video_num_steps,
@@ -286,20 +282,21 @@ def self_rollout(
         )
 
     def assert_phase(
-        adapter,
         barrier_name: str,
         frame_id: int,
         source: CacheSource,
         version_id: int,
     ) -> None:
-        barrier = getattr(adapter, barrier_name, None)
-        if barrier is not None:
-            barrier(
-                state,
-                frame_id=frame_id,
-                source=source,
-                version_id=version_id,
-            )
+        if barrier_name == "assert_geometry_commit":
+            barrier = getattr(native_model.vggto, barrier_name)
+        else:
+            barrier = getattr(native_model, barrier_name)
+        barrier(
+            state,
+            frame_id=frame_id,
+            source=source,
+            version_id=version_id,
+        )
         state.assert_cache_versions()
 
     latents = batch["latents"].to(device=device)
@@ -340,8 +337,9 @@ def self_rollout(
     ) -> None:
         """Commit clean video K/V and advance the semantic frame to geometry."""
 
-        mot_adapter.commit_video(
-            video,
+        invoke_model(
+            "commit_video",
+            latents=video,
             frame_ids=[frame_id],
             stream_ids=stream_ids,
             text_emb=text_emb,
@@ -355,7 +353,6 @@ def self_rollout(
         frame.video_source = source
         frame.video_version = version_id
         assert_phase(
-            mot_adapter,
             "assert_video_commit",
             frame_id,
             source,
@@ -374,21 +371,21 @@ def self_rollout(
     ) -> None:
         """Commit geometry K/V and advance the semantic frame to action."""
 
-        encoded = geometry_adapter.encode_and_commit(
-            geometry,
+        encoded = invoke_model(
+            "encode_geometry",
             frame_id=frame_id,
+            rgb=geometry,
             slot_valid_mask=_frame_geometry_valid(working_batch, frame_id, device),
             state=state,
             source=source,
             version_id=version_id,
-        )
+        ).geometry_frame
         frame = state.frame(frame_id)
         frame.geometry_rgb = geometry
         frame.geometry_state = encoded
         frame.geometry_source = source
         frame.geometry_version = version_id
         assert_phase(
-            geometry_adapter,
             "assert_geometry_commit",
             frame_id,
             source,
@@ -406,8 +403,9 @@ def self_rollout(
     ) -> None:
         """Commit clean action K/V and finish one semantic frame."""
 
-        mot_adapter.commit_action(
-            action,
+        invoke_model(
+            "commit_action",
+            actions=action,
             frame_ids=[frame_id],
             text_emb=text_emb,
             state=state,
@@ -420,7 +418,6 @@ def self_rollout(
         frame.action_source = source
         frame.action_version = version_id
         assert_phase(
-            mot_adapter,
             "assert_action_commit",
             frame_id,
             source,
@@ -430,8 +427,9 @@ def self_rollout(
     # Stage 1: history V/A are batched commits; all history G groups share one
     # transaction so the G-history mask is a full square rather than triangular.
     history_ids = list(range(history_frames))
-    mot_adapter.commit_video(
-        latents[:, :, :history_frames],
+    invoke_model(
+        "commit_video",
+        latents=latents[:, :, :history_frames],
         frame_ids=history_ids,
         stream_ids=stream_ids,
         text_emb=text_emb,
@@ -449,14 +447,14 @@ def self_rollout(
         frame.video_version = 1
     for frame_id in history_ids:
         assert_phase(
-            mot_adapter,
             "assert_video_commit",
             frame_id,
             CacheSource.HISTORY,
             1,
         )
-    history_geometry = geometry_adapter.encode_history_and_commit(
-        geometry_rgb[:, :history_frames],
+    history_geometry = invoke_model(
+        "encode_geometry_history",
+        rgb=geometry_rgb[:, :history_frames],
         frame_ids=history_ids,
         slot_valid_mask=working_batch["geometry_group_valid_mask"][
             :, :history_frames
@@ -464,7 +462,7 @@ def self_rollout(
         state=state,
         source=CacheSource.HISTORY,
         version_id=1,
-    )
+    ).geometry_frame
     if len(history_geometry) != history_frames:
         raise RuntimeError(
             "history geometry prefill returned "
@@ -478,14 +476,14 @@ def self_rollout(
         frame.geometry_version = 1
     for frame_id in history_ids:
         assert_phase(
-            geometry_adapter,
             "assert_geometry_commit",
             frame_id,
             CacheSource.HISTORY,
             1,
         )
-    mot_adapter.commit_action(
-        actions[:, :, :history_frames],
+    invoke_model(
+        "commit_action",
+        actions=actions[:, :, :history_frames],
         frame_ids=history_ids,
         text_emb=text_emb,
         state=state,
@@ -502,7 +500,6 @@ def self_rollout(
         frame.action_version = 1
     for frame_id in history_ids:
         assert_phase(
-            mot_adapter,
             "assert_action_commit",
             frame_id,
             CacheSource.HISTORY,
@@ -565,27 +562,29 @@ def self_rollout(
                     timestep=timestep,
                     sample=sample,
                 )
-            conditional = mot_adapter.predict_video(
-                sample,
+            conditional = invoke_model(
+                "predict_video",
+                sample=sample,
                 timestep=timestep,
                 frame_id=frame_id,
                 stream_ids=stream_ids,
                 text_emb=text_emb,
                 state=state,
                 valid_frames=_frame_video_valid(working_batch, frame_id, device),
-            )
+            ).prediction
             if guidance_scale == 1.0:
                 prediction = conditional
             else:
-                unconditional = mot_adapter.predict_video(
-                    sample,
+                unconditional = invoke_model(
+                    "predict_video",
+                    sample=sample,
                     timestep=timestep,
                     frame_id=frame_id,
                     stream_ids=stream_ids,
                     text_emb=empty_text_emb,
                     state=state,
                     valid_frames=_frame_video_valid(working_batch, frame_id, device),
-                )
+                ).prediction
                 prediction = unconditional + guidance_scale * (
                     conditional - unconditional
                 )
@@ -614,14 +613,15 @@ def self_rollout(
                     timestep=timestep,
                     sample=sample,
                 )
-            prediction = mot_adapter.predict_action(
-                sample,
+            prediction = invoke_model(
+                "predict_action",
+                sample=sample,
                 timestep=timestep,
                 frame_id=frame_id,
                 text_emb=text_emb,
                 state=state,
                 valid_mask=valid,
-            )
+            ).prediction
             sample = schedulers.action.step(prediction, timestep, sample)
             if valid is not None:
                 sample = sample * valid.to(dtype=sample.dtype)
