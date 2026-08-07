@@ -4,24 +4,16 @@ from __future__ import annotations
 
 def __getattr__(name: str):
     if name in {
-        "AutoregressiveThreeDVAMOTTransformer3DModel",
-        "AutoregressiveThreeDVAMOTBlock",
-        "AutoregressiveVGGTOGeometryTower",
-        "AutoregressiveVGGTOBlock",
+        "AutoregressiveVAMOTTransformer3DModel",
+        "AutoregressiveVAMOTBlock",
     }:
         from distillation.model.autoregressive_mot import (
-            AutoregressiveThreeDVAMOTBlock,
-            AutoregressiveThreeDVAMOTTransformer3DModel,
-        )
-        from distillation.model.autoregressive_vggto import (
-            AutoregressiveVGGTOBlock,
-            AutoregressiveVGGTOGeometryTower,
+            AutoregressiveVAMOTBlock,
+            AutoregressiveVAMOTTransformer3DModel,
         )
         return {
-            "AutoregressiveThreeDVAMOTTransformer3DModel": AutoregressiveThreeDVAMOTTransformer3DModel,
-            "AutoregressiveThreeDVAMOTBlock": AutoregressiveThreeDVAMOTBlock,
-            "AutoregressiveVGGTOGeometryTower": AutoregressiveVGGTOGeometryTower,
-            "AutoregressiveVGGTOBlock": AutoregressiveVGGTOBlock,
+            "AutoregressiveVAMOTTransformer3DModel": AutoregressiveVAMOTTransformer3DModel,
+            "AutoregressiveVAMOTBlock": AutoregressiveVAMOTBlock,
         }[name]
     if name in {"ConsistencyModel", "SGFDMDModel"}:
         if name == "ConsistencyModel":
@@ -56,10 +48,8 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "AutoregressiveThreeDVAMOTTransformer3DModel",
-    "AutoregressiveThreeDVAMOTBlock",
-    "AutoregressiveVGGTOGeometryTower",
-    "AutoregressiveVGGTOBlock",
+    "AutoregressiveVAMOTTransformer3DModel",
+    "AutoregressiveVAMOTBlock",
     "ConsistencyModel",
     "SGFDMDModel",
     "action_aware_loss",

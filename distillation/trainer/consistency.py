@@ -99,7 +99,6 @@ class ConsistencyTrainer(DistillationTrainerBase):
                 spec=mot_spec_from_config(self.config),
                 device=self.device,
                 empty_text_emb=self._get_empty_text_emb(),
-                decode_latents_to_rgb_views=self._decode_rollout_latents,
                 video_num_steps=int(self.config.distill.rollout_video_num_steps),
                 action_num_steps=int(self.config.distill.rollout_action_num_steps),
                 rollout_frames=int(self.config.distill.rollout_horizon_frames),
@@ -143,7 +142,6 @@ class ConsistencyTrainer(DistillationTrainerBase):
         artifacts = save_rollout_artifacts(
             rollout,
             batch,
-            decode_latents_to_rgb_views=self._decode_rollout_latents,
             output_dir=output_dir,
             video_fps=fps,
         )

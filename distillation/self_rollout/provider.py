@@ -11,8 +11,6 @@ import torch
 class GroundTruthStep:
     frame_id: int
     video_latent: torch.Tensor | None = None
-    geometry_rgb: torch.Tensor | None = None
-    geometry_state: Any | None = None
     action: torch.Tensor | None = None
     video_valid: torch.Tensor | None = None
     action_valid: torch.Tensor | None = None
@@ -23,8 +21,6 @@ class GroundTruthStep:
             raise ValueError("frame_id must be non-negative")
         if (
             self.video_latent is None
-            and self.geometry_rgb is None
-            and self.geometry_state is None
             and self.action is None
         ):
             raise ValueError("GroundTruthStep must provide at least one component")
@@ -45,7 +41,7 @@ class OfflineGroundTruthProvider:
 
     def __init__(self, batch: dict[str, Any], *, replace: frozenset[str] | None = None):
         self.batch = batch
-        self.replace = replace or frozenset({"video", "geometry", "action"})
+        self.replace = replace or frozenset({"video", "action"})
 
     def maybe_get(
         self,
@@ -64,11 +60,6 @@ class OfflineGroundTruthProvider:
             video_latent=(
                 self.batch["latents"][:, :, frame_id : frame_id + 1].clone()
                 if "video" in self.replace
-                else None
-            ),
-            geometry_rgb=(
-                self.batch["geometry_rgb"][:, frame_id : frame_id + 1].clone()
-                if "geometry" in self.replace and "geometry_rgb" in self.batch
                 else None
             ),
             action=(

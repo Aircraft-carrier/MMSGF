@@ -6,15 +6,9 @@ FlashAttention extensions.  The integer constants mirror
 ``wan_va.modules.mot_attention``.
 
 The dense reference is rectangular: rows are the current query transaction and
-columns are committed K/V followed by the current transaction.  Runtime
-rollout selects the readable cache segments first and executes maskless SDPA.
-With ``1`` as visible and ``.`` as masked, the stream-level rule is::
-
-                     K: committed X  committed G  current X  current G
-        Q: current X          1            1           1          1
-        Q: current G          .            1           .          1
-
-``X`` means video or action.  Prediction transactions are discarded after one
+columns are committed K/V followed by the current transaction. Runtime rollout
+selects the readable cache segments first and executes maskless SDPA.
+Prediction transactions are discarded after one
 denoising query; commit transactions keep only clean video/action K/V.
 """
 from __future__ import annotations
@@ -26,11 +20,9 @@ import torch
 
 STREAM_VIDEO = 0
 STREAM_ACTION = 1
-STREAM_GEOMETRY = 2
 
 NOISE_NOISY = 0
 NOISE_CLEAN = 1
-NOISE_GEOMETRY = 2
 
 SOURCE_HISTORY = 0
 SOURCE_ANCHOR = 1
@@ -182,7 +174,7 @@ def segmented_orders(
     history_frames: int,
     chunk_size: int,
 ) -> torch.Tensor:
-    """Return stable video/geometry orders for arbitrary rollout horizons."""
+    """Return stable Video+Action orders for arbitrary rollout horizons."""
 
     if history_frames <= 0:
         raise ValueError(f"history_frames must be positive, got {history_frames}")
@@ -271,7 +263,7 @@ def from_mot_metadata(meta, *, committed: bool = True) -> TokenMetadataBatch:
     if cached is not None and bool(committed):
         return cached
     if meta.frame_ids is None:
-        raise ValueError("strict geometry policy requires MOT frame_ids")
+        raise ValueError("autoregressive VA policy requires MOT frame_ids")
     valid = meta.seq_ids >= 0
     if meta.token_valid_ids is not None:
         valid = valid & meta.token_valid_ids.to(device=meta.device, dtype=torch.bool)
@@ -301,30 +293,9 @@ def build_cache_visibility(
 ) -> torch.Tensor:
     """Build the commit-ordered rectangular ``[B,Q,K]`` visibility mask.
 
-    Committed K/V is historical by definition.  Video/action queries may read
-    every committed stream plus their own transaction.  Geometry queries are
-    isolated to committed geometry plus current-transaction geometry.
-
-    Geometry obtains its stage-specific topology from transaction boundaries::
-
-        history prefill (G0..G3 share one transaction)
-
-            Q\\K  G0 G1 G2 G3
-             G0   1  1  1  1
-             G1   1  1  1  1
-             G2   1  1  1  1
-             G3   1  1  1  1
-
-        anchor/rollout (one new transaction per group)
-
-            Q\\K  G0 G1 G2 G3 G4 G5 ...
-             G4   1  1  1  1  1  .  ...
-             G5   1  1  1  1  1  1  ...
-
-    Thus history groups are mutually visible, while each later group sees only
-    committed geometry and itself.  Geometry never reads video/action keys.
-
-    ``window_size`` remains part of the checkpoint/config contract, but does
+    Committed K/V is historical by definition. Video/action queries may read
+    every committed stream plus their own transaction. ``window_size`` remains
+    part of the checkpoint/config contract, but does
     not truncate inference visibility: commit order is the causal boundary.
     """
 
@@ -343,9 +314,6 @@ def build_cache_visibility(
 
     q_seq = query.seq_ids[:, :, None]
     k_seq = key.seq_ids[:, None, :]
-    q_stream = query.stream_ids[:, :, None]
-    k_stream = key.stream_ids[:, None, :]
-
     base = (
         (q_seq == k_seq)
         & (q_seq >= 0)
@@ -362,16 +330,7 @@ def build_cache_visibility(
     )
     readable = key.committed_ids[:, None, :] | same_transaction
 
-    geometry_relation = (
-        (q_stream == STREAM_GEOMETRY)
-        & (k_stream == STREAM_GEOMETRY)
-        & readable
-    )
-    x_relation = (
-        ((q_stream == STREAM_VIDEO) | (q_stream == STREAM_ACTION))
-        & readable
-    )
-    return base & (geometry_relation | x_relation)
+    return base & readable
 
 
 def build_cache_selection(

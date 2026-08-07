@@ -7,13 +7,26 @@ from typing import Any
 
 from distillation.mask_profile import generation_profile_contract
 from distillation.model.autoregressive_mot import (
-    AutoregressiveThreeDVAMOTTransformer3DModel,
+    AutoregressiveVAMOTTransformer3DModel,
 )
 from wan_va.train_mot import MOTTrainer
 
 
 class AutoregressiveTrainer(MOTTrainer):
-    transformer_model_cls = AutoregressiveThreeDVAMOTTransformer3DModel
+    transformer_model_cls = AutoregressiveVAMOTTransformer3DModel
+    checkpoint_model_architecture = "autoregressive_va_mot_v1"
+
+    @classmethod
+    def _validate_transformer_checkpoint_layout(cls, checkpoint_path: Path):
+        """Allow parameter-compatible native VA exports for fresh initialization."""
+
+        try:
+            return super()._validate_transformer_checkpoint_layout(checkpoint_path)
+        except ValueError as autoregressive_error:
+            try:
+                return MOTTrainer._validate_transformer_checkpoint_layout(checkpoint_path)
+            except ValueError:
+                raise autoregressive_error
 
     def __init__(self, config: Any):
         if config.distill.resume_from is not None:
@@ -34,7 +47,7 @@ class AutoregressiveTrainer(MOTTrainer):
                 "exported_model": "student",
                 "step": int(self.step),
                 "optimizer_step": int(self.optimizer_step),
-                "model_architecture": "autoregressive_mot_v1",
+                "model_architecture": self.checkpoint_model_architecture,
                 "generation_profile": generation_profile_contract(
                     self.config.distill.generation_shape
                 ),

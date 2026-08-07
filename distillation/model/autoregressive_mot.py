@@ -1,6 +1,6 @@
 """Independent autoregressive MoT model family.
 
-The class is parameter-compatible with ThreeDVAMOTTransformer3DModel.  Its
+The class is parameter-compatible with VAMOTTransformer3DModel.  Its
 training path owns the AR order natively; rollout integration is added through
 the normal model forward boundary so FSDP hooks remain effective.
 """
@@ -11,28 +11,24 @@ from typing import Any, Iterable
 import torch
 
 from distillation.self_rollout.attention import segmented_orders
-from wan_va.modules.model_3dva_mot import (
-    ThreeDVAMOTBlock,
-    ThreeDVAMOTTransformer3DModel,
+from wan_va.modules.model_va_mot import (
+    VAMOTBlock,
+    VAMOTTransformer3DModel,
 )
 
 from .autoregressive_types import AutoregressiveProfile
 from .autoregressive_types import (
-    AutoregressiveGeometryJointRequest,
     AutoregressiveMOTLayerRequest,
     AutoregressiveModelOutput,
     AutoregressiveModelRequest,
     AutoregressiveStreamInput,
 )
-from .autoregressive_vggto import AutoregressiveVGGTOGeometryTower
 
 
-class AutoregressiveThreeDVAMOTBlock(ThreeDVAMOTBlock):
+class AutoregressiveVAMOTBlock(VAMOTBlock):
     """Parameter-compatible MoT block reserved for native AR execution."""
 
     def forward(self, states, *args, **kwargs):
-        if isinstance(states, AutoregressiveGeometryJointRequest):
-            return self.forward_geometry_incremental(states)
         if isinstance(states, AutoregressiveMOTLayerRequest):
             return self.forward_incremental(states)
         return super().forward(states, *args, **kwargs)
@@ -98,89 +94,31 @@ class AutoregressiveThreeDVAMOTBlock(ThreeDVAMOTBlock):
             text_value,
         )
 
-    def forward_geometry_incremental(self, request: AutoregressiveGeometryJointRequest):
-        from distillation.self_rollout.attention import (
-            STREAM_GEOMETRY,
-            build_cache_selection,
-            indexed_attention,
-        )
-        from distillation.self_rollout.cache import KVSegment
-
-        geometry = self.geometry
-        if geometry is None:
-            raise ValueError("geometry incremental request sent to an odd MoT layer")
-        registers = request.registers.to(dtype=getattr(geometry.norm1, "weight", request.registers).dtype)
-        query, key, value = geometry.qkv_project(registers.flatten(1, 2), request.rotary)
-        request.cache.mot_cache.append_transaction(
-            request.layer_id,
-            request.transaction_id,
-            KVSegment(key, value, request.metadata, stream_id=STREAM_GEOMETRY),
-        )
-        cache_key, cache_value, cache_meta = request.cache.mot_cache.materialize(
-            request.layer_id,
-            transaction_id=request.transaction_id,
-            stream_id=STREAM_GEOMETRY,
-        )
-        query_valid, key_valid = build_cache_selection(request.metadata, cache_meta)
-        attended, visible = indexed_attention(
-            query,
-            cache_key,
-            cache_value,
-            query_valid=query_valid,
-            key_valid=key_valid,
-        )
-        delta = geometry.attn_delta(attended).reshape_as(registers)
-        visible = visible.reshape(
-            registers.shape[0], request.groups * request.slots * request.views, registers.shape[2]
-        )
-        delta = torch.where(visible[:, :, :, None], delta, torch.zeros_like(delta))
-        residual = registers + delta
-        updated = residual + geometry.ffn_delta(residual)
-        if request.slot_valid_mask is not None:
-            valid = (
-                request.slot_valid_mask[:, :, :, None]
-                .to(device=updated.device, dtype=torch.bool)
-                .expand(-1, -1, -1, request.views)
-                .reshape(updated.shape[0], request.groups * request.slots * request.views)
-            )
-            updated = torch.where(valid[:, :, None, None], updated, registers)
-        return updated
-
-
-class AutoregressiveThreeDVAMOTTransformer3DModel(
-    ThreeDVAMOTTransformer3DModel
+class AutoregressiveVAMOTTransformer3DModel(
+    VAMOTTransformer3DModel
 ):
     """MOT transformer with AR metadata and AR component construction."""
 
-    _no_split_modules = ["AutoregressiveThreeDVAMOTBlock"]
-    _repeated_blocks = ["AutoregressiveThreeDVAMOTBlock"]
+    _no_split_modules = ["AutoregressiveVAMOTBlock"]
+    _repeated_blocks = ["AutoregressiveVAMOTBlock"]
 
     def __init__(self, *args, generation_profile=None, **kwargs):
         if isinstance(generation_profile, dict):
             generation_profile = AutoregressiveProfile.from_generation_shape(generation_profile)
         self.generation_profile = generation_profile or AutoregressiveProfile(
-            profile_name="segmented_history_strict_geometry_v1",
+            profile_name="segmented_history_va_v1",
             profile_version=2,
             order_mode="segmented",
             history_frames=4,
             chunk_size=4,
             window_size=16,
-            geometry_relation="segmented_order_causal",
-            x_to_g_relation="strict_order",
         )
         self.generation_profile.validate()
         super().__init__(*args, **kwargs)
-        self.vggto.configure_generation_profile(self.generation_profile)
         self.register_to_config(generation_profile=self.generation_profile.as_dict())
 
-    def _build_vggto_tower(self, **kwargs):
-        return AutoregressiveVGGTOGeometryTower(
-            **kwargs,
-            generation_profile=self.generation_profile,
-        )
-
     def _build_mot_block(self, **kwargs):
-        return AutoregressiveThreeDVAMOTBlock(**kwargs)
+        return AutoregressiveVAMOTBlock(**kwargs)
 
     def configure_generation_profile(self, generation_shape: Any) -> None:
         profile = (
@@ -189,25 +127,15 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
             else AutoregressiveProfile.from_generation_shape(generation_shape)
         )
         self.generation_profile = profile
-        self.vggto.configure_generation_profile(profile)
         self.register_to_config(generation_profile=profile.as_dict())
 
-    def _prepare_metadata(self, input_dict, prepared, geometry):
-        x_meta, mot_meta, diagnostics = super()._prepare_metadata(
-            input_dict,
-            prepared,
-            geometry,
-        )
+    def _prepare_metadata(self, input_dict, prepared):
+        metadata, diagnostics = super()._prepare_metadata(input_dict, prepared)
         profile = self.generation_profile
         chunk_size = int(input_dict.get("chunk_size", profile.chunk_size))
         return (
             self._apply_segmented_order(
-                x_meta,
-                history_frames=profile.history_frames,
-                chunk_size=chunk_size,
-            ),
-            self._apply_segmented_order(
-                mot_meta,
+                metadata,
                 history_frames=profile.history_frames,
                 chunk_size=chunk_size,
             ),
@@ -249,7 +177,7 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
         metadata.order_ids = torch.where(
             metadata.stream_ids == 1,
             action_order[metadata.frame_ids],
-            frame_order, # action 是独立的， video 和 geometry 是共享的
+            frame_order,
         )
         metadata.cache_key = None
         metadata.structure_cache_key = None
@@ -443,7 +371,7 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
         *,
         tokens_per_frame: int,
     ) -> torch.Tensor:
-        # LINK: wan_va/modules/model_3dva_mot.py:914
+        # LINK: wan_va/modules/model_va_mot.py:914
         # 输入：
         # frame_ids       通常形状为 [B, F]
         #                  B = batch size
@@ -651,9 +579,7 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
         hidden = stream.hidden
         stream_id = STREAM_VIDEO if stream.block_kind == "video" else STREAM_ACTION
 
-        # 阶段 2/3：逐层更新当前 stream。geometry 不作为第二个输入 stream
-        # 传进来；它是否可见取决于当前 layer_id 的共享 mot_cache 中是否
-        # 已经提交了 geometry K/V。
+        # 阶段 2/3：逐层更新当前 Video 或 Action stream。
         for layer_id, mot_block in enumerate(self.mot_blocks):
             if hasattr(mot_block, "forward_incremental"):
                 hidden = mot_block(
@@ -1004,10 +930,4 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
         if op == "commit_action":
             self.commit_action(**p)
             return AutoregressiveModelOutput()
-        if op == "encode_geometry_history":
-            frame = self.vggto.encode_history_and_commit(self, **p)
-            return AutoregressiveModelOutput(geometry_frame=frame)
-        if op == "encode_geometry":
-            frame = self.vggto.encode_and_commit(self, **p)
-            return AutoregressiveModelOutput(geometry_frame=frame)
         raise ValueError(f"unsupported autoregressive operation {op!r}")

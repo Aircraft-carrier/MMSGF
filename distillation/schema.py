@@ -45,15 +45,13 @@ class VALossWeights:
 class CheckpointMetadata:
     format_version: int
     checkpoint_type: str
-    vggto_attention_topology: str
-    optimization_composition: str
+    model_architecture: str
     has_full_state: bool
     distill_method: str
     exported_model: str
     step: int
     optimizer_step: int
     generation_profile: dict[str, Any]
-    model_architecture: str = "autoregressive_mot_v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +80,7 @@ class TrainingStepResult:
 class ReplayContext:
     """Stage3 no-grad record 与有梯度 replay 之间的完整边界。
 
-    Student batch 使用预测 target V/A/G，teacher batch 保持 GT V/A/G；
+    Student batch 使用预测 target V/A，teacher batch 保持 GT V/A；
     ``rollout_noisy`` 是 rollout 某个真实 denoise step 的 sampler state，
     ``pred_clean`` 是最终预测 clean，``teacher_clean`` 是 dataset GT clean。
     所有 record tensor 都已 detach，梯度只在 replay 时重新建立。

@@ -271,16 +271,13 @@ class SelfGradientForcingTrainingPipeline:
         )
 
         student_batch = dict(batch)
-        for key in ("latents", "actions", "geometry_rgb"):
+        for key in ("latents", "actions"):
             student_batch[key] = batch[key].clone()
         student_batch["latents"][:, :, generated_start:generated_end] = (
             rollout.pred_latents[:, :, generated_start:generated_end]
         )
         student_batch["actions"][:, :, generated_start:generated_end] = (
             rollout.pred_actions[:, :, generated_start:generated_end]
-        )
-        student_batch["geometry_rgb"][:, generated_start:generated_end] = (
-            rollout.pred_geometry_rgb[:, generated_start:generated_end]
         )
         student_batch["video_latent_loss_mask"] = video_mask
         student_batch["action_loss_mask"] = action_mask
@@ -452,7 +449,6 @@ class SelfGradientForcingTrainingPipeline:
                 spec=spec,
                 device=self.device,
                 empty_text_emb=self.trainer._get_empty_text_emb(),
-                decode_latents_to_rgb_views=self._decode_rollout_latents,
                 video_num_steps=self.rollout_video_num_steps,
                 action_num_steps=self.rollout_action_num_steps,
                 rollout_frames=self.rollout_horizon_frames,
@@ -493,7 +489,7 @@ class SelfGradientForcingTrainingPipeline:
             generated,
             context.rollout_timesteps,
         )
-        # 1) Student clean/geometry 使用 rollout prediction；noisy 与 timestep
+        # 1) Student clean V/A 使用 rollout prediction；noisy 与 timestep
         #    来自同一次 rollout 的真实 sampler state，而不是重新随机合成。
         student_out = self.student(replay_input, mode="train")
         student_flow = VAPrediction(

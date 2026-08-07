@@ -17,7 +17,6 @@ CPU_EVAL_NUM_THREADS="${CPU_EVAL_NUM_THREADS:-32}"
 export cv2_NUM_THREADS="${cv2_NUM_THREADS:-0}"
 
 export MOT_DATASET_ROOT="${MOT_DATASET_ROOT:-/workspace/code/lingbot-va/data/0715_3k_subset_final_train}"
-export MOT_POINTCLOUD_SAMPLE_PERIOD="${MOT_POINTCLOUD_SAMPLE_PERIOD:-2}"
 export MOT_VIDEO_DOWNSAMPLE_RATIO="${MOT_VIDEO_DOWNSAMPLE_RATIO:-4}"
 export MOT_EVAL_WITH_CPU="${MOT_EVAL_WITH_CPU:-1}"
 export MOT_EVAL_MODE="${MOT_EVAL_MODE:-video}"
@@ -26,15 +25,12 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WAN22_PRETRAINED_MODEL_PATH="${WAN22_PRETRAINED_MODEL_PATH:-/workspace/cache/huggingface_cache/hub/models--robbyant--lingbot-va-base/snapshots/68b7bc1b35da6ddc67ea94c4ceb58d768fbb3f9c}"
 export WAN22_DIFFUSERS_MODEL_PATH="${WAN22_DIFFUSERS_MODEL_PATH:-/workspace/model/wan2_2_diffusers}"
-export VGGTO_CHECKPOINT_PATH="${VGGTO_CHECKPOINT_PATH:-/workspace/model/vggt-omega/vggt_omega_1b_512.pt}"
-export VGGT_CHECKPOINT_PATH="${VGGT_CHECKPOINT_PATH:-/workspace/model/vggt/model.safetensors}"
 export INIT_MODEL_FROM_LINGBOT="${INIT_MODEL_FROM_LINGBOT:-1}"
 
 export WANDB_MODE="${WANDB_MODE:-offline}"
-export WANDB_PROJECT="${WANDB_PROJECT:-umi_vggto_mot_wam}"
+export WANDB_PROJECT="${WANDB_PROJECT:-umi_va_mot_wam}"
 
 export MOT_MAX_VIEWS_PER_GPU="${MOT_MAX_VIEWS_PER_GPU:-8}"
-export MOT_OPTIMIZATION_COMPOSITION="${MOT_OPTIMIZATION_COMPOSITION:-v}"
 
 CONFIG_NAME="${CONFIG_NAME:-umi_3dwam_train}"
 RUN_STAMP="${RUN_STAMP:-$(date +%m%d_%H%M%S)}"
@@ -54,18 +50,6 @@ fi
 if [ ! -f "${MOT_DATASET_ROOT}/meta/mot_config.json" ]; then
     echo "Missing MOT dataset config: ${MOT_DATASET_ROOT}/meta/mot_config.json" >&2
     exit 1
-fi
-
-if [ -z "${MOT_RESUME_FROM:-}" ] && [ -z "${MOT_INITIALIZE_FROM:-}" ]; then
-    if [ -z "${VGGTO_CHECKPOINT_PATH}" ] || [ ! -e "${VGGTO_CHECKPOINT_PATH}" ]; then
-        echo "Set VGGTO_CHECKPOINT_PATH to a VGGTO/VGGT-Omega checkpoint file or directory" >&2
-        exit 1
-    fi
-
-    if [ -z "${VGGT_CHECKPOINT_PATH}" ] || [ ! -e "${VGGT_CHECKPOINT_PATH}" ]; then
-        echo "Set VGGT_CHECKPOINT_PATH to an original VGGT checkpoint file or directory" >&2
-        exit 1
-    fi
 fi
 
 train_args=(

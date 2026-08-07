@@ -8,14 +8,13 @@ from typing import Any
 
 import torch
 
-from .attention import STREAM_ACTION, STREAM_GEOMETRY, STREAM_VIDEO
+from .attention import STREAM_ACTION, STREAM_VIDEO
 from .cache import KVCacheSnapshot, SelfRolloutKVCache
 
 
 class RolloutPhase(IntEnum):
     LATENT = 0
-    GEOMETRY = 1
-    ACTION = 2
+    ACTION = 1
 
 
 class CacheSource(IntEnum):
@@ -29,21 +28,16 @@ class CacheSource(IntEnum):
 class SemanticFrameState:
     frame_id: int
     video_latent: torch.Tensor | None = None
-    geometry_rgb: torch.Tensor | None = None
-    geometry_state: Any | None = None
     action: torch.Tensor | None = None
     video_source: CacheSource | None = None
-    geometry_source: CacheSource | None = None
     action_source: CacheSource | None = None
     video_version: int = 0
-    geometry_version: int = 0
     action_version: int = 0
 
 
 @dataclass(slots=True)
 class PredictionLog:
     video: dict[int, torch.Tensor] = field(default_factory=dict)
-    geometry: dict[int, torch.Tensor] = field(default_factory=dict)
     action: dict[int, torch.Tensor] = field(default_factory=dict)
     replacements: list[dict[str, Any]] = field(default_factory=list)
     diagnostics: dict[str, Any] = field(default_factory=dict)
@@ -52,7 +46,6 @@ class PredictionLog:
 @dataclass(frozen=True, slots=True)
 class RolloutSnapshot:
     mot_cache: KVCacheSnapshot
-    geometry_snapshot: Any
     semantic_frames: dict[int, SemanticFrameState]
     next_transaction_id: int
     generator_state: torch.Tensor | None
@@ -63,11 +56,9 @@ class RolloutState:
         self,
         *,
         mot_cache: SelfRolloutKVCache | None = None,
-        geometry_cache: Any | None = None,
         generator: torch.Generator | None = None,
     ) -> None:
         self.mot_cache = mot_cache or SelfRolloutKVCache()
-        self.geometry_cache = geometry_cache
         self.semantic_frames: dict[int, SemanticFrameState] = {}
         self.predictions = PredictionLog()
         self.generator = generator
@@ -85,15 +76,11 @@ class RolloutState:
         return self.semantic_frames.setdefault(frame_id, SemanticFrameState(frame_id))
 
     def snapshot(self) -> RolloutSnapshot:
-        geometry_snapshot = None
-        if self.geometry_cache is not None:
-            geometry_snapshot = self.geometry_cache.snapshot()
         generator_state = None
         if self.generator is not None:
             generator_state = self.generator.get_state().clone()
         return RolloutSnapshot(
             mot_cache=self.mot_cache.snapshot(),
-            geometry_snapshot=geometry_snapshot,
             semantic_frames={
                 frame_id: copy.copy(frame)
                 for frame_id, frame in self.semantic_frames.items()
@@ -104,8 +91,6 @@ class RolloutState:
 
     def restore(self, snapshot: RolloutSnapshot) -> None:
         self.mot_cache.restore(snapshot.mot_cache)
-        if self.geometry_cache is not None:
-            self.geometry_cache.restore(snapshot.geometry_snapshot)
         self.semantic_frames = {
             frame_id: copy.copy(frame)
             for frame_id, frame in snapshot.semantic_frames.items()
@@ -156,7 +141,6 @@ class RolloutState:
             raise KeyError(f"frame {frame_id} has no semantic state")
         source = {
             RolloutPhase.LATENT: frame.video_source,
-            RolloutPhase.GEOMETRY: frame.geometry_source,
             RolloutPhase.ACTION: frame.action_source,
         }[phase]
         if source != CacheSource.PREDICTED:
@@ -175,8 +159,6 @@ class RolloutState:
     def truncate_from(self, frame_id: int) -> None:
         frame_id = int(frame_id)
         self.mot_cache.truncate_from(frame_id)
-        if self.geometry_cache is not None:
-            self.geometry_cache.truncate_from(frame_id)
         self.semantic_frames = {
             index: frame
             for index, frame in self.semantic_frames.items()
@@ -198,18 +180,12 @@ class RolloutState:
 
         self.mot_cache.assert_no_transactions()
         caches = [("mot", self.mot_cache)]
-        if self.geometry_cache is not None:
-            relation_cache = getattr(self.geometry_cache, "relation_cache", None)
-            if relation_cache is not None:
-                relation_cache.assert_no_transactions()
-                caches.append(("geometry_relation", relation_cache))
 
         for cache_name, cache in caches:
             for layer_id, segment in cache.committed_segments():
                 metadata = segment.metadata
                 for stream_id, component in (
                     (STREAM_VIDEO, "video"),
-                    (STREAM_GEOMETRY, "geometry"),
                     (STREAM_ACTION, "action"),
                 ):
                     stream_mask = metadata.stream_ids == stream_id

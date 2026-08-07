@@ -62,7 +62,7 @@ def main() -> None:
     torch.set_num_threads(1)
     manifest = Path(
         "data/data/umi_mot_full_data_train_0712_final/meta/"
-        "mot_final_training_non_pointcloud_manifest.jsonl"
+        "mot_final_training_manifest.jsonl"
     )
     paths = _video_paths(manifest, args.video_count)
     active_paths = paths[:2] if args.mode == "reuse" else paths

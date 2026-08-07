@@ -209,8 +209,6 @@ def save_rollout_artifacts(
             "target_latents": result.target_latents.detach().cpu(),
             "pred_actions": result.pred_actions.detach().cpu(),
             "target_actions": result.target_actions.detach().cpu(),
-            "pred_geometry_rgb": result.pred_geometry_rgb.detach().cpu(),
-            "target_geometry_rgb": result.target_geometry_rgb.detach().cpu(),
             "action_valid_mask": result.action_valid_mask.detach().cpu(),
             "chunk_pairs": result.chunk_pairs,
             "chunk_frames": result.chunk_frames,

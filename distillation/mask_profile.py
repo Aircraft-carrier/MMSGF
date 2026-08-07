@@ -7,9 +7,7 @@ from typing import Any
 
 
 # Mirrors wan_va.modules.mot_attention without importing optional model modules.
-PROFILE_NAME = "segmented_history_strict_geometry_v1"
-# Version 2 changes G->G from strict frame history to segmented order-causal
-# visibility.  Old checkpoints must not silently reuse the new topology.
+PROFILE_NAME = "segmented_history_va_v1"
 PROFILE_VERSION = 2
 
 
@@ -21,8 +19,6 @@ def generation_profile_contract(generation_shape: Any) -> dict[str, Any]:
         "history_frames": int(generation_shape.get("history_frames", 4)),
         "chunk_size": int(generation_shape["chunk_size"]),
         "window_size": int(generation_shape["window_size"]),
-        "geometry_relation": "segmented_order_causal",
-        "x_to_g_relation": "strict_order",
     }
 
 

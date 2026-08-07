@@ -27,10 +27,7 @@ def temporary_masked_attention_backend(model: nn.Module, backend: str | None):
     if str(backend) not in {"dense", "fa4", "flex"}:
         raise ValueError(f"unsupported masked attention backend: {backend!r}")
 
-    modules = []
-    for module in (model, getattr(model, "vggto", None)):
-        if module is not None and all(module is not existing for existing in modules):
-            modules.append(module)
+    modules = [model]
     previous = [
         (module, getattr(module, "masked_attn_backend", _MISSING))
         for module in modules
@@ -52,7 +49,7 @@ def temporary_masked_attention_backend(model: nn.Module, backend: str | None):
 def temporary_fsdp_unshard(model: nn.Module):
     """Temporarily materialize FSDP2 DTensor parameters for internal calls.
 
-    Distillation self-rollout intentionally calls MOT/VGGTO submodules directly
+    Distillation self-rollout intentionally calls MOT submodules directly
     to maintain an incremental KV cache.  That bypasses FSDP2 root pre-forward
     hooks, so FSDP parameters can remain as DTensors while rollout inputs are
     local tensors.  Use this only around no-grad rollout sections, then reshard

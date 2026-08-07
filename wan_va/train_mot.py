@@ -1,22 +1,7 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
-"""
-3DVA_MOT post-training entrypoint.
-
-The current MOT trainer uses the fixed-window protocol: each dataset item
-contains one clean history chunk plus one target chunk, video latents are encoded
-online from raw RGB with the frozen Wan VAE, and diffusion timesteps are sampled
-per `[batch, target_chunk]`.
-
-* the model is `ThreeDVAMOTTransformer3DModel`, initialized from LingBot-VA and
-  VGGTO checkpoints;
-* the dataset is `MotTrainData`, returning VAE RGB windows plus
-  representative RGB/depth labels for the VGGTO geometry branch;
-* the loss combines LingBot video/action flow-matching losses with a VGGT-style
-  depth loss, with video/action loss masked off for clean history frames.
-"""
+"""Video+Action MOT post-training entrypoint."""
 
 import argparse
-from bisect import bisect_left
 import ctypes
 from functools import partial
 import gc
@@ -59,29 +44,18 @@ for _path in (str(_REPO_ROOT), str(_WAN_VA_DIR)):
 
 from configs import VA_CONFIGS
 from dataset import (
-    MotBalancedMixDataset,
-    MotGeometryLeRobotData,
-    MotPureLeRobotData,
+    MotTrainData,
     validate_mot_batch_for_forward,
-    validate_mot_geometry_batch,
 )
 from dataset.mot_dataset import (
     MOT_DEFAULT_ACTION_CACHE_SIZE,
-    MOT_DEFAULT_POINT_STORE_CACHE_SIZE,
     MOT_DEFAULT_VIDEO_DECODER_CACHE_SIZE,
     MOT_SUPPORTED_VIEW_COUNTS,
     decode_mot_runtime_cache_stats,
 )
 from distributed.util import _configure_model, init_distributed
 from modules.fa4_attention import validate_fa4_training_environment
-from modules.model_3dva_mot import ThreeDVAMOTTransformer3DModel
-from modules.vggto_loss import (
-    VGGT_MONITOR_ERROR_HISTOGRAM_BINS,
-    compute_vggto_depth_loss,
-    compute_vggto_point_loss,
-    geometry_error_quantiles_from_histogram,
-    geometry_pearson_from_stats,
-)
+from modules.model_va_mot import VAMOTTransformer3DModel
 from modules.utils import WanVAEStreamingWrapper, load_vae
 from wan_va.checkpoint_eval import CheckpointEvaluationQueue
 from wan_va.checkpoint_retention import prune_successful_checkpoints
@@ -93,11 +67,10 @@ from utils import FlowMatchScheduler, init_logger, logger, sample_timestep_id, w
 
 
 MOT_DCP_DIR_NAME = "distributed_state"
-MOT_DCP_FORMAT_VERSION = 2
+MOT_DCP_FORMAT_VERSION = 3
 MOT_CHECKPOINT_METADATA_NAME = "checkpoint_metadata.json"
 MOT_TRANSFORMER_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
-MOT_VGGTO_TOPOLOGY = "synchronized_multiview_v1"
-MOT_OPTIMIZATION_COMPOSITIONS = ("g", "v", "a", "vg", "va", "ag", "vag")
+MOT_MODEL_ARCHITECTURE = "va_mot_v1"
 MOT_PERFORMANCE_TIMING_KEYS = (
     "data_fetch",
     "data_barrier",
@@ -117,41 +90,6 @@ MOT_PERFORMANCE_TIMING_KEYS = (
     "gc_collect",
     "post_gc_barrier",
     "iteration",
-)
-
-MOT_GEOMETRY_LOG_KEYS = (
-    "depth_loss_raw",
-    "point_loss_raw",
-    "loss_conf_depth",
-    "loss_reg_depth",
-    "loss_grad_depth",
-    "depth_conf_mean",
-    "depth_conf_max",
-    "loss_conf_point",
-    "loss_reg_point",
-    "loss_grad_point",
-    "point_conf_mean",
-    "point_conf_max",
-    "depth_error_p50",
-    "depth_error_p90",
-    "point_error_p50",
-    "point_error_p90",
-    "point_normal_angle_mean",
-    "depth_conf_error_correlation",
-    "point_conf_error_correlation",
-)
-MOT_GEOMETRY_GLOBAL_DETAIL_KEYS = (
-    "depth_error_p50",
-    "depth_error_p90",
-    "point_error_p50",
-    "point_error_p90",
-    "point_normal_angle_mean",
-    "depth_conf_error_correlation",
-    "point_conf_error_correlation",
-)
-MOT_GEOMETRY_MAX_LOG_KEYS = (
-    "depth_conf_max",
-    "point_conf_max",
 )
 
 _PROC_STATUS_MEMORY_FIELDS = {
@@ -399,24 +337,6 @@ def _wandb_init_settings(config):
     }, wandb_dir, mode
 
 
-def resolve_optimization_composition(value: Any) -> str:
-    composition = str(value).strip().lower()
-    if composition not in MOT_OPTIMIZATION_COMPOSITIONS:
-        raise ValueError(
-            "optimization_composition must be one of "
-            f"{MOT_OPTIMIZATION_COMPOSITIONS}, got {value!r}"
-        )
-    return composition
-
-
-def optimization_branches(composition: str) -> frozenset[str]:
-    return frozenset(resolve_optimization_composition(composition))
-
-
-def _mot_execution_route(composition: str) -> str:
-    return "geometry" if resolve_optimization_composition(composition) == "g" else "joint"
-
-
 class _MOTViewBatchSampler(Sampler[list[int]]):
     """Build deterministic view-homogeneous local batches for one rank."""
 
@@ -428,7 +348,6 @@ class _MOTViewBatchSampler(Sampler[list[int]]):
         rank: int,
         num_microsteps: int,
         max_views_per_gpu: int,
-        pointcloud_sample_period: int | None = None,
         seed: int = 42,
         shuffle: bool = True,
     ):
@@ -450,56 +369,25 @@ class _MOTViewBatchSampler(Sampler[list[int]]):
         self.shuffle = bool(shuffle)
         self.start_step = 0
 
-        if isinstance(dataset, MotBalancedMixDataset):
-            self._mixed = True
-            self._source_buckets = {
-                0: dataset.pointcloud_dataset.view_buckets,
-                1: dataset.pure_dataset.view_buckets,
-            }
-            pointcloud_sample_period = int(pointcloud_sample_period or 0)
-            if pointcloud_sample_period <= 0:
-                raise ValueError(
-                    "pointcloud_sample_period must be positive for mixed MOT training"
-                )
-            self.pointcloud_sample_period = pointcloud_sample_period
-        else:
-            self._mixed = False
-            self._source_buckets = {0: dataset.view_buckets}
-            self.pointcloud_sample_period = None
-
-        domains = [set(buckets) for buckets in self._source_buckets.values()]
-        if not domains or not domains[0]:
+        self._view_buckets = dataset.view_buckets
+        domain = set(self._view_buckets)
+        if not domain:
             raise ValueError("MOT dataset must expose at least one nonempty view bucket")
-        if any(domain != domains[0] for domain in domains[1:]):
-            raise ValueError(
-                "pointcloud and non-pointcloud sources must expose the same "
-                "nonempty native-view domain"
-            )
-        unsupported = domains[0].difference(MOT_SUPPORTED_VIEW_COUNTS)
+        unsupported = domain.difference(MOT_SUPPORTED_VIEW_COUNTS)
         if unsupported:
             raise ValueError(f"unsupported native view counts: {sorted(unsupported)}")
-        self.available_view_counts = tuple(sorted(domains[0]))
+        self.available_view_counts = tuple(sorted(domain))
         for view_count in self.available_view_counts:
             global_batch_size = (
                 self.num_replicas * (self.max_views_per_gpu // view_count)
             )
-            if self._mixed:
-                period = int(self.pointcloud_sample_period)
-                required_by_source = (
-                    (global_batch_size + period - 1) // period,
-                    global_batch_size - global_batch_size // period,
+            available = len(self._view_buckets[view_count])
+            if available < global_batch_size:
+                raise ValueError(
+                    "native-view bucket is too small for a duplicate-free "
+                    f"global microbatch: V={view_count}, available={available}, "
+                    f"required={global_batch_size}"
                 )
-            else:
-                required_by_source = (global_batch_size,)
-            for source, required in enumerate(required_by_source):
-                available = len(self._source_buckets[source][view_count])
-                if available < required:
-                    raise ValueError(
-                        "native-view bucket is too small for a duplicate-free "
-                        "global microbatch: "
-                        f"source={source}, V={view_count}, available={available}, "
-                        f"required={required}"
-                    )
 
     def __len__(self) -> int:
         return self.num_microsteps - self.start_step
@@ -537,31 +425,23 @@ class _MOTViewBatchSampler(Sampler[list[int]]):
         return self.max_views_per_gpu // view_count
 
     def __iter__(self):
-        source_positions = {
-            (source, view_count): 0
-            for source in self._source_buckets
-            for view_count in self.available_view_counts
-        }
-        order_cache: dict[tuple[int, int], list[int]] = {}
-        global_slot_start = 0
+        positions = {view_count: 0 for view_count in self.available_view_counts}
+        order_cache: dict[int, list[int]] = {}
 
-        def source_index(source: int, view_count: int, position: int) -> int:
-            bucket = self._source_buckets[source][view_count]
+        def row_index(view_count: int, position: int) -> int:
+            bucket = self._view_buckets[view_count]
             offset = int(position) % len(bucket)
             if not self.shuffle:
                 return int(bucket[offset])
-            cache_key = (source, view_count)
-            order = order_cache.get(cache_key)
+            order = order_cache.get(view_count)
             if order is None:
                 generator = torch.Generator()
                 order_seed = self._mix_u64(
-                    self.seed
-                    + source * 10_000_019
-                    + view_count * 1_000_003
+                    self.seed + view_count * 1_000_003
                 )
                 generator.manual_seed(order_seed & ((1 << 63) - 1))
                 order = torch.randperm(len(bucket), generator=generator).tolist()
-                order_cache[cache_key] = order
+                order_cache[view_count] = order
             return int(bucket[order[offset]])
 
         for step in range(self.num_microsteps):
@@ -569,48 +449,16 @@ class _MOTViewBatchSampler(Sampler[list[int]]):
             local_batch_size = self.local_batch_size_for_view(view_count)
             global_batch_size = self.num_replicas * local_batch_size
 
-            if self._mixed:
-                period = int(self.pointcloud_sample_period)
-                pointcloud_count = (
-                    (global_slot_start + global_batch_size) // period
-                    - global_slot_start // period
-                )
-                pointcloud_slots = tuple(
-                    sorted(
-                        ((offset * global_batch_size) // pointcloud_count + step)
-                        % global_batch_size
-                        for offset in range(pointcloud_count)
-                    )
-                ) if pointcloud_count else ()
-                pointcloud_slot_set = set(pointcloud_slots)
-                source_counts = (pointcloud_count, global_batch_size - pointcloud_count)
-            else:
-                pointcloud_slots = tuple(range(global_batch_size))
-                pointcloud_slot_set = set(pointcloud_slots)
-                source_counts = (global_batch_size,)
-
             if step >= self.start_step:
-                local_indices = []
                 rank_slot_start = self.rank * local_batch_size
-                for local_offset in range(local_batch_size):
-                    global_offset = rank_slot_start + local_offset
-                    pointcloud_before = bisect_left(pointcloud_slots, global_offset)
-                    source = 0 if global_offset in pointcloud_slot_set else 1
-                    source_offset = (
-                        pointcloud_before
-                        if source == 0
-                        else global_offset - pointcloud_before
+                yield [
+                    row_index(
+                        view_count,
+                        positions[view_count] + rank_slot_start + local_offset,
                     )
-                    position = source_positions[(source, view_count)] + source_offset
-                    row_index = source_index(source, view_count, position)
-                    if self._mixed:
-                        row_index = self.dataset.encode_source_index(source, row_index)
-                    local_indices.append(row_index)
-                yield local_indices
-
-            for source, count in enumerate(source_counts):
-                source_positions[(source, view_count)] += count
-            global_slot_start += global_batch_size
+                    for local_offset in range(local_batch_size)
+                ]
+            positions[view_count] += global_batch_size
 
 
 def _dist_max_float(value: float, device: torch.device) -> float:
@@ -630,107 +478,22 @@ def _dist_mean_float(value: float, device: torch.device) -> float:
     return float(tensor.item())
 
 
-def _distributed_geometry_active_rank_scale(
-    local_active_rank: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scale active rank-local G scalars around distributed gradient averaging."""
+def apply_ac_mot(model: VAMOTTransformer3DModel) -> None:
+    """Checkpoint every joint Video+Action block."""
 
-    global_active_ranks = local_active_rank.detach().to(dtype=torch.float32).clone()
-    world_size = 1
-    if dist.is_initialized():
-        dist.all_reduce(global_active_ranks, op=dist.ReduceOp.SUM)
-        world_size = dist.get_world_size()
-    scale = torch.where(
-        global_active_ranks > 0,
-        global_active_ranks.new_tensor(float(world_size)) / global_active_ranks.clamp_min(1.0),
-        torch.zeros_like(global_active_ranks),
-    )
-    return scale, global_active_ranks
-
-
-def apply_ac_mot(
-    model: ThreeDVAMOTTransformer3DModel,
-    *,
-    execution_route: str = "joint",
-) -> None:
-    """Apply non-nested activation checkpointing for the selected route."""
-
-    if execution_route == "joint":
-        for layer_id, block in enumerate(model.mot_blocks):
-            model.mot_blocks[layer_id] = ptd_checkpoint_wrapper(
-                block,
-                preserve_rng_state=False,
-            )
-        return
-    if execution_route != "geometry":
-        raise ValueError(f"unsupported execution_route={execution_route!r}")
-    for block in model.mot_blocks:
-        if block.geometry is not None:
-            block.geometry = ptd_checkpoint_wrapper(
-                block.geometry,
-                preserve_rng_state=False,
-            )
-
-
-def _validate_vggto_checkpoint_determinism(model: ThreeDVAMOTTransformer3DModel) -> None:
-    """Guard the preserve_rng_state=False contract used by VGGTO checkpointing."""
-
-    violations = []
-    block_lists = {
-        "frame_blocks": model.vggto.frame_blocks,
-        "cross_view_blocks": model.vggto.cross_view_blocks,
-        "inter_frame_blocks": model.vggto.inter_frame_blocks,
-    }
-    for list_name, blocks in block_lists.items():
-        for layer_id, block in enumerate(blocks):
-            if not any(True for _ in block.parameters()):
-                continue
-            sample_drop_ratio = float(getattr(block, "sample_drop_ratio", 0.0))
-            if sample_drop_ratio != 0.0:
-                violations.append(f"{list_name}.{layer_id}.sample_drop_ratio={sample_drop_ratio}")
-            for module_name, module in block.named_modules():
-                if isinstance(module, torch.nn.Dropout) and float(module.p) != 0.0:
-                    suffix = f".{module_name}" if module_name else ""
-                    violations.append(f"{list_name}.{layer_id}{suffix}.p={float(module.p)}")
-    if violations:
-        raise ValueError(
-            "VGGTO activation checkpointing uses preserve_rng_state=False, but stochastic "
-            "modules are enabled: " + ", ".join(violations)
-        )
-
-
-def apply_ac_vggto(model: ThreeDVAMOTTransformer3DModel) -> None:
-    """Checkpoint every parameterized VGGTO Transformer block independently."""
-
-    _validate_vggto_checkpoint_determinism(model)
-    for layer_id, block in enumerate(model.vggto.frame_blocks):
-        model.vggto.frame_blocks[layer_id] = ptd_checkpoint_wrapper(
+    for layer_id, block in enumerate(model.mot_blocks):
+        model.mot_blocks[layer_id] = ptd_checkpoint_wrapper(
             block,
             preserve_rng_state=False,
         )
-    for blocks in (model.vggto.cross_view_blocks, model.vggto.inter_frame_blocks):
-        for layer_id, block in enumerate(blocks):
-            if any(True for _ in block.parameters()):
-                blocks[layer_id] = ptd_checkpoint_wrapper(
-                    block,
-                    preserve_rng_state=False,
-                )
 
 
 def shard_mot_model(
     model,
     param_dtype=torch.bfloat16,
     reduce_dtype=torch.float32,
-    *,
-    execution_route: str = "joint",
 ):
-    """FSDP-shard the MOT-specific module layout.
-
-    The original `shard_model` assumes `model.blocks`. Here we shard the MOT
-    blocks and the VGGTO tower, then shard the root module. This
-    preserves the official FSDP training style while respecting the VA-G model
-    structure.
-    """
+    """FSDP-shard every joint Video+Action block and the root model."""
 
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
@@ -738,35 +501,8 @@ def shard_mot_model(
         cast_forward_inputs=False,
     )
     fsdp_config = {"mp_policy": mp_policy, "reshard_after_forward": True}
-    head_mp_policy = MixedPrecisionPolicy(
-        param_dtype=torch.float32,
-        reduce_dtype=reduce_dtype,
-        cast_forward_inputs=False,
-    )
-    head_fsdp_config = {"mp_policy": head_mp_policy, "reshard_after_forward": True}
-
-    if execution_route not in {"joint", "geometry"}:
-        raise ValueError(f"unsupported execution_route={execution_route!r}")
-
     for block in model.mot_blocks:
-        if execution_route == "joint":
-            fully_shard(block, **fsdp_config)
-            continue
-        fully_shard(block.video_block, **fsdp_config)
-        fully_shard(block.action_block, **fsdp_config)
-        if block.geometry is not None:
-            fully_shard(block.geometry, **fsdp_config)
-    for block in model.vggto.frame_blocks:
         fully_shard(block, **fsdp_config)
-    for block in model.vggto.cross_view_blocks:
-        if any(True for _ in block.parameters()):
-            fully_shard(block, **fsdp_config)
-    for block in model.vggto.inter_frame_blocks:
-        if any(True for _ in block.parameters()):
-            fully_shard(block, **fsdp_config)
-    fully_shard(model.vggto.patch_embed, **fsdp_config)
-    fully_shard(model.vggto.dense_head, **head_fsdp_config)
-    fully_shard(model.vggto.point_head, **head_fsdp_config)
     fully_shard(model, **fsdp_config)
     return model
 
@@ -793,7 +529,7 @@ def _resolve_mot_dataset_paths(dataset_root: str | Path, mot_config: dict[str, A
     """
 
     root = Path(dataset_root).resolve()
-    manifest = root / "meta" / "mot_final_training_pointcloud_manifest.jsonl"
+    manifest = root / "meta" / "mot_final_training_manifest.jsonl"
     empty_emb = root / "empty_emb.pt"
     return {
         "dataset_path": str(root),
@@ -854,7 +590,6 @@ def _sample_mot_chunk_timesteps(
 
 def build_mot_train_dataset(config):
     spec = _mot_spec_from_config(config)
-    data_profile = _mot_execution_route(config.optimization_composition)
     configured_action_sequence_length = int(getattr(config, "action_sequence_length", spec.action_sequence_length))
     if configured_action_sequence_length != spec.action_sequence_length:
         raise ValueError(
@@ -862,66 +597,37 @@ def build_mot_train_dataset(config):
             f"got {configured_action_sequence_length}, expected {spec.action_sequence_length}"
         )
 
-    def make_dataset(manifest_path):
-        is_pointcloud_manifest = Path(manifest_path).resolve() == Path(config.mot_manifest_path).resolve()
-        dataset_cls = MotGeometryLeRobotData if is_pointcloud_manifest else MotPureLeRobotData
-        return dataset_cls(
-            manifest_path=manifest_path,
-            action_sequence_length=spec.action_sequence_length,
-            action_dim=config.action_dim,
-            norm_stats_by_task=getattr(config, "norm_stats_by_task", None),
-            action_chunk_size=spec.action_chunk_size,
-            video_downsample_ratio=spec.video_downsample_ratio,
-            text_emb_cache_path=getattr(config, "text_emb_cache_path", getattr(config, "empty_emb_path", None)),
-            empty_emb_path=getattr(config, "empty_emb_path", None),
-            action_cache_manifest_path=getattr(config, "action_cache_manifest_path", None),
-            video_decoder_cache_size=int(
-                getattr(config, "video_decoder_cache_size", MOT_DEFAULT_VIDEO_DECODER_CACHE_SIZE)
-            ),
-            point_store_cache_size=int(
-                getattr(config, "point_store_cache_size", MOT_DEFAULT_POINT_STORE_CACHE_SIZE)
-            ),
-            action_cache_size=int(
-                getattr(config, "action_cache_size", MOT_DEFAULT_ACTION_CACHE_SIZE)
-            ),
-            random_start=True,
-            data_profile=data_profile,
-        )
-
-    pointcloud_dataset = make_dataset(config.mot_manifest_path)
-    if data_profile == "geometry":
-        return pointcloud_dataset
-    non_pointcloud_manifest_path = getattr(config, "non_pointcloud_manifest_path", None)
-    if non_pointcloud_manifest_path:
-        pure_manifest = Path(non_pointcloud_manifest_path)
-        if not pure_manifest.is_file():
-            raise FileNotFoundError(pure_manifest)
-        with pure_manifest.open("r", encoding="utf-8") as f:
-            has_pure_rows = any(line.strip() for line in f)
-        if not has_pure_rows:
-            return pointcloud_dataset
-        return MotBalancedMixDataset(
-            pointcloud_dataset=pointcloud_dataset,
-            pure_dataset=make_dataset(non_pointcloud_manifest_path),
-        )
-    return pointcloud_dataset
+    return MotTrainData(
+        manifest_path=config.mot_manifest_path,
+        action_sequence_length=spec.action_sequence_length,
+        action_dim=config.action_dim,
+        norm_stats_by_task=getattr(config, "norm_stats_by_task", None),
+        action_chunk_size=spec.action_chunk_size,
+        video_downsample_ratio=spec.video_downsample_ratio,
+        text_emb_cache_path=getattr(
+            config, "text_emb_cache_path", getattr(config, "empty_emb_path", None)
+        ),
+        empty_emb_path=getattr(config, "empty_emb_path", None),
+        action_cache_manifest_path=getattr(config, "action_cache_manifest_path", None),
+        video_decoder_cache_size=int(
+            getattr(config, "video_decoder_cache_size", MOT_DEFAULT_VIDEO_DECODER_CACHE_SIZE)
+        ),
+        action_cache_size=int(
+            getattr(config, "action_cache_size", MOT_DEFAULT_ACTION_CACHE_SIZE)
+        ),
+        random_start=True,
+    )
 
 
 def _build_mot_train_sampler(train_dataset, config):
     grad_accum = max(1, int(getattr(config, "gradient_accumulation_steps", 1)))
     num_microsteps = max(1, int(config.num_steps)) * grad_accum
-    pointcloud_sample_period = (
-        getattr(config, "pointcloud_sample_period", None)
-        if isinstance(train_dataset, MotBalancedMixDataset)
-        else None
-    )
     return _MOTViewBatchSampler(
         train_dataset,
         num_replicas=int(getattr(config, "world_size", 1)),
         rank=int(getattr(config, "rank", 0)),
         num_microsteps=num_microsteps,
         max_views_per_gpu=int(config.max_views_per_gpu),
-        pointcloud_sample_period=pointcloud_sample_period,
         seed=int(getattr(config, "sampler_seed", 42)),
         shuffle=True,
     )
@@ -939,74 +645,36 @@ def _mot_dataloader_kwargs(config, train_sampler):
     return kwargs
 
 
-def build_mot_param_groups(model, base_lr: float, vggto_lr_multiplier: float, weight_decay: float):
-    """Create optimizer groups for the reviewed all-trainable strategy.
-
-    Discussed training decision: all parameters remain trainable, but native VGGTO
-    pretrained modules use a smaller LR to reduce early damage to the geometry
-    prior.  The MoT G joint streams live under `mot_blocks.*.geometry`; although
-    initialized from VGGTO inter-frame layers, they are the new VA-G fusion parameters and
-    stay on the main LR.
-    """
-
-    main_params = []
-    vggto_params = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if name.startswith("vggto."):
-            vggto_params.append(param)
-        else:
-            main_params.append(param)
-
-    groups = []
-    if main_params:
-        groups.append(
-            {
-                "params": main_params,
-                "lr": base_lr,
-                "weight_decay": weight_decay,
-                "name": "lingbot_and_mot",
-            }
-        )
-    if vggto_params:
-        groups.append(
-            {
-                "params": vggto_params,
-                "lr": base_lr * vggto_lr_multiplier,
-                "weight_decay": weight_decay,
-                "name": "vggto_pretrained",
-            }
-        )
-    return groups
+def build_mot_param_groups(model, base_lr: float, weight_decay: float):
+    params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    return [{
+        "params": params,
+        "lr": base_lr,
+        "weight_decay": weight_decay,
+        "name": "video_action_mot",
+    }]
 
 
 def _mot_parameter_branch(name: str) -> str:
-    if name.startswith("vggto.") or ".geometry." in name:
-        return "g"
     if name.startswith("action_") or ".action_block." in name:
         return "a"
     return "v"
 
 
-def apply_mot_parameter_ownership(
-    model,
-    optimization_composition: str,
-) -> dict[str, dict[str, int | bool]]:
-    """Set trainability from the exclusive V/A/G parameter-owner mapping."""
+def apply_mot_parameter_ownership(model) -> dict[str, dict[str, int | bool]]:
+    """Classify Video/Action ownership while keeping both branches trainable."""
 
-    selected = optimization_branches(optimization_composition)
     summary = {
         branch: {
-            "selected": branch in selected,
+            "selected": True,
             "parameter_tensors": 0,
             "parameters": 0,
         }
-        for branch in "vag"
+        for branch in "va"
     }
     for name, parameter in model.named_parameters():
         branch = _mot_parameter_branch(name)
-        parameter.requires_grad_(branch in selected)
+        parameter.requires_grad_(True)
         summary[branch]["parameter_tensors"] += 1
         summary[branch]["parameters"] += parameter.numel()
 
@@ -1028,12 +696,6 @@ def _validate_positive_finite_weight(config, name: str) -> float:
 
 
 def validate_mot_training_config(config) -> str:
-    composition = resolve_optimization_composition(
-        getattr(config, "optimization_composition", None)
-    )
-    config.optimization_composition = composition
-    branches = optimization_branches(composition)
-
     raw_max_views_per_gpu = getattr(config, "max_views_per_gpu", 0)
     if isinstance(raw_max_views_per_gpu, bool) or not isinstance(
         raw_max_views_per_gpu,
@@ -1054,27 +716,9 @@ def validate_mot_training_config(config) -> str:
     if getattr(config, "resume_from", None) and getattr(config, "initialize_from", None):
         raise ValueError("resume_from and initialize_from are mutually exclusive")
 
-    if "v" in branches:
-        _validate_positive_finite_weight(config, "video_loss_weight")
-    if "a" in branches:
-        _validate_positive_finite_weight(config, "action_loss_weight")
-    if "g" in branches:
-        _validate_positive_finite_weight(config, "geometry_loss_weight")
-        component_weights = [
-            float(getattr(config, "depth_loss_weight")),
-            float(getattr(config, "point_loss_weight")),
-        ]
-        if any(not np.isfinite(value) or value < 0 for value in component_weights):
-            raise ValueError(
-                "active geometry component weights must be finite and non-negative, "
-                f"got depth={component_weights[0]}, point={component_weights[1]}"
-            )
-        if not any(value > 0 for value in component_weights):
-            raise ValueError(
-                "active G objective requires a positive depth_loss_weight or "
-                "point_loss_weight"
-            )
-    return composition
+    _validate_positive_finite_weight(config, "video_loss_weight")
+    _validate_positive_finite_weight(config, "action_loss_weight")
+    return "va"
 
 
 def _configure_adamw_foreach(optimizer: torch.optim.AdamW) -> None:
@@ -1182,18 +826,6 @@ def _local_tensor(value: torch.Tensor) -> torch.Tensor:
     return value.to_local() if isinstance(value, DTensor) else value
 
 
-def _cross_view_named_parameters(model) -> list[tuple[str, torch.nn.Parameter]]:
-    named_parameters = []
-    seen = set()
-    for layer_id, block in enumerate(model.vggto.cross_view_blocks):
-        for name, parameter in block.named_parameters():
-            if id(parameter) in seen:
-                continue
-            seen.add(id(parameter))
-            named_parameters.append((f"cross_view_blocks.{layer_id}.{name}", parameter))
-    return named_parameters
-
-
 def _distributed_parameter_norm_stats(
     named_parameters: list[tuple[str, torch.nn.Parameter]],
     *,
@@ -1292,8 +924,6 @@ def _batch_meta_for_nan_log(batch):
         "episode_index",
         "start_frame",
         "source_dataset",
-        "has_pointcloud",
-        "pointcloud_session_dir",
     )
     return {key: _first_batch_meta_value(meta[key]) for key in keys if key in meta}
 
@@ -1331,15 +961,6 @@ def _make_nan_log_record(
         "action_loss",
         "video_loss_weight",
         "action_loss_weight",
-        "depth_loss",
-        "depth_loss_raw",
-        "geometry_loss_weight",
-        "geometry_active_rank_scale",
-        "geometry_global_active_ranks",
-        "depth_loss_weight",
-        "point_loss",
-        "point_loss_raw",
-        "point_loss_weight",
     ):
         if key in losses:
             record[key] = _scalar_for_log(losses[key])
@@ -1349,16 +970,13 @@ def _make_nan_log_record(
 
 
 class MOTTrainer:
+    checkpoint_model_architecture = MOT_MODEL_ARCHITECTURE
     # Subclasses such as distillation's autoregressive trainer override this
     # without changing the native MOT trainer's model family.
-    transformer_model_cls = ThreeDVAMOTTransformer3DModel
+    transformer_model_cls = VAMOTTransformer3DModel
     def __init__(self, config):
         self.config = config
-        self.optimization_composition = validate_mot_training_config(config)
-        self.optimization_branches = optimization_branches(
-            self.optimization_composition
-        )
-        self.execution_route = _mot_execution_route(self.optimization_composition)
+        validate_mot_training_config(config)
         gc_interval = int(getattr(config, "gc_interval", 0) or 0)
         if gc_interval < 0:
             raise ValueError(f"gc_interval must be non-negative, got {gc_interval}")
@@ -1445,8 +1063,6 @@ class MOTTrainer:
             spec = _mot_spec_from_config(config)
             logger.info(
                 "MOT fixed-window training: "
-                f"optimization_composition={self.optimization_composition} "
-                f"execution_route={self.execution_route} "
                 f"max_views_per_gpu={config.max_views_per_gpu} "
                 f"available_views={train_sampler.available_view_counts} "
                 f"local_batch_sizes={{{', '.join(f'{v}: {train_sampler.local_batch_size_for_view(v)}' for v in train_sampler.available_view_counts)}}} "
@@ -1456,15 +1072,6 @@ class MOTTrainer:
                 f"target_actions_per_sample={spec.target_actions_per_sample}"
             )
         if config.rank == 0:
-            if isinstance(train_dataset, MotBalancedMixDataset):
-                pointcloud_period = train_sampler.pointcloud_sample_period
-                logger.info(
-                    "MOT source sampling: "
-                    f"pointcloud:non_pointcloud=1:{pointcloud_period - 1} "
-                    f"pointcloud_sample_period={pointcloud_period} "
-                    f"pointcloud_episodes={len(train_dataset.pointcloud_dataset)} "
-                    f"non_pointcloud_episodes={len(train_dataset.pure_dataset)}"
-                )
             logger.info(
                 "MOT dynamic batch sampler: "
                 f"microsteps_per_rank={len(train_sampler)} "
@@ -1472,43 +1079,33 @@ class MOTTrainer:
             )
         self.train_loader = DataLoader(train_dataset, **_mot_dataloader_kwargs(config, train_sampler))
 
-        logger.info("Loading 3DVA_MOT transformer...")
+        logger.info("Loading VA_MOT transformer...")
         # Dataset/W&B setup must not perturb the controlled model initialization.
         _seed_mot_training(int(getattr(config, "train_seed", 42)))
         self.transformer = self._load_transformer()
         self.transformer.requires_grad_(True)
-        branch_summary = apply_mot_parameter_ownership(
-            self.transformer,
-            self.optimization_composition,
-        )
+        branch_summary = apply_mot_parameter_ownership(self.transformer)
         if not any(parameter.requires_grad for parameter in self.transformer.parameters()):
-            raise ValueError("MOT training requires at least one unfrozen V/A/G branch")
+            raise ValueError("MOT training requires trainable Video+Action parameters")
         if config.rank == 0:
             logger.info(f"MOT parameter ownership: {branch_summary}")
 
         logger.info("Setting up MOT activation checkpointing ...")
-        apply_ac_mot(self.transformer, execution_route=self.execution_route)
-        apply_ac_vggto(self.transformer)
+        apply_ac_mot(self.transformer)
 
         logger.info("Setting up MOT FSDP...")
         self.transformer = _configure_model(
             model=self.transformer,
-            shard_fn=partial(
-                shard_mot_model,
-                execution_route=self.execution_route,
-            ),
+            shard_fn=shard_mot_model,
             param_dtype=self.dtype,
             device=self.device,
             eval_mode=False,
         )
-        if not dist.is_initialized():
-            self.transformer.vggto.keep_heads_fp32_()
         self.transformer.train()
 
         optimizer_groups = build_mot_param_groups(
             self.transformer,
             base_lr=config.learning_rate,
-            vggto_lr_multiplier=getattr(config, "vggto_lr_multiplier", 0.1),
             weight_decay=config.weight_decay,
         )
         self.optimizer = torch.optim.AdamW(
@@ -1527,19 +1124,18 @@ class MOTTrainer:
 
         self.train_scheduler_latent = None
         self.train_scheduler_action = None
-        if self.execution_route == "joint":
-            self.train_scheduler_latent = FlowMatchScheduler(
-                shift=self.config.snr_shift,
-                sigma_min=0.0,
-                extra_one_step=True,
-            )
-            self.train_scheduler_latent.set_timesteps(1000, training=True)
-            self.train_scheduler_action = FlowMatchScheduler(
-                shift=self.config.action_snr_shift,
-                sigma_min=0.0,
-                extra_one_step=True,
-            )
-            self.train_scheduler_action.set_timesteps(1000, training=True)
+        self.train_scheduler_latent = FlowMatchScheduler(
+            shift=self.config.snr_shift,
+            sigma_min=0.0,
+            extra_one_step=True,
+        )
+        self.train_scheduler_latent.set_timesteps(1000, training=True)
+        self.train_scheduler_action = FlowMatchScheduler(
+            shift=self.config.action_snr_shift,
+            sigma_min=0.0,
+            extra_one_step=True,
+        )
+        self.train_scheduler_action.set_timesteps(1000, training=True)
 
         self.save_dir = Path(config.save_root) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -1612,19 +1208,10 @@ class MOTTrainer:
             "action_ffn_dim": 3072,
             "attn_mode": "torch",
             "num_layers": 30,
-            "vggto_depth": 30,
-            "vggto_register_attention_indices": tuple(range(0, 30, 2)),
-            "vggto_cached_layer_indices": (5, 15, 21, 29),
-            "vggto_pretrained_register_attention_indices": (2, 8, 12, 18, 26),
-            "vggto_inserted_layer_indices": (4, 6, 10, 14, 22, 24),
-            "vggto_converted_layer_indices": (0, 16, 20, 28),
-            # Explicit masked-attention backend for VA-G joint attention. If set
+            # Explicit masked-attention backend for joint Video+Action attention. If set
             # to "fa4", the model fails fast unless FlashAttention-4 is usable.
             "masked_attn_backend": getattr(self.config, "masked_attn_backend", "fa4"),
             "init_noise_seed": int(getattr(self.config, "init_noise_seed", 42)),
-            "vggto_cross_view_init_scale": float(
-                getattr(self.config, "vggto_cross_view_init_scale", 1.0)
-            ),
         }
         init_model_from_lingbot = bool(
             getattr(self.config, "init_model_from_lingbot", True)
@@ -1634,38 +1221,22 @@ class MOTTrainer:
             if init_model_from_lingbot
             else self.config.wan22_transformer_path
         )
-        source_paths = {
-            "video_transformer_path": video_transformer_path,
-            "vggto_checkpoint_path": getattr(self.config, "vggto_checkpoint_path", None),
-            "vggt_checkpoint_path": getattr(self.config, "vggt_checkpoint_path", None),
-        }
-        missing_sources = [name for name, path in source_paths.items() if not path]
-        if missing_sources:
-            raise ValueError(
-                "Constructing a new MOT transformer requires source checkpoints: "
-                + ", ".join(missing_sources)
-            )
-        model, report = self.transformer_model_cls.from_lingbot_and_vggto(
+        if not video_transformer_path:
+            raise ValueError("Constructing a new MOT transformer requires a video checkpoint")
+        model, report = self.transformer_model_cls.from_video_backbone(
             video_transformer_path,
-            source_paths["vggto_checkpoint_path"],
-            source_paths["vggt_checkpoint_path"],
             init_model_from_lingbot=init_model_from_lingbot,
             config_overrides=config_overrides,
         )
         if self.config.rank == 0:
             logger.info(
-                f"Initialized MOT transformer from {report.video_source}/VGGTO: "
+                f"Initialized MOT transformer from {report.video_source}: "
                 f"video_keys={report.loaded_video_keys}, "
-                f"vggto_keys={report.loaded_vggto_required_keys}, "
-                f"vggt_point_keys={report.loaded_vggt_point_keys}, "
-                f"ignored_vggto_keys={len(report.ignored_vggto_keys)}, "
                 f"action_copy={len(report.action_init.copied)}, "
                 f"action_interpolate={len(report.action_init.interpolated)}, "
                 f"action_scale={len(report.action_init.scaled)}, "
                 f"action_shared={len(report.action_init.shared)}, "
                 f"action_random={report.action_init.random}, "
-                "cross_view_layer_scale_factor="
-                f"{report.vggto_24_to_30.cross_view_layer_scale_factor}, "
                 f"notes={report.notes}"
             )
             logger.info(
@@ -1815,12 +1386,10 @@ class MOTTrainer:
         skipped_step: bool,
     ) -> None:
         local_times = {key: 0.0 for key in MOT_PERFORMANCE_TIMING_KEYS}
-        local_pointcloud_samples = 0
         local_dataset_skip_count = 0
         local_samples = 0
         native_view_microsteps = {view_count: 0 for view_count in MOT_SUPPORTED_VIEW_COUNTS}
         for timing_record in timing_records:
-            local_pointcloud_samples += int(timing_record.get("pointcloud_samples", 0))
             local_dataset_skip_count += int(timing_record.get("dataset_skip_count", 0))
             local_samples += int(timing_record.get("local_samples", 1))
             native_views = int(timing_record.get("native_views", 0))
@@ -1885,7 +1454,6 @@ class MOTTrainer:
         local_values = torch.tensor(
             [
                 *(local_times[key] for key in timing_keys),
-                local_pointcloud_samples,
                 local_dataset_skip_count,
                 local_samples,
             ],
@@ -1900,9 +1468,8 @@ class MOTTrainer:
         else:
             rank_values = local_values.unsqueeze(0)
         rank_values = rank_values.cpu()
-        pointcloud_samples_by_rank = rank_values[:, len(timing_keys)].to(dtype=torch.int64)
-        dataset_skip_count_by_rank = rank_values[:, len(timing_keys) + 1].to(dtype=torch.int64)
-        samples_by_rank = rank_values[:, len(timing_keys) + 2].to(dtype=torch.int64)
+        dataset_skip_count_by_rank = rank_values[:, len(timing_keys)].to(dtype=torch.int64)
+        samples_by_rank = rank_values[:, len(timing_keys) + 1].to(dtype=torch.int64)
 
         local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", 1)))
         timings = {}
@@ -1920,7 +1487,6 @@ class MOTTrainer:
                 "slowest_rank": slowest_rank,
                 "slowest_node": slowest_rank // local_world_size,
                 "slowest_local_rank": slowest_rank % local_world_size,
-                "slowest_rank_pointcloud_samples": int(pointcloud_samples_by_rank[slowest_rank].item()),
                 "slowest_rank_dataset_skip_count": int(dataset_skip_count_by_rank[slowest_rank].item()),
                 "top_slowest": [
                     {"rank": int(rank), "seconds": float(value)}
@@ -1943,8 +1509,6 @@ class MOTTrainer:
             "local_samples": int(samples_by_rank[int(self.config.rank)].item()),
             "global_samples": global_samples,
             "global_samples_per_second": global_samples / iteration_max if iteration_max > 0 else 0.0,
-            "pointcloud_samples": int(pointcloud_samples_by_rank.sum().item()),
-            "pointcloud_ranks": torch.nonzero(pointcloud_samples_by_rank, as_tuple=False).flatten().tolist(),
             "dataset_skip_count": int(dataset_skip_count_by_rank.sum().item()),
             "timings": timings,
         }
@@ -1955,203 +1519,29 @@ class MOTTrainer:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
     def _aggregate_log_records(self, records: list[dict[str, Any]]) -> dict[str, float]:
-        """Reduce one logging window with conditional geometry denominators."""
-
-        zero = torch.zeros((), device=self.device, dtype=torch.float64)
-        reduction_parts = []
-        reduction_layout = []
-        branches = getattr(self, "optimization_branches", frozenset("vag"))
-        sample_log_keys = ["total_loss_raw", "total_norm"]
-        if "v" in branches:
-            sample_log_keys.extend(("weighted_video_loss_raw", "latent_loss_raw"))
-        if "a" in branches:
-            sample_log_keys.extend(("weighted_action_loss_raw", "action_loss_raw"))
-        if "g" in branches:
-            sample_log_keys.extend(("weighted_depth_loss_raw", "weighted_point_loss_raw"))
-            sample_log_keys.extend(MOT_GEOMETRY_LOG_KEYS)
-
-        for key in sample_log_keys:
-            value_sum = zero.clone()
-            if key in MOT_GEOMETRY_GLOBAL_DETAIL_KEYS + MOT_GEOMETRY_MAX_LOG_KEYS:
+        if not records:
+            return {}
+        summary = {}
+        keys = set().union(*(record.keys() for record in records))
+        for key in keys:
+            values = [record[key] for record in records if key in record]
+            if not values or not all(torch.is_tensor(value) and value.numel() == 1 for value in values):
                 continue
-            value_count = zero.clone()
-            geometry_key = key in MOT_GEOMETRY_LOG_KEYS
-            for record in records:
-                value = record.get(key)
-                if not torch.is_tensor(value) or value.numel() != 1:
-                    continue
-                value = value.detach().to(device=self.device, dtype=torch.float64)
-                valid = torch.isfinite(value)
-                if geometry_key:
-                    geometry_valid = record.get("geometry_metric_valid")
-                    valid = valid & torch.as_tensor(geometry_valid, device=self.device, dtype=torch.bool)
-                value_sum = value_sum + torch.where(valid, value, zero)
-                value_count = value_count + valid.to(dtype=torch.float64)
-            reduction_parts.extend((value_sum, value_count))
-            reduction_layout.append((key, len(reduction_parts) - 2))
-
-        data_count_keys = [
-            "data_pointcloud_samples",
-            "data_pure_samples",
-            "data_dataset_skip_count",
-            "grad_clip_event",
-            "grad_clip_count",
-        ]
-        if "v" in branches:
-            data_count_keys.extend(
-                (
-                    "data_video_supervised_num",
-                    "data_video_supervised_den",
-                    "data_video_valid_num",
-                    "data_video_valid_den",
-                )
-            )
-        if "a" in branches:
-            data_count_keys.extend(
-                (
-                    "data_action_supervised_num",
-                    "data_action_supervised_den",
-                    "data_action_valid_num",
-                    "data_action_valid_den",
-                )
-            )
-        if "g" in branches:
-            data_count_keys.extend(
-                (
-                    "data_geometry_valid_slot_num",
-                    "data_geometry_valid_slot_den",
-                    "data_geometry_valid_pixel_num",
-                    "data_geometry_valid_pixel_den",
-                )
-            )
-        data_start = len(reduction_parts)
-        for key in data_count_keys:
-            values = [
-                record[key].detach().to(device=self.device, dtype=torch.float64)
-                for record in records
-                if torch.is_tensor(record.get(key))
-            ]
-            reduction_parts.append(torch.stack(values).sum() if values else zero.clone())
-
-        reduced = torch.stack(reduction_parts)
-        if dist.is_initialized():
-            dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
-
-        result = {}
-        for key, offset in reduction_layout:
-            value_sum = reduced[offset]
-            value_count = reduced[offset + 1]
-            result[key] = (
-                float((value_sum / value_count).item())
-                if value_count.item() > 0
-                else float("nan")
-            )
-        for index, key in enumerate(data_count_keys):
-            result[key] = float(reduced[data_start + index].item())
-
-        max_keys = []
-        if "v" in branches:
-            max_keys.append("latent_loss_raw")
-        if "a" in branches:
-            max_keys.append("action_loss_raw")
-        if "g" in branches:
-            max_keys.extend(("depth_loss_raw", "point_loss_raw", *MOT_GEOMETRY_MAX_LOG_KEYS))
-
-        def reduce_maxima() -> None:
-            local_max = []
-            for key in max_keys:
-                values = []
-                geometry_key = key in {"depth_loss_raw", "point_loss_raw"} or key in MOT_GEOMETRY_MAX_LOG_KEYS
-                for record in records:
-                    value = record.get(key)
-                    if not torch.is_tensor(value) or value.numel() != 1 or not bool(torch.isfinite(value).item()):
-                        continue
-                    if geometry_key and not bool(record["geometry_metric_valid"].item()):
-                        continue
-                    values.append(value.detach().to(device=self.device, dtype=torch.float64))
-                local_max.append(torch.stack(values).max() if values else zero.new_full((), float("-inf")))
-            if not local_max:
-                return
-            maxima = torch.stack(local_max)
-            if dist.is_initialized():
-                dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
-            for key, value in zip(max_keys, maxima):
-                output_key = key if key in MOT_GEOMETRY_MAX_LOG_KEYS else f"max_{key}"
-                result[output_key] = float(value.item()) if torch.isfinite(value) else float("nan")
-
-        if "g" not in branches:
-            reduce_maxima()
-            return result
-
-        detail_specs = (
-            ("depth_error_histogram", VGGT_MONITOR_ERROR_HISTOGRAM_BINS),
-            ("point_error_histogram", VGGT_MONITOR_ERROR_HISTOGRAM_BINS),
-            ("depth_conf_error_correlation_stats", 6),
-            ("point_conf_error_correlation_stats", 6),
-            ("point_normal_angle_stats", 2),
-        )
-        detail_parts = []
-        detail_layout = {}
-        detail_offset = 0
-        for key, size in detail_specs:
-            values = [
-                record[key].detach().to(device=self.device, dtype=torch.float64).reshape(size)
-                for record in records
-                if torch.is_tensor(record.get(key))
-                and record[key].numel() == size
-                and bool(record["geometry_metric_valid"].item())
-            ]
-            detail_parts.append(torch.stack(values).sum(dim=0) if values else zero.new_zeros(size))
-            detail_layout[key] = (detail_offset, size)
-            detail_offset += size
-        detail_reduced = torch.cat(detail_parts)
-        if dist.is_initialized():
-            dist.all_reduce(detail_reduced, op=dist.ReduceOp.SUM)
-
-        def detail_value(key: str) -> torch.Tensor:
-            offset, size = detail_layout[key]
-            return detail_reduced[offset : offset + size]
-
-        depth_quantiles = geometry_error_quantiles_from_histogram(detail_value("depth_error_histogram"))
-        point_quantiles = geometry_error_quantiles_from_histogram(detail_value("point_error_histogram"))
-        depth_correlation = geometry_pearson_from_stats(detail_value("depth_conf_error_correlation_stats"))
-        point_correlation = geometry_pearson_from_stats(detail_value("point_conf_error_correlation_stats"))
-        normal_sum, normal_count = detail_value("point_normal_angle_stats")
-        normal_mean = torch.where(
-            normal_count > 0,
-            normal_sum / normal_count.clamp_min(1),
-            normal_sum.new_full((), float("nan")),
-        )
-        result.update(
-            {
-                "depth_error_p50": float(depth_quantiles[0].item()),
-                "depth_error_p90": float(depth_quantiles[1].item()),
-                "point_error_p50": float(point_quantiles[0].item()),
-                "point_error_p90": float(point_quantiles[1].item()),
-                "depth_conf_error_correlation": float(depth_correlation.item()),
-                "point_conf_error_correlation": float(point_correlation.item()),
-                "point_normal_angle_mean": float(normal_mean.item()),
-            }
-        )
-        reduce_maxima()
-        return result
+            stacked = torch.stack([value.detach().float().to(self.device) for value in values])
+            summary[key] = float(stacked.mean().item())
+        return summary
 
     def _consume_runtime_cache_stats(self, batch: dict[str, Any]) -> None:
         raw_stats = batch.pop("_runtime_cache_stats", None)
         payloads = raw_stats if isinstance(raw_stats, (list, tuple)) else (raw_stats,)
-        has_pointcloud = batch.get("has_pointcloud")
-        pointcloud_flags = has_pointcloud.reshape(-1) if torch.is_tensor(has_pointcloud) else None
-        for sample_idx, payload in enumerate(payloads):
+        for payload in payloads:
             try:
                 stats = decode_mot_runtime_cache_stats(payload)
             except ValueError:
                 continue
-            source = "unknown"
-            if pointcloud_flags is not None and sample_idx < pointcloud_flags.numel():
-                source = "pointcloud" if bool(pointcloud_flags[sample_idx].item()) else "non_pointcloud"
             worker_pid = stats.get("worker_pid")
             if worker_pid is not None:
-                self._worker_cache_stats.setdefault(int(worker_pid), {})[source] = stats
+                self._worker_cache_stats.setdefault(int(worker_pid), {})["dataset"] = stats
 
     def _memory_snapshot_due(self, step: int) -> bool:
         if not bool(getattr(self, "memory_jsonl_enabled", False)):
@@ -2509,17 +1899,6 @@ class MOTTrainer:
 
 
     @torch.no_grad()
-    def _prepare_geometry_fields(self, batch_dict):
-        return {
-            "rgb": batch_dict["geometry_rgb"].to(
-                dtype=getattr(self, "dtype", batch_dict["geometry_rgb"].dtype)
-            ),
-            "pts3d": batch_dict["geometry_pts3d"],
-            "valid_mask": batch_dict["geometry_point_valid_mask"],
-            "slot_valid_mask": batch_dict["geometry_group_valid_mask"],
-        }
-
-    @torch.no_grad()
     def _prepare_joint_input_dict(self, batch_dict, *, add_noise=True):
         spec = _mot_spec_from_config(self.config)
         video_latent_loss_mask = batch_dict["video_latent_loss_mask"].to(
@@ -2572,15 +1951,11 @@ class MOTTrainer:
         action_dict["action_loss_mask"] = action_loss_mask
         action_dict["action_valid_mask"] = action_valid_mask
 
-        geometry_dict = self._prepare_geometry_fields(batch_dict)
-        geometry_dict["stream_ids"] = batch_dict["stream_ids"]
-
         input_dict = {
             "latent_dict": latent_dict,
             "action_dict": action_dict,
-            "geometry_dict": geometry_dict,
+            "stream_ids": batch_dict["stream_ids"],
             "monitoring_dict": {
-                "has_pointcloud": batch_dict.get("has_pointcloud"),
                 "dataset_skip_count": batch_dict.get("dataset_skip_count"),
             },
             "chunk_size": spec.latent_frames_per_action_chunk_per_view,
@@ -2588,48 +1963,6 @@ class MOTTrainer:
         }
         validate_mot_batch_for_forward(batch_dict, action_sequence_length=spec.action_sequence_length)
         return input_dict
-
-    def _prepare_geometry_input_dict(self, batch_dict):
-        spec = _mot_spec_from_config(self.config)
-        validate_mot_geometry_batch(
-            batch_dict,
-            action_sequence_length=spec.action_sequence_length,
-        )
-        selected = {
-            key: batch_dict[key]
-            for key in (
-                "geometry_rgb",
-                "geometry_pts3d",
-                "geometry_point_valid_mask",
-                "geometry_group_valid_mask",
-                "has_pointcloud",
-            )
-        }
-        if "dataset_skip_count" in batch_dict:
-            selected["dataset_skip_count"] = batch_dict["dataset_skip_count"]
-        selected = _move_to_device(
-            selected,
-            self.device,
-            non_blocking=(self.device.type == "cuda"),
-        )
-        geometry_dict = self._prepare_geometry_fields(selected)
-        model_input = {
-            "rgb": geometry_dict["rgb"],
-            "slot_valid_mask": geometry_dict["slot_valid_mask"],
-            "chunk_size": spec.latent_frames_per_action_chunk_per_view,
-            "window_size": spec.attention_window_size,
-        }
-        return {
-            "geometry_model_input": model_input,
-            "geometry_dict": {
-                key: geometry_dict[key]
-                for key in ("pts3d", "valid_mask", "slot_valid_mask")
-            },
-            "monitoring_dict": {
-                "has_pointcloud": selected["has_pointcloud"],
-                "dataset_skip_count": selected.get("dataset_skip_count"),
-            },
-        }
 
     def convert_input_format(self, input_dict):
         return _move_to_device(input_dict, self.device, non_blocking=(self.device.type == "cuda"))
@@ -2686,161 +2019,26 @@ class MOTTrainer:
             "data_action_valid_den": action_loss.new_tensor(action_valid_mask.numel()),
         }
 
-    def _compute_geometry_objective(self, input_dict, pred):
-        detailed_metrics = bool(input_dict.get("detailed_metrics", False))
-        geometry = input_dict["geometry_dict"]
-        geometry_valid_mask = geometry["valid_mask"].bool()
-        geometry_slot_mask = geometry["slot_valid_mask"].bool()
-        batch_size = geometry_valid_mask.shape[0]
-        depth_weight = float(self.config.depth_loss_weight)
-        point_weight = float(self.config.point_loss_weight)
-        component_losses = []
-        component_valid_counts = []
-        metrics = {}
-
-        if depth_weight > 0:
-            depth_loss, depth_metrics = compute_vggto_depth_loss(
-                pred["depth"],
-                pred["depth_conf"],
-                geometry["pts3d"],
-                geometry_valid_mask,
-                gradient_loss_fn=getattr(self.config, "gradient_loss_fn", "grad"),
-                valid_range=float(getattr(self.config, "valid_range", 0.98)),
-                gamma=float(getattr(self.config, "gamma", 1.0)),
-                alpha=float(getattr(self.config, "alpha", 0.2)),
-                detailed_metrics=detailed_metrics,
-            )
-            component_losses.append(("depth", depth_weight, depth_loss))
-            component_valid_counts.append(depth_metrics["depth_valid_pixels"])
-            metrics.update(depth_metrics)
-        if point_weight > 0:
-            point_loss, point_metrics = compute_vggto_point_loss(
-                pred["points"],
-                pred["points_conf"],
-                geometry["pts3d"],
-                geometry_valid_mask,
-                gradient_loss_fn=getattr(self.config, "point_gradient_loss_fn", "normal"),
-                valid_range=float(getattr(self.config, "valid_range", 0.98)),
-                gamma=float(getattr(self.config, "gamma", 1.0)),
-                alpha=float(getattr(self.config, "alpha", 0.2)),
-                detailed_metrics=detailed_metrics,
-            )
-            component_losses.append(("point", point_weight, point_loss))
-            component_valid_counts.append(point_metrics["point_valid_pixels"])
-            metrics.update(point_metrics)
-
-        reference = component_losses[0][2]
-        monitoring = input_dict.get("monitoring_dict", {})
-        has_pointcloud = monitoring.get("has_pointcloud")
-        if has_pointcloud is None:
-            has_pointcloud = geometry_valid_mask.reshape(batch_size, -1).any(dim=1)
-        else:
-            has_pointcloud = has_pointcloud.to(device=reference.device, dtype=torch.bool).reshape(batch_size)
-        pointcloud_samples = has_pointcloud.sum()
-        geometry_rank_active = (
-            (pointcloud_samples > 0)
-            & torch.stack(
-                [count.to(device=reference.device) for count in component_valid_counts]
-            ).max().ge(100)
-        ).to(dtype=torch.float32)
-        geometry_rank_scale, global_active_ranks = _distributed_geometry_active_rank_scale(
-            geometry_rank_active
-        )
-        geometry_rank_scale = geometry_rank_scale.to(
-            device=reference.device,
-            dtype=reference.dtype,
-        )
-        geometry_weight = float(self.config.geometry_loss_weight)
-        weighted_total = reference.new_zeros(())
-        out = {
-            "geometry_loss_weight": reference.new_tensor(geometry_weight),
-            "geometry_active_rank_scale": geometry_rank_scale.detach(),
-            "geometry_global_active_ranks": global_active_ranks.to(device=reference.device),
-            "geometry_metric_valid": geometry_rank_active,
-        }
-        for name, component_weight, component_loss in component_losses:
-            weighted = (
-                geometry_weight
-                * component_weight
-                * geometry_rank_scale
-                * component_loss
-            )
-            weighted_total = weighted_total + weighted
-            out[f"{name}_loss_raw"] = component_loss.detach()
-            out[f"weighted_{name}_loss_raw"] = weighted.detach()
-            out[f"{name}_loss_weight"] = component_loss.new_tensor(component_weight)
-        out.update(
-            {
-                key: value.detach() if torch.is_tensor(value) else value
-                for key, value in metrics.items()
-            }
-        )
-        pointcloud_slot_mask = has_pointcloud[:, None, None]
-        out.update(
-            data_geometry_valid_slot_num=(geometry_slot_mask & pointcloud_slot_mask).sum().to(dtype=torch.float32),
-            data_geometry_valid_slot_den=pointcloud_samples.to(dtype=torch.float32) * geometry_slot_mask[0].numel(),
-            data_geometry_valid_pixel_num=geometry_valid_mask.sum().to(dtype=torch.float32),
-            data_geometry_valid_pixel_den=pointcloud_samples.to(dtype=torch.float32) * geometry_valid_mask[0].numel(),
-        )
-        return weighted_total, out
-
     def compute_loss(self, input_dict, pred):
-        branches = getattr(self, "optimization_branches", None)
-        if branches is None:
-            branches = optimization_branches(self.config.optimization_composition)
-        contributions = []
-        out = {}
-        if "v" in branches:
-            weighted, metrics = self._compute_video_objective(input_dict, pred)
-            contributions.append(weighted)
-            out.update(metrics)
-        if "a" in branches:
-            weighted, metrics = self._compute_action_objective(input_dict, pred)
-            contributions.append(weighted)
-            out.update(metrics)
-        if "g" in branches:
-            weighted, metrics = self._compute_geometry_objective(input_dict, pred)
-            contributions.append(weighted)
-            out.update(metrics)
-
-        total_loss = contributions[0]
-        for contribution in contributions[1:]:
-            total_loss = total_loss + contribution
+        video_loss, video_metrics = self._compute_video_objective(input_dict, pred)
+        action_loss, action_metrics = self._compute_action_objective(input_dict, pred)
+        total_loss = video_loss + action_loss
         inv_accum = 1.0 / float(self.gradient_accumulation_steps)
-        out["loss"] = total_loss * inv_accum
-        out["total_loss_raw"] = total_loss.detach()
-        for name in ("latent", "action", "depth", "point"):
-            raw = out.get(f"{name}_loss_raw")
-            if raw is not None:
-                out[f"{name}_loss"] = raw * inv_accum
-
-        geometry_valid_mask = input_dict["geometry_dict"]["valid_mask"].bool()
-        batch_size = geometry_valid_mask.shape[0]
-        reference = total_loss
+        batch_size = int(input_dict["latent_dict"]["latent"].shape[0])
         monitoring = input_dict.get("monitoring_dict", {})
-        has_pointcloud = monitoring.get("has_pointcloud")
-        if has_pointcloud is None:
-            has_pointcloud = geometry_valid_mask.reshape(batch_size, -1).any(dim=1)
-        else:
-            has_pointcloud = has_pointcloud.to(device=reference.device, dtype=torch.bool).reshape(batch_size)
-        pointcloud_samples = has_pointcloud.sum()
         dataset_skip_count = monitoring.get("dataset_skip_count")
         if dataset_skip_count is None:
-            dataset_skip_count = torch.zeros(batch_size, device=reference.device, dtype=torch.int64)
-        else:
-            dataset_skip_count = dataset_skip_count.to(device=reference.device, dtype=torch.int64).reshape(batch_size)
-        out.update(
-            {
-                "data_pointcloud_samples": pointcloud_samples.to(dtype=torch.float32),
-                "data_pure_samples": (batch_size - pointcloud_samples).to(dtype=torch.float32),
-                "data_dataset_skip_count": dataset_skip_count.sum().to(dtype=torch.float32),
-                "data_local_samples": reference.new_tensor(batch_size, dtype=torch.float32),
-                "data_native_views": reference.new_tensor(
-                    geometry_valid_mask.shape[3] if geometry_valid_mask.ndim >= 6 else 0,
-                    dtype=torch.float32,
-                ),
-            }
-        )
+            dataset_skip_count = total_loss.new_zeros(batch_size)
+        out = {**video_metrics, **action_metrics}
+        out.update({
+            "loss": total_loss * inv_accum,
+            "total_loss_raw": total_loss.detach(),
+            "latent_loss": video_metrics["latent_loss_raw"] * inv_accum,
+            "action_loss": action_metrics["action_loss_raw"] * inv_accum,
+            "data_dataset_skip_count": dataset_skip_count.sum().to(dtype=torch.float32),
+            "data_local_samples": total_loss.new_tensor(batch_size, dtype=torch.float32),
+            "data_native_views": total_loss.new_tensor(input_dict["stream_ids"].shape[1], dtype=torch.float32),
+        })
         return out
 
     def _distributed_any(self, value: bool) -> bool:
@@ -2968,31 +2166,18 @@ class MOTTrainer:
         phase_timings = {}
         forward_timer = self._start_phase_timer() if measure_performance else None
         batch_prepare_timer = self._start_phase_timer() if measure_performance else None
-        execution_route = getattr(self, "execution_route", "joint")
-        if execution_route == "geometry":
-            input_transfer_timer = self._start_phase_timer() if measure_performance else None
-            input_dict = self._prepare_geometry_input_dict(batch)
-            if measure_performance:
-                phase_timings["input_transfer"] = self._stop_phase_timer(input_transfer_timer)
-                phase_timings["vae_encode"] = 0.0
-                phase_timings["input_prepare"] = 0.0
-            model_input = input_dict["geometry_model_input"]
-            model_mode = "train_geometry"
-        else:
-            input_transfer_timer = self._start_phase_timer() if measure_performance else None
-            batch = self.convert_input_format(batch)
-            if measure_performance:
-                phase_timings["input_transfer"] = self._stop_phase_timer(input_transfer_timer)
-            vae_encode_timer = self._start_phase_timer() if measure_performance else None
-            batch = self._materialize_batch_latents(batch)
-            if measure_performance:
-                phase_timings["vae_encode"] = self._stop_phase_timer(vae_encode_timer)
-            input_prepare_timer = self._start_phase_timer() if measure_performance else None
-            input_dict = self._prepare_joint_input_dict(batch)
-            if measure_performance:
-                phase_timings["input_prepare"] = self._stop_phase_timer(input_prepare_timer)
-            model_input = input_dict
-            model_mode = "train"
+        input_transfer_timer = self._start_phase_timer() if measure_performance else None
+        batch = self.convert_input_format(batch)
+        if measure_performance:
+            phase_timings["input_transfer"] = self._stop_phase_timer(input_transfer_timer)
+        vae_encode_timer = self._start_phase_timer() if measure_performance else None
+        batch = self._materialize_batch_latents(batch)
+        if measure_performance:
+            phase_timings["vae_encode"] = self._stop_phase_timer(vae_encode_timer)
+        input_prepare_timer = self._start_phase_timer() if measure_performance else None
+        input_dict = self._prepare_joint_input_dict(batch)
+        if measure_performance:
+            phase_timings["input_prepare"] = self._stop_phase_timer(input_prepare_timer)
         if measure_performance:
             phase_timings["batch_prepare"] = self._stop_phase_timer(batch_prepare_timer)
         input_dict["detailed_metrics"] = bool(collect_detailed_metrics)
@@ -3002,7 +2187,7 @@ class MOTTrainer:
             self.transformer.set_requires_gradient_sync(should_sync)
 
         model_forward_timer = self._start_phase_timer() if measure_performance else None
-        output = self.transformer(model_input, mode=model_mode)
+        output = self.transformer(input_dict, mode="train")
         if measure_performance:
             phase_timings["model_forward"] = self._stop_phase_timer(model_forward_timer)
         loss_timer = self._start_phase_timer() if measure_performance else None
@@ -3044,15 +2229,6 @@ class MOTTrainer:
             phase_timings["backward"] = self._stop_phase_timer(backward_timer)
 
         grad_summary = {}
-        cross_view_parameters = []
-        if should_sync and collect_detailed_metrics:
-            cross_view_parameters = _cross_view_named_parameters(self.transformer)
-            if not cross_view_parameters:
-                raise RuntimeError("no trainable VGGTO cross-view parameters found for monitoring")
-            grad_summary["vggto_cross_view"] = _distributed_parameter_norm_stats(
-                cross_view_parameters,
-                device=self.device,
-            )
 
         if should_sync:
             optimizer_timer = self._start_phase_timer() if measure_performance else None
@@ -3084,19 +2260,7 @@ class MOTTrainer:
                 losses["skipped_step"] = True
             else:
                 optimizer_step_timer = self._start_phase_timer() if measure_performance else None
-                cross_view_snapshots = (
-                    _snapshot_local_parameters(cross_view_parameters)
-                    if cross_view_parameters
-                    else []
-                )
                 self.optimizer.step()
-                if cross_view_snapshots:
-                    grad_summary["vggto_cross_view"].update(
-                        _distributed_parameter_update_stats(
-                            cross_view_snapshots,
-                            device=self.device,
-                        )
-                    )
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 if measure_performance:
@@ -3201,18 +2365,17 @@ class MOTTrainer:
             "rng_states_by_rank": rng_states_by_rank,
             "metadata": {
                 "checkpoint_type": "dcp_sharded",
-                "vggto_attention_topology": MOT_VGGTO_TOPOLOGY,
+                "model_architecture": self.checkpoint_model_architecture,
                 "torch_version": str(torch.__version__),
                 "world_size": int(getattr(self.config, "world_size", 1)),
-                "optimization_composition": self.optimization_composition,
                 "max_views_per_gpu": int(self.config.max_views_per_gpu),
                 "masked_attn_backend": str(getattr(self.config, "masked_attn_backend", "fa4")),
                 "sampler_seed": int(getattr(self.config, "sampler_seed", 42)),
             },
         }
 
-    @staticmethod
-    def _validate_transformer_checkpoint_layout(checkpoint_path: Path) -> dict[str, Any]:
+    @classmethod
+    def _validate_transformer_checkpoint_layout(cls, checkpoint_path: Path) -> dict[str, Any]:
         required_files = (
             checkpoint_path / "_SUCCESS",
             checkpoint_path / MOT_CHECKPOINT_METADATA_NAME,
@@ -3234,10 +2397,8 @@ class MOTTrainer:
             )
         if metadata.get("checkpoint_type") != "mot_training":
             raise ValueError("MOT checkpoint metadata has an invalid checkpoint_type")
-        if metadata.get("vggto_attention_topology") != MOT_VGGTO_TOPOLOGY:
-            raise ValueError(
-                "MOT checkpoint does not use the synchronized multi-view VGGTO topology"
-            )
+        if metadata.get("model_architecture") != cls.checkpoint_model_architecture:
+            raise ValueError("MOT checkpoint is not compatible with the VA-only model")
         return metadata
 
     @classmethod
@@ -3271,12 +2432,8 @@ class MOTTrainer:
         metadata = training_state.get("metadata")
         if not isinstance(metadata, dict) or metadata.get("checkpoint_type") != "dcp_sharded":
             raise ValueError("MOT DCP trainer state has invalid checkpoint metadata")
-        if metadata.get("vggto_attention_topology") != MOT_VGGTO_TOPOLOGY:
-            raise ValueError(
-                "MOT DCP checkpoint does not use the synchronized multi-view VGGTO topology: "
-                f"checkpoint={metadata.get('vggto_attention_topology')!r}, "
-                f"current={MOT_VGGTO_TOPOLOGY!r}"
-            )
+        if metadata.get("model_architecture") != self.checkpoint_model_architecture:
+            raise ValueError("MOT DCP checkpoint is not compatible with the VA-only model")
         saved_torch_version = metadata.get("torch_version")
         if saved_torch_version != str(torch.__version__) and self.config.rank == 0:
             logger.warning(
@@ -3287,7 +2444,6 @@ class MOTTrainer:
 
         compatible_fields = {
             "world_size": int(getattr(self.config, "world_size", 1)),
-            "optimization_composition": self.optimization_composition,
             "max_views_per_gpu": int(self.config.max_views_per_gpu),
             "masked_attn_backend": str(getattr(self.config, "masked_attn_backend", "fa4")),
             "sampler_seed": int(getattr(self.config, "sampler_seed", 42)),
@@ -3373,8 +2529,7 @@ class MOTTrainer:
         metadata = {
             "format_version": MOT_DCP_FORMAT_VERSION,
             "checkpoint_type": "mot_training",
-            "vggto_attention_topology": MOT_VGGTO_TOPOLOGY,
-            "optimization_composition": self.optimization_composition,
+            "model_architecture": self.checkpoint_model_architecture,
             "has_full_state": bool(has_full_state),
         }
         with (checkpoint_dir / MOT_CHECKPOINT_METADATA_NAME).open("w", encoding="utf-8") as f:
@@ -3590,20 +2745,13 @@ class MOTTrainer:
             batch = self._get_next_batch()
             self._consume_runtime_cache_stats(batch)
             if should_write_performance:
-                has_pointcloud = batch.get("has_pointcloud")
                 skip_count = batch.get("dataset_skip_count")
-                pointcloud_samples = (
-                    int(torch.as_tensor(has_pointcloud).sum().item())
-                    if has_pointcloud is not None
-                    else 0
-                )
                 dataset_skip_count = (
                     int(torch.as_tensor(skip_count).sum().item())
                     if skip_count is not None
                     else 0
                 )
             else:
-                pointcloud_samples = 0
                 dataset_skip_count = 0
             data_fetch_time = (
                 time.perf_counter() - data_fetch_start
@@ -3666,84 +2814,29 @@ class MOTTrainer:
                         return summary[numerator] / den if den > 0 else float("nan")
 
                     data_metrics = {
-                        "data/pointcloud_sample_ratio": (
-                            summary["data_pointcloud_samples"]
-                            / (summary["data_pointcloud_samples"] + summary["data_pure_samples"])
-                            if summary["data_pointcloud_samples"] + summary["data_pure_samples"] > 0
-                            else float("nan")
-                        ),
                         "data/dataset_skip_total": self.dataset_skip_total,
-                        "data/source_pointcloud_count": summary["data_pointcloud_samples"],
-                        "data/source_pure_count": summary["data_pure_samples"],
                         "data/max_views_per_gpu": int(getattr(self.config, "max_views_per_gpu", 0)),
                         "data/native_views": int(losses["data_native_views"].item()),
                         "data/local_batch_size": int(losses["data_local_samples"].item()),
                         "data/global_sample_count": int(losses["data_local_samples"].item())
                         * int(getattr(self.config, "world_size", 1)),
                     }
-                    if "v" in self.optimization_branches:
-                        data_metrics.update(
-                            {
-                                "data/video_supervised_frame_ratio": ratio(
-                                    "data_video_supervised_num", "data_video_supervised_den"
-                                ),
-                                "data/video_valid_frame_ratio": ratio(
-                                    "data_video_valid_num", "data_video_valid_den"
-                                ),
-                            }
-                        )
-                    if "a" in self.optimization_branches:
-                        data_metrics.update(
-                            {
-                                "data/action_supervised_token_ratio": ratio(
-                                    "data_action_supervised_num", "data_action_supervised_den"
-                                ),
-                                "data/action_valid_token_ratio": ratio(
-                                    "data_action_valid_num", "data_action_valid_den"
-                                ),
-                            }
-                        )
-                    geometry_metrics = {}
-                    if "g" in self.optimization_branches:
-                        data_metrics.update(
-                            {
-                                "data/geometry_valid_slot_ratio": ratio(
-                                    "data_geometry_valid_slot_num", "data_geometry_valid_slot_den"
-                                ),
-                                "data/geometry_valid_pixel_ratio": ratio(
-                                    "data_geometry_valid_pixel_num", "data_geometry_valid_pixel_den"
-                                ),
-                                "data/geometry_active_ranks": float(
-                                    losses["geometry_global_active_ranks"].item()
-                                ),
-                            }
-                        )
-                        correlations = [
-                            summary[key]
-                            for key in (
-                                "depth_conf_error_correlation",
-                                "point_conf_error_correlation",
-                            )
-                            if key in summary and np.isfinite(summary[key])
-                        ]
-                        geometry_metrics = {
-                            "geometry/depth_error_p50": summary.get("depth_error_p50", float("nan")),
-                            "geometry/depth_error_p90": summary.get("depth_error_p90", float("nan")),
-                            "geometry/point_error_p50": summary.get("point_error_p50", float("nan")),
-                            "geometry/point_error_p90": summary.get("point_error_p90", float("nan")),
-                            "geometry/normal_angle_mean": summary.get("point_normal_angle_mean", float("nan")),
-                            "geometry/depth_conf_error_correlation": summary.get(
-                                "depth_conf_error_correlation", float("nan")
+                    data_metrics.update(
+                        {
+                            "data/video_supervised_frame_ratio": ratio(
+                                "data_video_supervised_num", "data_video_supervised_den"
                             ),
-                            "geometry/point_conf_error_correlation": summary.get(
-                                "point_conf_error_correlation", float("nan")
+                            "data/video_valid_frame_ratio": ratio(
+                                "data_video_valid_num", "data_video_valid_den"
                             ),
-                            "geometry/conf_error_correlation": (
-                                float(sum(correlations) / len(correlations))
-                                if correlations
-                                else float("nan")
+                            "data/action_supervised_token_ratio": ratio(
+                                "data_action_supervised_num", "data_action_supervised_den"
+                            ),
+                            "data/action_valid_token_ratio": ratio(
+                                "data_action_valid_num", "data_action_valid_den"
                             ),
                         }
+                    )
                     grad_clip_count = summary["grad_clip_count"]
                     learning_rates = self.lr_scheduler.get_last_lr()
                     optim_metrics = {
@@ -3758,25 +2851,12 @@ class MOTTrainer:
                             else float("nan")
                         ),
                         "optim/lr_main": learning_rates[0],
-                        "optim/lr_vggto": learning_rates[1] if len(learning_rates) > 1 else learning_rates[0],
                     }
                     train_metrics = {
                         "train/total_loss": summary["total_loss_raw"],
-                        "train/optimization_composition": self.optimization_composition,
-                        "train/execution_route": self.execution_route,
-                        "train/data_profile": self.execution_route,
+                        "train/weighted_video_loss": summary["weighted_video_loss_raw"],
+                        "train/weighted_action_loss": summary["weighted_action_loss_raw"],
                     }
-                    if "v" in self.optimization_branches:
-                        train_metrics["train/weighted_video_loss"] = summary["weighted_video_loss_raw"]
-                    if "a" in self.optimization_branches:
-                        train_metrics["train/weighted_action_loss"] = summary["weighted_action_loss_raw"]
-                    if "g" in self.optimization_branches:
-                        train_metrics.update(
-                            {
-                                "train/weighted_depth_loss": summary["weighted_depth_loss_raw"],
-                                "train/weighted_point_loss": summary["weighted_point_loss_raw"],
-                            }
-                        )
                     log_records = []
                     timing_records = []
                 step_in_accumulation = 0
@@ -3798,24 +2878,10 @@ class MOTTrainer:
                             "skipped": int(skipped_step),
                             "lr": f"{learning_rates[0]:.2e}",
                         }
-                        if "v" in self.optimization_branches:
-                            postfix.update(
-                                latent_loss=f"{summary['latent_loss_raw']:.4f}",
-                                video_w=f"{losses['video_loss_weight'].item():.3f}",
-                            )
-                        if "a" in self.optimization_branches:
-                            postfix.update(
-                                action_loss=f"{summary['action_loss_raw']:.4f}",
-                                action_w=f"{losses['action_loss_weight'].item():.3f}",
-                            )
-                        if "g" in self.optimization_branches:
-                            postfix.update(
-                                depth_loss=f"{summary['depth_loss_raw']:.4f}",
-                                point_loss=f"{summary['point_loss_raw']:.4f}",
-                                geo_w=f"{losses['geometry_loss_weight'].item():.3f}",
-                                depth_w=f"{losses['depth_loss_weight'].item():.3f}",
-                                point_w=f"{losses['point_loss_weight'].item():.3f}",
-                            )
+                        postfix.update(
+                            latent_loss=f"{summary['latent_loss_raw']:.4f}",
+                            action_loss=f"{summary['action_loss_raw']:.4f}",
+                        )
                         progress_bar.set_postfix(postfix)
                     if grad_summary:
                         logger.info("Gradient flow summary: " + json.dumps(grad_summary, sort_keys=True))
@@ -3833,56 +2899,12 @@ class MOTTrainer:
                                 grad_metrics[f"grad_flow/{group_name}_update_all_finite"] = float(
                                     values["update_all_finite"]
                                 )
-                        loss_metrics = {}
-                        if "v" in self.optimization_branches:
-                            loss_metrics.update(
-                                {
-                                    "loss_metrics/global_avg_video_loss": summary["latent_loss_raw"],
-                                    "loss_metrics/global_max_video_loss": summary["max_latent_loss_raw"],
-                                    "loss_metrics/video_loss_weight": float(losses["video_loss_weight"].item()),
-                                }
-                            )
-                        if "a" in self.optimization_branches:
-                            loss_metrics.update(
-                                {
-                                    "loss_metrics/global_avg_action_loss": summary["action_loss_raw"],
-                                    "loss_metrics/global_max_action_loss": summary["max_action_loss_raw"],
-                                    "loss_metrics/action_loss_weight": float(losses["action_loss_weight"].item()),
-                                }
-                            )
-                        if "g" in self.optimization_branches:
-                            loss_metrics.update(
-                                {
-                                    "loss_metrics/global_avg_depth_loss": summary["depth_loss_raw"],
-                                    "loss_metrics/global_avg_point_loss": summary["point_loss_raw"],
-                                    "loss_metrics/global_max_depth_loss": summary["max_depth_loss_raw"],
-                                    "loss_metrics/global_max_point_loss": summary["max_point_loss_raw"],
-                                    "loss_metrics/geometry_loss_weight": float(
-                                        losses["geometry_loss_weight"].item()
-                                    ),
-                                    "loss_metrics/geometry_active_rank_scale": float(
-                                        losses["geometry_active_rank_scale"].item()
-                                    ),
-                                    "loss_metrics/depth_loss_weight": float(losses["depth_loss_weight"].item()),
-                                    "loss_metrics/point_loss_weight": float(losses["point_loss_weight"].item()),
-                                    **{
-                                        f"loss_metrics/{key}": summary[key]
-                                        for key in (
-                                            "loss_conf_depth",
-                                            "loss_reg_depth",
-                                            "loss_grad_depth",
-                                            "depth_conf_mean",
-                                            "depth_conf_max",
-                                            "loss_conf_point",
-                                            "loss_reg_point",
-                                            "loss_grad_point",
-                                            "point_conf_mean",
-                                            "point_conf_max",
-                                        )
-                                        if key in summary
-                                    },
-                                }
-                            )
+                        loss_metrics = {
+                            "loss_metrics/global_avg_video_loss": summary["latent_loss_raw"],
+                            "loss_metrics/global_avg_action_loss": summary["action_loss_raw"],
+                            "loss_metrics/video_loss_weight": float(losses["video_loss_weight"].item()),
+                            "loss_metrics/action_loss_weight": float(losses["action_loss_weight"].item()),
+                        }
                         self.wandb.log(
                             {
                                 **loss_metrics,
@@ -3890,7 +2912,6 @@ class MOTTrainer:
                                 "lr": learning_rates[0],
                                 **train_metrics,
                                 **optim_metrics,
-                                **geometry_metrics,
                                 **performance,
                                 **data_metrics,
                                 **grad_metrics,
@@ -3940,7 +2961,6 @@ class MOTTrainer:
                     {
                         "data_fetch": data_fetch_time,
                         "data_barrier": data_barrier_time,
-                        "pointcloud_samples": pointcloud_samples,
                         "dataset_skip_count": dataset_skip_count,
                         "local_samples": int(losses["data_local_samples"].item()),
                         "native_views": int(losses["data_native_views"].item()),
@@ -4012,7 +3032,7 @@ def run(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train 3DVA_MOT for robotics")
+    parser = argparse.ArgumentParser(description="Train VA_MOT for robotics")
     parser.add_argument(
         "--config-name",
         type=str,

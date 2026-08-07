@@ -10,7 +10,7 @@ import torch
 from distillation.checkpoint import DistillationCheckpointIO
 from distillation.mask_profile import validate_checkpoint_generation_profile
 from distillation.model.autoregressive_mot import (
-    AutoregressiveThreeDVAMOTTransformer3DModel,
+    AutoregressiveVAMOTTransformer3DModel,
 )
 from distillation.schema import TrainingStepResult
 from wan_va.train_mot import MOTTrainer
@@ -32,18 +32,19 @@ class DistillationTrainerBase(MOTTrainer):
     2. RGB batch 含 ``vae_rgb_history`` 与 ``vae_rgb_target``，调用父类 streaming
        VAE 逐 batch/逐 view 编码，再沿 frame 轴拼成同样的 8-frame latent。
 
-    ``actions [B,20,8,16,1]``、V/A loss/valid mask、text embedding、geometry
-    RGB/point/mask 和 ``stream_ids [B,V]`` 都继续来自原生 MOT dataset/collate。
+    ``actions [B,20,8,16,1]``、V/A loss/valid mask、text embedding 和
+    ``stream_ids [B,V]`` 都继续来自原生 MOT dataset/collate。
     ``convert_input_format`` 先递归搬 tensor 到当前 rank device；
     ``_materialize_batch_latents`` 只在缺少 cached latent 时调用 VAE。蒸馏代码
-    不伪造真实 RGB/geometry schema，也不复制 dataset 逻辑。
+    不复制 dataset 逻辑。
 
     本类只接管 stage-specific loss、双 optimizer/EMA hook 和 checkpoint；外层
     epoch/step、view-aware sampler、日志、NaN 同步仍复用 ``MOTTrainer.train``。
     """
 
     method: str
-    transformer_model_cls = AutoregressiveThreeDVAMOTTransformer3DModel
+    checkpoint_model_architecture = "autoregressive_va_mot_v1"
+    transformer_model_cls = AutoregressiveVAMOTTransformer3DModel
 
     def _load_transformer(self):
         # MOTTrainer applies activation checkpoint wrappers after this hook.
@@ -175,11 +176,6 @@ class DistillationTrainerBase(MOTTrainer):
     @staticmethod
     def _data_metrics(batch: dict, reference: torch.Tensor) -> dict[str, torch.Tensor]:
         batch_size = batch["latents"].shape[0]
-        has_pointcloud = batch.get("has_pointcloud")
-        if has_pointcloud is None:
-            has_pointcloud = batch["geometry_group_valid_mask"].reshape(batch_size, -1).any(1)
-        has_pointcloud = torch.as_tensor(has_pointcloud, device=reference.device, dtype=torch.bool)
-
         skip_count = batch.get("dataset_skip_count")
         if skip_count is None:
             skip_count = reference.new_zeros(batch_size)
@@ -190,8 +186,6 @@ class DistillationTrainerBase(MOTTrainer):
         action_loss_mask = batch["action_loss_mask"]
         action_valid_mask = batch["action_valid_mask"]
         return {
-            "data_pointcloud_samples": has_pointcloud.sum().float(),
-            "data_pure_samples": (~has_pointcloud).sum().float(),
             "data_dataset_skip_count": skip_count.sum().float(),
             "data_local_samples": reference.new_tensor(batch_size, dtype=torch.float32),
             "data_native_views": reference.new_tensor(batch["latents"].shape[3], dtype=torch.float32),

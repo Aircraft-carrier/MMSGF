@@ -57,7 +57,6 @@ class SelfGradientForcingDMDTrainer(DistillationTrainerBase):
         param_groups = build_mot_param_groups(
             self.method_model.fake_score,
             base_lr=config.learning_rate,
-            vggto_lr_multiplier=config.vggto_lr_multiplier,
             weight_decay=config.weight_decay,
         )
         optimizer = torch.optim.AdamW(

@@ -35,9 +35,7 @@ _MOT_CONFIG_PATH = _DATASET_ROOT / "meta" / "mot_config.json"
 def _default_mot_config() -> dict:
     return {
         "format": "umi_mot_real_train",
-        "mot_manifest_path": str(_DATASET_ROOT / "meta" / "mot_final_training_pointcloud_manifest.jsonl"),
-        "non_pointcloud_manifest_path": None,
-        "pointcloud_sample_period": 8,
+        "mot_manifest_path": str(_DATASET_ROOT / "meta" / "mot_final_training_manifest.jsonl"),
         "empty_emb_path": str(_DATASET_ROOT / "empty_emb.pt"),
         "text_emb_cache_path": str(_DATASET_ROOT / "text_emb_cache.pt"),
         "obs_cam_keys": ["observation.images.robot_0", "observation.images.robot_1"],
@@ -76,16 +74,6 @@ _ACTION_CACHE_MANIFEST = os.getenv(
     "MOT_ACTION_CACHE_MANIFEST",
     _mot_config.get("action_cache_manifest_path") or "",
 )
-_POINTCLOUD_SAMPLE_PERIOD = int(
-    os.getenv(
-        "MOT_POINTCLOUD_SAMPLE_PERIOD",
-        str(_mot_config.get("pointcloud_sample_period", 8)),
-    )
-)
-if _POINTCLOUD_SAMPLE_PERIOD <= 0:
-    raise ValueError("MOT_POINTCLOUD_SAMPLE_PERIOD must be a positive integer")
-
-
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -131,25 +119,13 @@ va_umi_3dwam_train_cfg.eval_cfg = make_mot_eval_cfg(
     wan22_model_root=va_umi_3dwam_train_cfg.wan22_pretrained_model_name_or_path,
     mode=os.getenv("MOT_EVAL_MODE", "video"),
 )
-_VGGTO_CHECKPOINT_PATH = os.getenv("VGGTO_CHECKPOINT_PATH")
-va_umi_3dwam_train_cfg.vggto_checkpoint_path = _VGGTO_CHECKPOINT_PATH
-_VGGT_CHECKPOINT_PATH = os.getenv("VGGT_CHECKPOINT_PATH")
-va_umi_3dwam_train_cfg.vggt_checkpoint_path = _VGGT_CHECKPOINT_PATH
-
 # Dataset fields are read from the generated MOT dataset metadata.
 va_umi_3dwam_train_cfg.dataset_path = str(_DATASET_ROOT)
 va_umi_3dwam_train_cfg.mot_config_path = str(_MOT_CONFIG_PATH)
 va_umi_3dwam_train_cfg.mot_manifest_path = _prefer_local_path(
-    "meta/mot_final_training_pointcloud_manifest.jsonl",
+    "meta/mot_final_training_manifest.jsonl",
     _mot_config["mot_manifest_path"],
 )
-_non_pointcloud_manifest_path = _mot_config.get("non_pointcloud_manifest_path")
-va_umi_3dwam_train_cfg.non_pointcloud_manifest_path = (
-    _prefer_local_path("meta/mot_final_training_non_pointcloud_manifest.jsonl", _non_pointcloud_manifest_path)
-    if _non_pointcloud_manifest_path
-    else None
-)
-va_umi_3dwam_train_cfg.pointcloud_sample_period = _POINTCLOUD_SAMPLE_PERIOD
 va_umi_3dwam_train_cfg.empty_emb_path = _prefer_local_path("empty_emb.pt", _mot_config["empty_emb_path"])
 va_umi_3dwam_train_cfg.text_emb_cache_path = _prefer_local_path(
     "text_emb_cache.pt",
@@ -179,7 +155,7 @@ va_umi_3dwam_train_cfg.height = 224
 va_umi_3dwam_train_cfg.width = 224
 
 # MOT-specific training controls.
-va_umi_3dwam_train_cfg.model_type = "3dva_mot"
+va_umi_3dwam_train_cfg.model_type = "va_mot"
 va_umi_3dwam_train_cfg.dataset_type = "mot_real_lerobot"
 va_umi_3dwam_train_cfg.num_steps = int(os.getenv("MOT_NUM_STEPS", "1000000"))
 va_umi_3dwam_train_cfg.save_interval = int(os.getenv("MOT_SAVE_INTERVAL", "2000"))
@@ -194,9 +170,6 @@ va_umi_3dwam_train_cfg.masked_attn_backend = "fa4"
 va_umi_3dwam_train_cfg.init_noise_seed = 42
 va_umi_3dwam_train_cfg.train_seed = int(os.getenv("MOT_TRAIN_SEED", "42"))
 va_umi_3dwam_train_cfg.sampler_seed = 42
-va_umi_3dwam_train_cfg.vggto_cross_view_init_scale = float(
-    os.getenv("VGGTO_CROSS_VIEW_INIT_SCALE", "0.1")
-)
 va_umi_3dwam_train_cfg.log_interval = int(os.getenv("MOT_LOG_INTERVAL", "100"))
 va_umi_3dwam_train_cfg.performance_jsonl_enabled = False
 va_umi_3dwam_train_cfg.performance_jsonl_interval = 1
@@ -207,26 +180,12 @@ va_umi_3dwam_train_cfg.dataloader_pin_memory = True
 va_umi_3dwam_train_cfg.dataloader_prefetch_factor = 2
 # Limits apply to each MotTrainData instance in every persistent worker.
 va_umi_3dwam_train_cfg.video_decoder_cache_size = int(os.getenv("MOT_VIDEO_DECODER_CACHE_SIZE", "256"))
-va_umi_3dwam_train_cfg.point_store_cache_size = int(os.getenv("MOT_POINT_STORE_CACHE_SIZE", "2"))
 va_umi_3dwam_train_cfg.action_cache_size = int(os.getenv("MOT_ACTION_CACHE_SIZE", "2176"))
 va_umi_3dwam_train_cfg.memory_jsonl_enabled = False
 va_umi_3dwam_train_cfg.memory_jsonl_interval = 100
 va_umi_3dwam_train_cfg.memory_smaps_interval = 500
 va_umi_3dwam_train_cfg.video_loss_weight = 1.0
 va_umi_3dwam_train_cfg.action_loss_weight = 1.0
-va_umi_3dwam_train_cfg.geometry_loss_weight = 1.0
-va_umi_3dwam_train_cfg.depth_loss_weight = 1.0
-va_umi_3dwam_train_cfg.gradient_loss_fn = "grad"
-va_umi_3dwam_train_cfg.point_loss_weight = 1.0
-va_umi_3dwam_train_cfg.point_gradient_loss_fn = "normal"
-va_umi_3dwam_train_cfg.optimization_composition = os.getenv(
-    "MOT_OPTIMIZATION_COMPOSITION",
-    "vag",
-).strip().lower()
-va_umi_3dwam_train_cfg.valid_range = 0.98
-va_umi_3dwam_train_cfg.gamma = 1.0
-va_umi_3dwam_train_cfg.alpha = 0.2
-va_umi_3dwam_train_cfg.vggto_lr_multiplier = 0.1
 va_umi_3dwam_train_cfg.wandb_name = "umi_subset3k_newmot_stage2_video_only_0724"
 va_umi_3dwam_train_cfg.wandb_mode = "offline"
 va_umi_3dwam_train_cfg.action_norm_method = "quantiles"

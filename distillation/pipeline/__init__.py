@@ -4,7 +4,6 @@ from __future__ import annotations
 from distillation.pipeline.utils import (
     VAPrediction,
     add_noise_to_va,
-    hide_target_geometry,
     mask_clean_targets,
     replace_va_streams,
 )
@@ -25,7 +24,6 @@ __all__ = [
     "SelfGradientForcingTrainingPipeline",
     "VAPrediction",
     "add_noise_to_va",
-    "hide_target_geometry",
     "mask_clean_targets",
     "replace_va_streams",
 ]

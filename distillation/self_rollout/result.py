@@ -13,8 +13,6 @@ class RolloutResult:
     target_latents: torch.Tensor
     pred_actions: torch.Tensor
     target_actions: torch.Tensor
-    pred_geometry_rgb: torch.Tensor
-    target_geometry_rgb: torch.Tensor
     action_valid_mask: torch.Tensor
     chunk_pairs: int
     chunk_frames: int

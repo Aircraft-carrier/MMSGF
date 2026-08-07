@@ -8,14 +8,13 @@ from wan_va.configs import VA_CONFIGS
 
 consistency_distillation_cfg = EasyDict(copy.deepcopy(VA_CONFIGS["umi_3dwam_train"]))
 apply_distillation_runtime_overrides(consistency_distillation_cfg)
-consistency_distillation_cfg.optimization_composition = "va"
 consistency_distillation_cfg.cfg_prob = 0.0
 consistency_distillation_cfg.distill = EasyDict(
     method="consistency_distillation",
-    model_architecture="autoregressive_mot_v1",
+    model_architecture="autoregressive_va_mot_v1",
     # distillation wrapper 在原生 metadata 上应用两段式 order；不改变物理 packing。
     generation_shape={
-        "profile_name": "segmented_history_strict_geometry_v1",
+        "profile_name": "segmented_history_va_v1",
         "order_mode": "segmented",
         "history_frames": 4,
         "chunk_size": 4,

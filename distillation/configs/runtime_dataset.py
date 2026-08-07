@@ -45,10 +45,7 @@ def _existing_path(value: str | None, *, roots: tuple[Path, ...] = ()) -> str | 
 
 
 def _first_manifest_norm_stats_key(source_root: Path) -> str | None:
-    for name in (
-        "mot_final_training_pointcloud_manifest.jsonl",
-        "mot_final_training_non_pointcloud_manifest.jsonl",
-    ):
+    for name in ("mot_final_training_manifest.jsonl",):
         path = source_root / "meta" / name
         if not path.is_file():
             continue
@@ -100,10 +97,7 @@ def prepare_distillation_dataset_config() -> None:
     shadow_meta = shadow_root / "meta"
     shadow_meta.mkdir(parents=True, exist_ok=True)
 
-    for name in (
-        "mot_final_training_pointcloud_manifest.jsonl",
-        "mot_final_training_non_pointcloud_manifest.jsonl",
-    ):
+    for name in ("mot_final_training_manifest.jsonl",):
         src = source_root / "meta" / name
         if src.is_file():
             _link_or_copy(src, shadow_meta / name)
@@ -129,10 +123,7 @@ def prepare_distillation_dataset_config() -> None:
         mot_config["norm_stats_key"] = str(default_norm_key)
 
     mot_config["mot_manifest_path"] = str(
-        shadow_meta / "mot_final_training_pointcloud_manifest.jsonl"
-    )
-    mot_config["non_pointcloud_manifest_path"] = str(
-        shadow_meta / "mot_final_training_non_pointcloud_manifest.jsonl"
+        shadow_meta / "mot_final_training_manifest.jsonl"
     )
 
     text_cache_root = repo_root / "train_logs" / "distill_assets" / "text_cache"

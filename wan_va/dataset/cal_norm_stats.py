@@ -285,7 +285,7 @@ def cal_real_mot_norm_stats(
     loaded_selection = load_real_mot_training_selection(selection_root)
     selection_config = loaded_selection.config
     action_chunk_size = int(action_chunk_size)
-    selected_rows = loaded_selection.pointcloud_rows + loaded_selection.non_pointcloud_rows
+    selected_rows = loaded_selection.rows
     selected_task_uids = {str(row["task_uid"]) for row in selected_rows}
     rows_by_task: dict[str, list[dict[str, Any]]] = {}
     for row in selected_rows:
@@ -386,8 +386,7 @@ def cal_real_mot_norm_stats(
     return {
         "selection_root": loaded_selection.selection_root,
         "base_root": Path(selection_config["base_root"]).resolve(),
-        "num_pointcloud_samples": len(loaded_selection.pointcloud_rows),
-        "num_non_pointcloud_samples": len(loaded_selection.non_pointcloud_rows),
+        "num_samples": len(loaded_selection.rows),
         "num_tasks": len(task_stats),
         "num_existing_tasks": existing_task_count,
         "num_computed_tasks": computed_task_count,
@@ -410,7 +409,7 @@ def _resolve_dataset_path(dataset_root: Path, value: str | None) -> Path | None:
 
 def _rows_from_mot_config(dataset_root: Path, mot_config: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for key in ("mot_manifest_path", "non_pointcloud_manifest_path"):
+    for key in ("mot_manifest_path",):
         manifest_path = _resolve_dataset_path(dataset_root, mot_config.get(key))
         if manifest_path is not None and manifest_path.is_file():
             rows.extend(_read_jsonl(manifest_path))

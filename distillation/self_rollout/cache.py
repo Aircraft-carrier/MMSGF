@@ -35,28 +35,6 @@ class KVCacheSnapshot:
     transactions: dict[int, dict[int, tuple[KVSegment, ...]]]
 
 
-@dataclass(slots=True)
-class EncodedGeometryFrame:
-    frame_id: int
-    rgb: torch.Tensor
-    final_tokens: torch.Tensor
-    patch_hw: tuple[int, int]
-    image_hw: tuple[int, int]
-    patch_token_start: int
-    cached_outputs: list[torch.Tensor | None]
-    layer_registers: dict[int, torch.Tensor]
-    depth: torch.Tensor | None = None
-    depth_conf: torch.Tensor | None = None
-    points: torch.Tensor | None = None
-    points_conf: torch.Tensor | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class GeometryCacheSnapshot:
-    relation_cache: KVCacheSnapshot
-    frames: dict[int, EncodedGeometryFrame]
-
-
 class SelfRolloutKVCache:
     """Append-only per-layer cache with explicit transaction lifetimes."""
 
@@ -304,29 +282,3 @@ class SelfRolloutKVCache:
                 f"stream={int(stream_id)}, source={int(source_id)}, "
                 f"version={int(version_id)}: " + "; ".join(missing)
             )
-
-
-class GeometryRolloutCache:
-    def __init__(self) -> None:
-        self.relation_cache = SelfRolloutKVCache()
-        self.frames: dict[int, EncodedGeometryFrame] = {}
-
-    def snapshot(self) -> GeometryCacheSnapshot:
-        return GeometryCacheSnapshot(
-            relation_cache=self.relation_cache.snapshot(),
-            frames=dict(self.frames),
-        )
-
-    def restore(self, snapshot: GeometryCacheSnapshot | None) -> None:
-        if snapshot is None:
-            self.relation_cache = SelfRolloutKVCache()
-            self.frames = {}
-            return
-        self.relation_cache.restore(snapshot.relation_cache)
-        self.frames = dict(snapshot.frames)
-
-    def truncate_from(self, frame_id: int) -> None:
-        self.relation_cache.truncate_from(frame_id)
-        self.frames = {
-            index: frame for index, frame in self.frames.items() if index < int(frame_id)
-        }

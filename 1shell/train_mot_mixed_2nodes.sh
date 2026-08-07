@@ -25,8 +25,6 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WAN22_PRETRAINED_MODEL_PATH="${WAN22_PRETRAINED_MODEL_PATH:-/workspace/cache/huggingface_cache/hub/models--robbyant--lingbot-va-base/snapshots/68b7bc1b35da6ddc67ea94c4ceb58d768fbb3f9c}"
-export VGGTO_CHECKPOINT_PATH="${VGGTO_CHECKPOINT_PATH:-/workspace/model/vggt-omega/vggt_omega_1b_512.pt}"
-export VGGT_CHECKPOINT_PATH="${VGGT_CHECKPOINT_PATH:-/workspace/model/vggt/model.safetensors}"
 
 CONFIG_NAME="${CONFIG_NAME:-umi_3dwam_train}"
 PYTHON_BIN="${PYTHON_BIN:-/workspace/basics/miniconda3/envs/lingbotVA/bin/python}"

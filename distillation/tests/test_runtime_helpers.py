@@ -33,16 +33,13 @@ class _ShardModule(nn.Module):
         self.events.append(f"reshard:{self.name}")
 
 
-def test_temporary_backend_restores_all_target_attributes() -> None:
+def test_temporary_backend_restores_target_attribute() -> None:
     model = _BackendModule("fa4")
-    model.vggto = _BackendModule(None)
 
     with temporary_masked_attention_backend(model, "dense"):
         assert model.masked_attn_backend == "dense"
-        assert model.vggto.masked_attn_backend == "dense"
 
     assert model.masked_attn_backend == "fa4"
-    assert not hasattr(model.vggto, "masked_attn_backend")
 
 
 def test_temporary_backend_rejects_unknown_backend() -> None:

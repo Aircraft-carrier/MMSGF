@@ -28,7 +28,7 @@ class ConsistencyTrainingPipeline:
     - action ``[B,20,8,16,1]``；20 是 action channel，16 是每 latent frame
       打包的 action token 数；
     - video loss mask ``[B,8]``；action loss mask 与 action 同形；
-    - text/geometry/stream_ids 不在本类重建，原样复用 MOTTrainer 的输入。
+    - text/stream_ids 不在本类重建，原样复用 MOTTrainer 的输入。
 
     为便于人工手算，可以把它缩小成 ``B=1,Cv=1,F=2,Ca=1``：frame0 是
     condition，frame1 是监督位置。假设 frame1 ``x0=2, noise=6, sigma=0.75``，
@@ -168,7 +168,7 @@ class ConsistencyTrainingPipeline:
         """
         trainer = self.trainer
 
-        # 1) 复用原生 input builder 做 dtype、mask、text、geometry、stream id 和
+        # 1) 复用原生 input builder 做 dtype、mask、text、stream id 和
         #    attention-window 校验；不让它生成 AR noise，因为下面马上会生成
         #    consistency 专用的同一条 (x_t -> x_t_next) trajectory。
         base_input = trainer._prepare_joint_input_dict(batch, add_noise=False)

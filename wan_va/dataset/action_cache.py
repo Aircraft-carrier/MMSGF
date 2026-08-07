@@ -72,7 +72,6 @@ def _collect_data_files(dataset_root: Path, mot_config: dict[str, Any]) -> list[
     data_files: set[Path] = set()
     manifest_values = [
         mot_config.get("mot_manifest_path"),
-        mot_config.get("non_pointcloud_manifest_path"),
     ]
     for manifest_value in manifest_values:
         manifest_path = _resolve_dataset_path(dataset_root, manifest_value)

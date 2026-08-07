@@ -25,7 +25,7 @@ from distillation.schema import CheckpointMetadata
 from wan_va.checkpoint_retention import prune_successful_checkpoints
 
 MOT_DCP_DIR_NAME = "distributed_state"
-CHECKPOINT_FORMAT_VERSION = 2
+CHECKPOINT_FORMAT_VERSION = 3
 
 
 def find_latest_successful_checkpoint(checkpoint_root: Path) -> Path | None:
@@ -175,7 +175,7 @@ class DistillationCheckpointIO:
             getattr(
                 trainer.config.distill,
                 "model_architecture",
-                "autoregressive_mot_v1",
+                "autoregressive_va_mot_v1",
             )
         )
         if getattr(metadata, "model_architecture", expected_architecture) != expected_architecture:
@@ -323,7 +323,7 @@ class DistillationCheckpointIO:
         # 先调用 MOT 原生 writer，保证这个 distillation export 可以直接作为
         # 下一阶段的 ``student_init`` / ``fake_score_init``。尤其是 stage3 加载
         # stage2 时，``_validate_transformer_checkpoint_layout`` 会严格检查
-        # checkpoint_type、VGGTO topology 和 optimization composition。
+        # checkpoint_type 和纯 VA model architecture。
         trainer._write_checkpoint_metadata(temp_dir, has_full_state=True)
         base_metadata = json.loads(
             (temp_dir / "checkpoint_metadata.json").read_text(encoding="utf-8")
@@ -332,8 +332,13 @@ class DistillationCheckpointIO:
         metadata = CheckpointMetadata(
             format_version=int(base_metadata["format_version"]),
             checkpoint_type=str(base_metadata["checkpoint_type"]),
-            vggto_attention_topology=str(base_metadata["vggto_attention_topology"]),
-            optimization_composition=str(base_metadata["optimization_composition"]),
+            model_architecture=str(
+                getattr(
+                    trainer.config.distill,
+                    "model_architecture",
+                    "autoregressive_va_mot_v1",
+                )
+            ),
             has_full_state=bool(base_metadata["has_full_state"]),
             distill_method=trainer.method,
             exported_model=(
@@ -344,13 +349,6 @@ class DistillationCheckpointIO:
             step=int(trainer.step),
             optimizer_step=int(trainer.optimizer_step),
             generation_profile=generation_profile_contract(shape),
-            model_architecture=str(
-                getattr(
-                    trainer.config.distill,
-                    "model_architecture",
-                    "autoregressive_mot_v1",
-                )
-            ),
         )
         (temp_dir / "checkpoint_metadata.json").write_text(
             json.dumps(asdict(metadata), indent=2),

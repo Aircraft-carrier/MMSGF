@@ -49,7 +49,7 @@ def replace_va_streams(
 
     ``_prepare_joint_input_dict(add_noise=False)`` intentionally omits the native
     autoregressive ``targets`` tensors because distillation computes its losses
-    outside ``ThreeDVAMOTTransformer3DModel``.  The model's train forward still
+    outside ``VAMOTTransformer3DModel``.  The model's train forward still
     reads ``action_dict["targets"].shape`` when reshaping its output, so the
     adapter must keep that structural key.  The value below is only a shape
     carrier; consistency/replay/DMD losses never read it.
@@ -60,7 +60,7 @@ def replace_va_streams(
     - ``noisy.action`` / ``clean.action``: ``[B,Ca,F,N,1]``;
     - ``timesteps.video`` / ``timesteps.action``: ``[B,F]``.
 
-    The returned dictionaries preserve text, masks, geometry and attention-window
+    The returned dictionaries preserve text, masks and attention-window
     metadata from ``base_input`` and replace only the V/A trajectory fields.
     """
     latent_dict = {
@@ -98,18 +98,6 @@ def replace_text_condition(input_dict: dict, text_emb: torch.Tensor) -> dict:
             "text_emb": text_emb,
         },
     }
-
-
-def hide_target_geometry(input_dict: dict, target_mask: torch.Tensor) -> dict:
-    geometry = dict(input_dict["geometry_dict"])
-    rgb = geometry["rgb"].clone()
-    rgb[target_mask] = 0
-    geometry["rgb"] = rgb
-
-    slot_mask = geometry["slot_valid_mask"].clone()
-    slot_mask[target_mask] = False
-    geometry["slot_valid_mask"] = slot_mask
-    return {**input_dict, "geometry_dict": geometry}
 
 
 def mask_clean_targets(
