@@ -145,16 +145,14 @@ def test_ar_mot_incremental_forward_runs_through_cpu_fsdp(tmp_path) -> None:
             version_id=1,
         )
         request = AutoregressiveMOTLayerRequest(
-            streams=[
-                AutoregressiveStreamInput(
-                    hidden,
-                    conditioning,
-                    None,
-                    metadata,
-                    "video",
-                )
-            ],
-            hidden_states=[hidden],
+            stream=AutoregressiveStreamInput(
+                hidden,
+                conditioning,
+                None,
+                metadata,
+                "video",
+            ),
+            hidden_state=hidden,
             text=torch.randn(1, 3, 4),
             state=RolloutState(),
             transaction_id=1,
@@ -162,9 +160,8 @@ def test_ar_mot_incremental_forward_runs_through_cpu_fsdp(tmp_path) -> None:
             stream_id=STREAM_VIDEO,
         )
         output = block(request)
-        assert len(output) == 1
-        assert output[0].shape == hidden.shape
-        assert not isinstance(output[0], DTensor)
+        assert output.shape == hidden.shape
+        assert not isinstance(output, DTensor)
     finally:
         dist.destroy_process_group()
 

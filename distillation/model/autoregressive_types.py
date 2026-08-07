@@ -105,13 +105,13 @@ class AutoregressiveStreamInput:
 class AutoregressiveMOTLayerRequest:
     """Internal request consumed by one AR MoT block forward."""
 
-    streams: list[Any]
-    hidden_states: list[torch.Tensor]
+    stream: Any
+    hidden_state: torch.Tensor
     text: torch.Tensor
     state: Any
     transaction_id: int
     layer_id: int
-    stream_id: int | None = None
+    stream_id: int
 
 
 @dataclass(slots=True)

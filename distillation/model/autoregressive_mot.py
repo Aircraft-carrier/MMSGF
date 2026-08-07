@@ -39,30 +39,24 @@ class AutoregressiveThreeDVAMOTBlock(ThreeDVAMOTBlock):
 
     def forward_incremental(self, request: AutoregressiveMOTLayerRequest):
         from distillation.self_rollout.attention import (
-            STREAM_GEOMETRY,
             build_cache_selection,
             indexed_attention,
         )
         from distillation.self_rollout.cache import KVSegment
 
-        streams = request.streams
-        hidden_states = request.hidden_states
-        current_meta = streams[0].metadata
-        if len(streams) > 1:
-            from distillation.self_rollout.attention import TokenMetadataBatch
-
-            current_meta = TokenMetadataBatch.cat([stream.metadata for stream in streams])
-        qkv_parts = []
-        modulations = []
-        blocks = []
-        for stream, hidden in zip(streams, hidden_states):
-            block = self.video_block if stream.block_kind == "video" else self.action_block
-            modulation = self._modulation(block, stream.conditioning)
-            qkv_parts.append(self._self_qkv(block, hidden, modulation, stream.rotary))
-            blocks.append(block)
-            modulations.append(modulation)
-        query, current_key, current_value = (
-            torch.cat(parts, dim=1) for parts in zip(*qkv_parts)
+        stream = request.stream
+        hidden = request.hidden_state
+        block = (
+            self.video_block
+            if stream.block_kind == "video"
+            else self.action_block
+        )
+        modulation = self._modulation(block, stream.conditioning)
+        query, current_key, current_value = self._self_qkv(
+            block,
+            hidden,
+            modulation,
+            stream.rotary,
         )
         request.state.mot_cache.append_transaction(
             request.layer_id,
@@ -70,7 +64,7 @@ class AutoregressiveThreeDVAMOTBlock(ThreeDVAMOTBlock):
             KVSegment(
                 current_key,
                 current_value,
-                current_meta,
+                stream.metadata,
                 stream_id=request.stream_id,
             ),
         )
@@ -79,7 +73,7 @@ class AutoregressiveThreeDVAMOTBlock(ThreeDVAMOTBlock):
             layer_id,
             transaction_id=request.transaction_id,
         )
-        query_valid, key_valid = build_cache_selection(current_meta, key_meta)
+        query_valid, key_valid = build_cache_selection(stream.metadata, key_meta)
         attention_output, _ = indexed_attention(
             query,
             key,
@@ -87,8 +81,6 @@ class AutoregressiveThreeDVAMOTBlock(ThreeDVAMOTBlock):
             query_valid=query_valid,
             key_valid=key_valid,
         )
-        lengths = [hidden.shape[1] for hidden in hidden_states]
-        attention_parts = torch.split(attention_output, lengths, dim=1)
         text_attn = self.video_block.attn2
         text_key = text_attn.norm_k(text_attn.to_k(request.text)).unflatten(
             2, (text_attn.heads, -1)
@@ -96,22 +88,15 @@ class AutoregressiveThreeDVAMOTBlock(ThreeDVAMOTBlock):
         text_value = text_attn.to_v(request.text).unflatten(
             2, (text_attn.heads, -1)
         )
-        updated = []
-        for block, hidden, attended, modulation in zip(
-            blocks, hidden_states, attention_parts, modulations
-        ):
-            self_output = self._attention_output(block.attn1, attended)
-            updated.append(
-                self._finish_block(
-                    block,
-                    hidden,
-                    self_output,
-                    modulation,
-                    text_key,
-                    text_value,
-                )
-            )
-        return updated
+        self_output = self._attention_output(block.attn1, attention_output)
+        return self._finish_block(
+            block,
+            hidden,
+            self_output,
+            modulation,
+            text_key,
+            text_value,
+        )
 
     def forward_geometry_incremental(self, request: AutoregressiveGeometryJointRequest):
         from distillation.self_rollout.attention import (
@@ -264,7 +249,7 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
         metadata.order_ids = torch.where(
             metadata.stream_ids == 1,
             action_order[metadata.frame_ids],
-            frame_order,
+            frame_order, # action 是独立的， video 和 geometry 是共享的
         )
         metadata.cache_key = None
         metadata.structure_cache_key = None
@@ -351,13 +336,48 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
         h_tokens: int,
         w_tokens: int,
     ) -> torch.Tensor:
+        # LINK: distillation/model/autoregressive_mot.py:890
+        # 输入：
+        # frame_ids 通常形状为 [B, F]
+        # B = batch size
+        # F = 当前样本包含的帧数
+        #
+        # frame_ids[b, f] 表示第 b 个样本中第 f 个视频位置
+        # 实际对应的帧编号。
+        #
+        # 例如：
+        # frame_ids =
+        # [[0, 1, 2],
+        #  [5, 6, 7]]
+        #
+        # 说明 batch 中第 0 个样本使用第 0、1、2 帧，
+        # 第 1 个样本使用第 5、6、7 帧。
         batch_size, frames = frame_ids.shape
         device = frame_ids.device
+        # 阶段 1/4：创建空间方向的 token 坐标
+        #
+        # height: [0, 1, ..., h_tokens-1]，形状 [H]
+        # width:  [0, 1, ..., w_tokens-1]，形状 [W]
+        #
+        # 使用 float32，是因为后面的 self.rope 可能需要浮点位置坐标。
         height = torch.arange(h_tokens, device=device, dtype=torch.float32)
         width = torch.arange(w_tokens, device=device, dtype=torch.float32)
         grids = []
+        # 阶段 2/4：为每个 batch 样本生成视频 token 坐标
         for batch in range(batch_size):
             frame = frame_ids[batch].to(dtype=torch.float32)
+            # 生成四维坐标网格：
+            #
+            # frame  -> 帧坐标，数量 F
+            # view   -> 视角坐标，数量 V
+            # height -> 高度 token 坐标，数量 H
+            # width  -> 宽度 token 坐标，数量 W
+            #
+            # ff、_vv、hh、ww 的形状都是：
+            # [F, V, H, W]
+            #
+            # indexing="ij" 保证维度顺序与输入顺序一致：
+            # [frame, view, height, width]
             ff, _vv, hh, ww = torch.meshgrid(
                 frame,
                 torch.arange(views, device=device, dtype=torch.float32),
@@ -365,13 +385,56 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
                 width,
                 indexing="ij",
             )
+            # 组合成 4 个位置坐标通道：
+            #
+            # 第 0 个通道：帧坐标 ff
+            # 第 1 个通道：高度坐标 hh
+            # 第 2 个通道：宽度坐标 ww
+            # 第 3 个通道：全 0 坐标
+            #
+            # 注意：_vv 没有被放进 stack，
+            # 所以视角编号参与了 token 数量和排列，
+            # 但没有作为显式的位置坐标通道。
+            #
+            # stack 后：
+            # [F, V, H, W] -> [4, F, V, H, W]
+            #
+            # reshape 后：
+            # [4, F, V, H, W] -> [4, F*V*H*W]
+            #
+            # 每一列对应一个视频 token 的位置：
+            # [frame_id, height_id, width_id, 0]
             grids.append(
                 torch.stack([ff, hh, ww, torch.zeros_like(ff)], dim=0).reshape(4, -1)
             )
+        # 阶段 3/4：把每个 batch 的坐标网格堆叠起来
+        #
+        # grids 中有 B 个张量，每个张量形状为 [4, F*V*H*W]。
+        #
+        # torch.stack(..., dim=0) 后：
+        # [B 个 [4, N]] -> [B, 4, N]
+        #
+        # 其中：
+        # N = F * V * H * W
         grid = torch.stack(grids, dim=0)
         expected = frames * views * h_tokens * w_tokens
         if grid.shape[-1] != expected:
             raise RuntimeError("video rotary grid length mismatch")
+        
+        # 阶段 4/4：将坐标网格转换为 RoPE
+        #
+        # grid 的形状是 [B, 4, N]。
+        # self.rope 根据这 4 个坐标通道生成旋转位置编码。
+        #
+        # 具体输出形状取决于 self.rope 的实现。
+        # 随后 [:, :, None] 在第 2 维插入一个长度为 1 的维度：
+        #
+        # 假设 self.rope(grid) 的形状是 [B, D, N]，
+        # 那么：
+        # [B, D, N] -> [B, D, 1, N]
+        #
+        # 这个新增维度通常用于后续与 attention head、
+        # 多视角维度或其他广播维度对齐。
         return self.rope(grid)[:, :, None]
 
     def _action_rotary(
@@ -380,12 +443,85 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
         *,
         tokens_per_frame: int,
     ) -> torch.Tensor:
+        # LINK: wan_va/modules/model_3dva_mot.py:914
+        # 输入：
+        # frame_ids       通常形状为 [B, F]
+        #                  B = batch size
+        #                  F = frames，帧数
+        #                  每个元素表示对应位置属于哪一帧
+        #
+        # tokens_per_frame = 每帧包含的 action token 数量
+        #
+        # 例如：
+        # frame_ids =
+        # [[0, 1, 2],
+        #  [0, 1, 2]]
+        # 表示 batch 中每个样本都有 3 帧。
+
+        # 阶段 1/3：创建每一帧内部的 token slot 编号
+        #
+        # torch.arange(tokens_per_frame) 的形状是 [K]，
+        # 其中 K = tokens_per_frame：
+        #
+        # K=4 时：
+        # [0, 1, 2, 3]
+        #
+        # [None, None] 在最前面增加两个维度：
+        # [K] -> [1, 1, K]
+        #
+        # 这样做是为了后面和 [B, F, 1] 形状的 frame_ids
+        # 通过 broadcasting 相加。
         slots = torch.arange(
             tokens_per_frame,
             device=frame_ids.device,
             dtype=torch.long,
         )[None, None]
+        # 阶段 2/3：将二维的“帧编号 + 帧内 slot 编号”
+        # 映射成连续的一维位置编号
+        #
+        # frame_ids[:, :, None]：
+        # [B, F] -> [B, F, 1]
+        #
+        # slots：
+        # [1, 1, K]
+        #
+        # 相乘并相加时发生 broadcasting：
+        # [B, F, 1] * K + [1, 1, K]
+        #                         -> [B, F, K]
+        #
+        # 计算公式：
+        # positions[b, f, k] = frame_ids[b, f] * K + k
+        #
+        # 例子：F=3，K=4
+        #
+        # frame_ids[0] = [0, 1, 2]
+        #
+        # frame_ids[0, :, None] * 4：
+        # [[0],
+        #  [4],
+        #  [8]]
+        #
+        # 加上 slots=[[0, 1, 2, 3]] 后：
+        # [[ 0,  1,  2,  3],   # 第 0 帧的 4 个 token
+        #  [ 4,  5,  6,  7],   # 第 1 帧的 4 个 token
+        #  [ 8,  9, 10, 11]]   # 第 2 帧的 4 个 token
+        #
+        # positions 的形状为 [B, F, K]。
         positions = frame_ids[:, :, None] * tokens_per_frame + slots
+        # 阶段 3/3：把每帧内部的 K 个 token 展平为一个序列
+        #
+        # [B, F, K] -> [B, F*K]
+        #
+        # 例如：
+        # [[0, 1, 2, 3],
+        #  [4, 5, 6, 7],
+        #  [8, 9, 10, 11]]
+        #
+        # 会变成：
+        # [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        #
+        # 然后将这些一维位置编号传给 action_rope，
+        # 由它根据位置编号生成对应的 Rotary Position Embedding。
         return self.action_rope(positions.reshape(frame_ids.shape[0], -1))
 
     def _video_input(
@@ -498,77 +634,55 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
             block_kind="action",
         )
 
-    def _run_streams(
+    def _run_stream(
         self,
-        streams: list[AutoregressiveStreamInput],
+        stream: AutoregressiveStreamInput,
         *,
         text_emb: torch.Tensor,
         state,
         transaction_id: int,
-    ) -> list[torch.Tensor]:
-        from distillation.self_rollout.attention import (
-            STREAM_ACTION,
-            STREAM_VIDEO,
-            TokenMetadataBatch,
-        )
+    ) -> torch.Tensor:
+        from distillation.self_rollout.attention import STREAM_ACTION, STREAM_VIDEO
         from distillation.self_rollout.cache import KVSegment
 
-        if not streams:
-            raise ValueError("at least one stream is required")
-        batch_size = streams[0].hidden.shape[0]
-        if any(stream.hidden.shape[0] != batch_size for stream in streams):
-            raise ValueError("all streams must share a batch size")
+        # 阶段 1/3：准备一个 video 或 action stream。
+        batch_size = stream.hidden.shape[0]
         text = self._text(text_emb, batch_size)
-        hidden_states = [stream.hidden for stream in streams]
-        current_stream_id = None
-        if all(stream.block_kind == "video" for stream in streams):
-            current_stream_id = STREAM_VIDEO
-        elif all(stream.block_kind == "action" for stream in streams):
-            current_stream_id = STREAM_ACTION
-        current_meta = (
-            streams[0].metadata
-            if len(streams) == 1
-            else TokenMetadataBatch.cat([stream.metadata for stream in streams])
-        )
+        hidden = stream.hidden
+        stream_id = STREAM_VIDEO if stream.block_kind == "video" else STREAM_ACTION
 
+        # 阶段 2/3：逐层更新当前 stream。geometry 不作为第二个输入 stream
+        # 传进来；它是否可见取决于当前 layer_id 的共享 mot_cache 中是否
+        # 已经提交了 geometry K/V。
         for layer_id, mot_block in enumerate(self.mot_blocks):
             if hasattr(mot_block, "forward_incremental"):
-                hidden_states = mot_block(
+                hidden = mot_block(
                     AutoregressiveMOTLayerRequest(
-                        streams=streams,
-                        hidden_states=hidden_states,
+                        stream=stream,
+                        hidden_state=hidden,
                         text=text,
                         state=state,
                         transaction_id=transaction_id,
                         layer_id=layer_id,
-                        stream_id=current_stream_id,
+                        stream_id=stream_id,
                     )
                 )
                 continue
+
+            # 兼容路径：调制 -> QKV -> 共享 cache attention -> text/FFN。
             from distillation.self_rollout import attention as attention_module
 
-            qkv_parts = []
-            modulations = []
-            blocks = []
-            for stream, hidden in zip(streams, hidden_states):
-                block = (
-                    mot_block.video_block
-                    if stream.block_kind == "video"
-                    else mot_block.action_block
-                )
-                modulation = mot_block._modulation(block, stream.conditioning)
-                qkv_parts.append(
-                    mot_block._self_qkv(
-                        block,
-                        hidden,
-                        modulation,
-                        stream.rotary,
-                    )
-                )
-                blocks.append(block)
-                modulations.append(modulation)
-            query, current_key, current_value = (
-                torch.cat(parts, dim=1) for parts in zip(*qkv_parts)
+            block = (
+                mot_block.video_block
+                if stream.block_kind == "video"
+                else mot_block.action_block
+            )
+            modulation = mot_block._modulation(block, stream.conditioning)
+            query, current_key, current_value = mot_block._self_qkv(
+                block,
+                hidden,
+                modulation,
+                stream.rotary,
             )
             state.mot_cache.append_transaction(
                 layer_id,
@@ -576,8 +690,8 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
                 KVSegment(
                     current_key,
                     current_value,
-                    current_meta,
-                    stream_id=current_stream_id,
+                    stream.metadata,
+                    stream_id=stream_id,
                 ),
             )
             key, value, key_meta = state.mot_cache.materialize(
@@ -585,7 +699,8 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
                 transaction_id=transaction_id,
             )
             query_valid, key_valid = attention_module.build_cache_selection(
-                current_meta, key_meta
+                stream.metadata,
+                key_meta,
             )
             attended, _visible = attention_module.indexed_attention(
                 query,
@@ -594,8 +709,6 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
                 query_valid=query_valid,
                 key_valid=key_valid,
             )
-            lengths = [hidden.shape[1] for hidden in hidden_states]
-            attended_parts = torch.split(attended, lengths, dim=1)
             text_attn = mot_block.video_block.attn2
             text_key = text_attn.norm_k(text_attn.to_k(text)).unflatten(
                 2,
@@ -605,23 +718,17 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
                 2,
                 (text_attn.heads, -1),
             )
-            hidden_states = [
-                mot_block._finish_block(
-                    block,
-                    hidden,
-                    mot_block._attention_output(block.attn1, attention_output),
-                    modulation,
-                    text_key,
-                    text_value,
-                )
-                for block, hidden, attention_output, modulation in zip(
-                    blocks,
-                    hidden_states,
-                    attended_parts,
-                    modulations,
-                )
-            ]
-        return hidden_states
+            hidden = mot_block._finish_block(
+                block,
+                hidden,
+                mot_block._attention_output(block.attn1, attended),
+                modulation,
+                text_key,
+                text_value,
+            )
+
+        # 阶段 3/3：返回同一个 stream 的最终 hidden states，[B,L,D]。
+        return hidden
 
     def _run_transaction(
         self,
@@ -633,12 +740,12 @@ class AutoregressiveThreeDVAMOTTransformer3DModel(
         commit_source=None,
     ) -> torch.Tensor:
         try:
-            hidden = self._run_streams(
-                [stream],
+            hidden = self._run_stream(
+                stream,
                 text_emb=text_emb,
                 state=state,
                 transaction_id=transaction_id,
-            )[0]
+            )
             if commit_source is not None:
                 state.mot_cache.commit_transaction(
                     transaction_id,

@@ -461,7 +461,7 @@ def _attach_ar_mot_methods(model: _TinyMOTModel) -> _TinyMOTModel:
         "_action_rotary",
         "_video_input",
         "_action_input",
-        "_run_streams",
+        "_run_stream",
         "_run_transaction",
         "_assert_clean_commit",
         "predict_video",
