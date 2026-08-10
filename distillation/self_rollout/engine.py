@@ -6,11 +6,19 @@ from typing import Any
 import torch
 
 from distillation.model.autoregressive_types import AutoregressiveModelRequest
+from distillation.model.wan_wrapper import WanDiffusionWrapper
+from distillation.diffusion_utils import renoise_x0
 
 from .provider import GroundTruthProvider, GroundTruthStep
 from .recorder import SelfRolloutRecorder
 from .result import RolloutResult
-from .scheduler import RolloutSchedulers, build_rollout_schedulers
+from .transitions import (
+    RolloutSchedulers,
+    RolloutTransitionMode,
+    SGFRolloutSchedule,
+    build_rollout_schedulers,
+    normalize_rollout_transition_mode,
+)
 from .state import CacheSource, RolloutPhase, RolloutState
 
 
@@ -90,17 +98,21 @@ def self_rollout(
     spec: Any,
     device: torch.device,
     empty_text_emb: torch.Tensor,
-    video_num_steps: int,
-    action_num_steps: int,
+    video_num_steps: int | None = None,
+    action_num_steps: int | None = None,
     rollout_frames: int,
+    transition_mode: RolloutTransitionMode = "inference",
     ground_truth_provider: GroundTruthProvider | None = None,
     replacement_policy: str = "require_ground_truth",
     generator: torch.Generator | None = None,
     schedulers: RolloutSchedulers | None = None,
+    sgf_schedule: SGFRolloutSchedule | None = None,
+    diffusion_wrapper: WanDiffusionWrapper | None = None,
     recorder: SelfRolloutRecorder | None = None,
 ) -> RolloutResult:
     """Run a distillation-owned incremental Video+Action rollout."""
 
+    transition_mode = normalize_rollout_transition_mode(transition_mode)
     rollout_frames = int(rollout_frames)
     if rollout_frames <= 0:
         raise ValueError(f"rollout_frames must be positive, got {rollout_frames}")
@@ -120,9 +132,55 @@ def self_rollout(
     if str(shape.get("order_mode", "segmented")) != "segmented":
         raise ValueError("self_rollout requires generation_shape.order_mode='segmented'")
 
+    if transition_mode == "inference":
+        if sgf_schedule is not None or diffusion_wrapper is not None or recorder is not None:
+            raise ValueError(
+                "inference rollout does not accept SGF schedule, wrapper, or recorder"
+            )
+        if schedulers is None and (
+            video_num_steps is None or action_num_steps is None
+        ):
+            raise ValueError(
+                "inference rollout requires schedulers or video/action num steps"
+            )
+        schedulers = schedulers or build_rollout_schedulers(
+            config,
+            video_num_steps=int(video_num_steps),
+            action_num_steps=int(action_num_steps),
+        )
+    else:
+        if schedulers is not None or video_num_steps is not None or action_num_steps is not None:
+            raise ValueError(
+                "sgf_renoise rollout uses sgf_schedule instead of inference schedulers/num steps"
+            )
+        if sgf_schedule is None or diffusion_wrapper is None or recorder is None:
+            raise ValueError(
+                "sgf_renoise rollout requires sgf_schedule, diffusion_wrapper, and recorder"
+            )
+        if ground_truth_provider is not None:
+            raise ValueError("sgf_renoise rollout does not support ground-truth replacement")
+        recorder.validate(
+            video_num_steps=len(sgf_schedule.video_steps),
+            action_num_steps=len(sgf_schedule.action_steps),
+        )
+
     if generator is None:
         generator = torch.Generator(device=device)
-        generator.manual_seed(int(getattr(config, "seed", 0)))
+        if transition_mode == "inference":
+            # Preserve the existing inference trajectory exactly.
+            generator.manual_seed(int(getattr(config, "seed", 0)))
+        else:
+            # Consume the trainer-managed rank-local RNG so repeated microsteps
+            # do not restart from the same Gaussian trajectory.  The global CUDA
+            # RNG is already included in distillation checkpoints.
+            seed = torch.randint(
+                0,
+                2**31 - 1,
+                (),
+                device=device,
+                dtype=torch.int64,
+            ).item()
+            generator.manual_seed(int(seed))
     state = RolloutState(generator=generator)
     native_model = getattr(transformer, "module", transformer)
     if not hasattr(native_model, "forward_autoregressive"):
@@ -134,17 +192,6 @@ def self_rollout(
         return transformer(
             AutoregressiveModelRequest(operation=operation, payload=payload),
             mode="self_rollout",
-        )
-
-    schedulers = schedulers or build_rollout_schedulers(
-        config,
-        video_num_steps=video_num_steps,
-        action_num_steps=action_num_steps,
-    )
-    if recorder is not None:
-        recorder.validate(
-            video_num_steps=video_num_steps,
-            action_num_steps=action_num_steps,
         )
 
     latents = batch["latents"].to(device=device)
@@ -276,8 +323,18 @@ def self_rollout(
             generator=state.generator,
         )
         guidance_scale = float(getattr(config, "guidance_scale", 1.0))
-        for step_index, timestep in enumerate(schedulers.video.timesteps.to(device)):
-            if recorder is not None:
+        if transition_mode == "inference":
+            steps = schedulers.video.timesteps.to(device)
+            video_scheduler = schedulers.video
+        else:
+            steps = torch.as_tensor(
+                sgf_schedule.video_steps,
+                device=device,
+                dtype=torch.float32,
+            )
+            video_scheduler = sgf_schedule.video_scheduler
+        for step_index, timestep in enumerate(steps):
+            if transition_mode == "sgf_renoise":
                 recorder.observe(
                     "video",
                     frame_id=frame_id,
@@ -308,7 +365,35 @@ def self_rollout(
                     valid_frames=_frame_video_valid(working_batch, frame_id, device),
                 ).prediction
                 prediction = unconditional + guidance_scale * (conditional - unconditional)
-            sample = schedulers.video.step(prediction, timestep, sample)
+            if transition_mode == "inference":
+                sample = video_scheduler.step(prediction, timestep, sample)
+                continue
+
+            frame_timestep = torch.as_tensor(
+                timestep,
+                device=device,
+                dtype=torch.float32,
+            ).reshape(1, 1).expand(sample.shape[0], 1)
+            x0 = diffusion_wrapper.velocity_to_x0(
+                prediction,
+                sample,
+                frame_timestep,
+                modality="video",
+            )
+            if step_index + 1 == len(steps):
+                sample = x0
+            else:
+                next_timestep = torch.as_tensor(
+                    steps[step_index + 1],
+                    device=device,
+                    dtype=torch.float32,
+                ).reshape(1, 1).expand(sample.shape[0], 1)
+                sample, _ = renoise_x0(
+                    x0,
+                    next_timestep,
+                    video_scheduler,
+                    generator=state.generator,
+                )
         return sample
 
     def sample_action(frame_id: int) -> torch.Tensor:
@@ -324,8 +409,18 @@ def self_rollout(
         valid = _frame_action_valid(working_batch, frame_id, device)
         if valid is not None:
             sample = sample * valid.to(dtype=sample.dtype)
-        for step_index, timestep in enumerate(schedulers.action.timesteps.to(device)):
-            if recorder is not None:
+        if transition_mode == "inference":
+            steps = schedulers.action.timesteps.to(device)
+            action_scheduler = schedulers.action
+        else:
+            steps = torch.as_tensor(
+                sgf_schedule.action_steps,
+                device=device,
+                dtype=torch.float32,
+            )
+            action_scheduler = sgf_schedule.action_scheduler
+        for step_index, timestep in enumerate(steps):
+            if transition_mode == "sgf_renoise":
                 recorder.observe(
                     "action",
                     frame_id=frame_id,
@@ -342,7 +437,34 @@ def self_rollout(
                 state=state,
                 valid_mask=valid,
             ).prediction
-            sample = schedulers.action.step(prediction, timestep, sample)
+            if transition_mode == "inference":
+                sample = action_scheduler.step(prediction, timestep, sample)
+            else:
+                frame_timestep = torch.as_tensor(
+                    timestep,
+                    device=device,
+                    dtype=torch.float32,
+                ).reshape(1, 1).expand(sample.shape[0], 1)
+                x0 = diffusion_wrapper.velocity_to_x0(
+                    prediction,
+                    sample,
+                    frame_timestep,
+                    modality="action",
+                )
+                if step_index + 1 == len(steps):
+                    sample = x0
+                else:
+                    next_timestep = torch.as_tensor(
+                        steps[step_index + 1],
+                        device=device,
+                        dtype=torch.float32,
+                    ).reshape(1, 1).expand(sample.shape[0], 1)
+                    sample, _ = renoise_x0(
+                        x0,
+                        next_timestep,
+                        action_scheduler,
+                        generator=state.generator,
+                    )
             if valid is not None:
                 sample = sample * valid.to(dtype=sample.dtype)
         return sample
@@ -516,6 +638,7 @@ def self_rollout(
             "replacements": state.predictions.replacements,
             "profile": "segmented_history_va_v1",
             "profile_version": 2,
+            "transition_mode": transition_mode,
             "rollout_frames": rollout_frames,
             "pending_ground_truth_frames": sorted(pending_ground_truth),
             "mot_cache_tokens": {

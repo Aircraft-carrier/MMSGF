@@ -35,15 +35,14 @@ class SelfGradientForcingDMDTrainer(DistillationTrainerBase):
             raise ValueError(
                 "self_gradient_forcing_dmd requires distill.real_score_checkpoint"
             )
+        # A resume checkpoint publicly exports the AR student, not the private
+        # bidirectional fake-score.  Construct the fake-score skeleton from an
+        # explicit bidirectional export (or the real-score source) and let DCP
+        # restore its exact parameters and optimizer state afterwards.
         fake_score_init = (
             getattr(config.distill, "fake_score_init", None)
-            or getattr(config.distill, "resume_from", None)
+            or real_score_checkpoint
         )
-        if fake_score_init is None:
-            raise ValueError(
-                "self_gradient_forcing_dmd requires distill.fake_score_init "
-                "for a fresh run"
-            )
         return SGFDMDModel(
             config=config,
             trainer=self,

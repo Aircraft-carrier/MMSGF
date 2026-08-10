@@ -5,6 +5,9 @@ This file intentionally does not inherit from any other local configuration.
 Fill in the empty dataset/model paths before launching training.
 """
 
+import os
+from pathlib import Path
+
 import torch
 from easydict import EasyDict
 
@@ -23,10 +26,25 @@ va_wan22_train_cfg.action_cache_manifest_path = None
 
 # WAN2.2 initialization.  `init_model_from_lingbot=False` selects the
 # diffusers WAN2.2 transformer below; the VAE is loaded from the model root.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_WAN22_MODEL_ROOT = _REPO_ROOT / "playground" / "Pretrained_models" / "Wan2.2-TI2V-5B"
+_WAN22_MODEL_ROOT = Path(
+    os.getenv("WAN22_PRETRAINED_MODEL_PATH", str(_DEFAULT_WAN22_MODEL_ROOT))
+).expanduser()
+
+# This is a base Wan2.2 transformer, not a saved MOT checkpoint.  Training
+# therefore constructs a VAMOTTransformer3DModel from its video backbone and
+# initializes the action expert locally.
 va_wan22_train_cfg.init_model_from_lingbot = False
-va_wan22_train_cfg.wan22_pretrained_model_name_or_path = ""
-va_wan22_train_cfg.wan22_transformer_path = ""
+va_wan22_train_cfg.wan22_pretrained_model_name_or_path = str(_WAN22_MODEL_ROOT)
+va_wan22_train_cfg.wan22_transformer_path = os.getenv(
+    "WAN22_TRANSFORMER_PATH", str(_WAN22_MODEL_ROOT)
+)
 va_wan22_train_cfg.lingbot_transformer_path = ""
+# Keep both unset for a fresh MOT run: the base WAN2.2 video backbone above is
+# converted into a MOT model and its action blocks are initialized from video.
+va_wan22_train_cfg.resume_from = None
+va_wan22_train_cfg.initialize_from = None
 
 # ---------------------------------------------------------------------------
 # Dataset / fixed-window MOT protocol.
@@ -110,8 +128,6 @@ va_wan22_train_cfg.save_root = "./train_out"
 va_wan22_train_cfg.save_interval = 2000
 va_wan22_train_cfg.max_checkpoints = 3
 va_wan22_train_cfg.save_full_state = True
-va_wan22_train_cfg.resume_from = None
-va_wan22_train_cfg.initialize_from = None
 va_wan22_train_cfg.enable_wandb = False
 va_wan22_train_cfg.wandb_name = "va_wan22_mot_train"
 va_wan22_train_cfg.wandb_mode = "offline"
@@ -127,4 +143,3 @@ va_wan22_train_cfg.memory_jsonl_interval = 100
 va_wan22_train_cfg.memory_smaps_interval = 500
 va_wan22_train_cfg.eval_with_cpu = False
 va_wan22_train_cfg.eval_cfg = None
-

@@ -10,7 +10,7 @@ from distillation.pipeline.utils import (
     replace_text_condition,
     replace_va_streams,
 )
-from distillation.scheduler import (
+from distillation.diffusion_utils import (
     consistency_prediction,
     flow_step,
     flow_to_x0,

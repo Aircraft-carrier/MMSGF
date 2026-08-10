@@ -3,6 +3,9 @@ from __future__ import annotations
 
 
 def __getattr__(name: str):
+    if name == "WanDiffusionWrapper":
+        from distillation.model.wan_wrapper import WanDiffusionWrapper
+        return WanDiffusionWrapper
     if name in {
         "AutoregressiveVAMOTTransformer3DModel",
         "AutoregressiveVAMOTBlock",
@@ -40,7 +43,6 @@ def __getattr__(name: str):
         "consistency_loss",
         "dmd_surrogate_loss",
         "fake_score_flow_loss",
-        "replay_target_loss",
     }:
         from distillation.model import objectives
         return getattr(objectives, name)
@@ -62,5 +64,5 @@ __all__ = [
     "consistency_loss",
     "dmd_surrogate_loss",
     "fake_score_flow_loss",
-    "replay_target_loss",
+    "WanDiffusionWrapper",
 ]

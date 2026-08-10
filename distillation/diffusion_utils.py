@@ -1,9 +1,12 @@
-"""Flow-matching scheduler operations for MOT tensors shaped ``[B,C,F,...]``."""
+"""Flow-matching tensor utilities for MOT distillation."""
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
+
+from distillation.schema import DenoisyInterval
 
 if TYPE_CHECKING:
     from wan_va.utils.scheduler import FlowMatchScheduler
@@ -98,6 +101,47 @@ def add_noise(
     return (1.0 - sigma) * clean + sigma * noise
 
 
+def renoise_x0(
+    x0: torch.Tensor,
+    next_timesteps: torch.Tensor,
+    scheduler: "FlowMatchScheduler",
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Add fresh Gaussian noise to an x0 prediction at the next timestep."""
+    noise = torch.randn(
+        x0.shape,
+        device=x0.device,
+        dtype=x0.dtype,
+        generator=generator,
+    )
+    return add_noise(x0, noise, next_timesteps, scheduler), noise
+
+
+def sample_interval_timesteps(
+    interval: DenoisyInterval,
+    shape: tuple[int, int],
+    device: torch.device,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Sample integer model timesteps within one exit-derived DMD interval."""
+    if len(shape) != 2:
+        raise ValueError(f"timestep shape must be [B,F], got {shape}")
+    if tuple(mask.shape) != tuple(shape):
+        raise ValueError(
+            f"timestep mask must have shape {shape}, got {tuple(mask.shape)}"
+        )
+    low = int(math.ceil(float(interval.denoisy_to)))
+    high = int(math.floor(float(interval.denoisy_from))) + 1
+    if high <= low:
+        raise ValueError(
+            "denoisy interval contains no integer timestep: "
+            f"[{interval.denoisy_to}, {interval.denoisy_from}]"
+        )
+    timesteps = torch.randint(low, high, shape, device=device)
+    return torch.where(mask.to(device=device, dtype=torch.bool), timesteps, 0)
+
+
 def flow_to_x0(
     flow: torch.Tensor,
     noisy_sample: torch.Tensor,
@@ -121,12 +165,7 @@ def consistency_prediction(
     *,
     sigma_data: float,
 ) -> torch.Tensor:
-    """Apply Flash-WAM's variance-preserving video consistency boundary scaling.
-
-    ``f=c_skip*x_t+c_out*x0_hat``。sigma=0 时 c_skip=1,c_out=0，输出严格等于
-    x_t；高噪声处 c_out 有界。student 和 EMA 必须调用同一个函数，否则两侧
-    target/prediction 尺度不同，MSE 没有可解释性。
-    """
+    """Apply Flash-WAM's variance-preserving video consistency boundary scaling."""
     sigma = sigmas_for_timesteps(scheduler, timesteps, dtype=noisy_sample.dtype)
     sigma = broadcast_frame_values(sigma, noisy_sample)
     sigma_data = noisy_sample.new_tensor(float(sigma_data))
@@ -144,12 +183,7 @@ def flow_step(
     next_timesteps: torch.Tensor,
     scheduler: "FlowMatchScheduler",
 ) -> torch.Tensor:
-    """Move one flow line directly by ``x_next=x_t+(sigma_next-sigma_t)*flow``.
-
-    例如 x_t=5、flow=4、sigma_t=.75、sigma_next=.25，则 x_next=3；它也等于
-    ``(1-.25)*x0+.25*noise``。这验证了 teacher flow 正确时可以跨过若干原生
-    scheduler step 直达相邻 consistency state。
-    """
+    """Move one flow line by ``x_next=x_t+(sigma_next-sigma_t)*flow``."""
     sigma = sigmas_for_timesteps(scheduler, timesteps, dtype=sample.dtype)
     next_sigma = sigmas_for_timesteps(scheduler, next_timesteps, dtype=sample.dtype)
     delta = broadcast_frame_values(next_sigma - sigma, sample)

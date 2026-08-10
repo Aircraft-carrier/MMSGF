@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from distillation.schema import VAMasks, VAPrediction, VATimesteps
-from distillation.scheduler import add_noise
+from distillation.diffusion_utils import add_noise
 
 if TYPE_CHECKING:
     from wan_va.utils.scheduler import FlowMatchScheduler

@@ -163,18 +163,3 @@ def fake_score_flow_loss(
         weights,
         "fake_score",
     )
-
-
-def replay_target_loss(
-    student_flow: VAPrediction,
-    target_flow: VAPrediction,
-    masks: VAMasks,
-    weights: VALossWeights = VALossWeights(),
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    return _va_loss(
-        student_flow,
-        target_flow,
-        masks,
-        weights,
-        "replay",
-    )

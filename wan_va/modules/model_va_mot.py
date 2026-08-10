@@ -789,9 +789,32 @@ class VAMOTTransformer3DModel(ModelMixin, ConfigMixin):
                 attn_mode="torch",
             )
         else:
+            # The official Wan2.2-TI2V-5B export uses the pre-diffusers
+            # field names ``dim``, ``num_heads``, ``in_dim``, and ``out_dim``.
+            # Current diffusers expects the expanded names below; without this
+            # translation it falls back to its 5120-D defaults and cannot load
+            # the 3072-D WAN2.2 checkpoint.
+            wan22_config = DiffusersWanTransformer3DModel.load_config(
+                video_transformer_path
+            )
+            dim = int(wan22_config["dim"])
+            num_heads = int(wan22_config["num_heads"])
+            if dim % num_heads != 0:
+                raise ValueError(
+                    "Wan2.2 dim must divide evenly across num_heads: "
+                    f"dim={dim}, num_heads={num_heads}"
+                )
             base = DiffusersWanTransformer3DModel.from_pretrained(
                 video_transformer_path,
                 torch_dtype=torch.float32,
+                num_attention_heads=num_heads,
+                attention_head_dim=dim // num_heads,
+                in_channels=int(wan22_config["in_dim"]),
+                out_channels=int(wan22_config["out_dim"]),
+                freq_dim=int(wan22_config["freq_dim"]),
+                ffn_dim=int(wan22_config["ffn_dim"]),
+                num_layers=int(wan22_config["num_layers"]),
+                eps=float(wan22_config["eps"]),
             )
         config = dict(base.config)
         for key in (

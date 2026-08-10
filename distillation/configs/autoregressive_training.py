@@ -6,7 +6,7 @@ from easydict import EasyDict
 from distillation.configs.runtime_dataset import apply_distillation_runtime_overrides
 from wan_va.configs import VA_CONFIGS
 
-autoregressive_training_cfg = EasyDict(copy.deepcopy(VA_CONFIGS["umi_3dwam_train"]))
+autoregressive_training_cfg = EasyDict(copy.deepcopy(VA_CONFIGS["wan22_train"]))
 apply_distillation_runtime_overrides(autoregressive_training_cfg)
 autoregressive_training_cfg.distill = EasyDict(
     method="autoregressive_training",

@@ -21,6 +21,20 @@ from distillation.configs import (
 from wan_va.distributed.util import init_distributed
 
 
+def _parse_timestep_list(value: str) -> list[float]:
+    parts = value.split(",")
+    if not parts or any(not part.strip() for part in parts):
+        raise argparse.ArgumentTypeError(
+            "timestep list must be a comma-separated sequence of numbers"
+        )
+    try:
+        return [float(part) for part in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid timestep list {value!r}"
+        ) from exc
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a distilled MOT transformer.")
     parser.add_argument("--method", required=True, choices=METHODS)
@@ -42,6 +56,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="Video denoising steps used by each training rollout.")
     parser.add_argument("--rollout-action-num-steps", default=None, type=int,
                         help="Action denoising steps used by each training rollout.")
+    parser.add_argument(
+        "--video-denoisy-step-list",
+        default=None,
+        type=_parse_timestep_list,
+        help="Comma-separated SGF video timesteps, strictly descending.",
+    )
+    parser.add_argument(
+        "--action-denoisy-step-list",
+        default=None,
+        type=_parse_timestep_list,
+        help="Comma-separated SGF action timesteps, strictly descending.",
+    )
     parser.add_argument("--rollout-horizon-frames", default=None, type=int,
                         help="Logical target frames generated after the clean target anchor.")
     parser.add_argument(
@@ -110,6 +136,28 @@ def run(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if value is not None:
             config.distill[name] = int(value)
+    if args.method == SELF_GRADIENT_FORCING_DMD:
+        if (
+            args.rollout_video_num_steps is not None
+            or args.rollout_action_num_steps is not None
+        ):
+            raise ValueError(
+                "self_gradient_forcing_dmd uses --video/--action-denoisy-step-list "
+                "instead of rollout num steps"
+            )
+        if args.video_denoisy_step_list is not None:
+            config.distill.denoisy_step_list.video = list(
+                args.video_denoisy_step_list
+            )
+        if args.action_denoisy_step_list is not None:
+            config.distill.denoisy_step_list.action = list(
+                args.action_denoisy_step_list
+            )
+    elif (
+        args.video_denoisy_step_list is not None
+        or args.action_denoisy_step_list is not None
+    ):
+        raise ValueError("denoisy step list flags are only valid for SGF DMD")
     for name in ("cfg_min", "cfg_max", "sigma_data"):
         value = getattr(args, name)
         if value is not None:

@@ -10,6 +10,11 @@ from .provider import (
 from .recorder import RecordedDenoiseState, SelfRolloutRecorder
 from .result import RolloutResult
 from .state import CacheSource, RolloutPhase, RolloutState
+from .transitions import (
+    RolloutTransitionMode,
+    SGFRolloutSchedule,
+    build_sgf_rollout_schedule,
+)
 
 
 def self_rollout(*args, **kwargs):
@@ -28,9 +33,12 @@ __all__ = [
     "RolloutPhase",
     "RolloutResult",
     "RolloutState",
+    "RolloutTransitionMode",
+    "SGFRolloutSchedule",
     "SelfRolloutRecorder",
     "resolve_ground_truth_provider",
     "rollout_artifact_due",
     "save_rollout_artifacts",
     "self_rollout",
+    "build_sgf_rollout_schedule",
 ]

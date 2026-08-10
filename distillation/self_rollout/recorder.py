@@ -6,23 +6,31 @@ from typing import Literal
 
 import torch
 
+from distillation.schema import DenoisyInterval
+
 
 @dataclass(frozen=True, slots=True)
 class RecordedDenoiseState:
     sample: torch.Tensor
     timestep: torch.Tensor
+    exit_id: int
+    denoisy_from: float
+    denoisy_to: float
 
 
 class SelfRolloutRecorder:
     """Record one real scheduler input state per generated frame and modality."""
 
-    def __init__(self, *, video_step: int, action_step: int) -> None:
-        self.record_steps = {
-            "video": int(video_step),
-            "action": int(action_step),
+    def __init__(
+        self,
+        *,
+        video: DenoisyInterval,
+        action: DenoisyInterval,
+    ) -> None:
+        self.intervals = {
+            "video": video,
+            "action": action,
         }
-        if any(step < 0 for step in self.record_steps.values()):
-            raise ValueError("record steps must be non-negative")
         self.video: dict[int, RecordedDenoiseState] = {}
         self.action: dict[int, RecordedDenoiseState] = {}
 
@@ -32,10 +40,10 @@ class SelfRolloutRecorder:
             "action": int(action_num_steps),
         }
         for modality, limit in limits.items():
-            step = self.record_steps[modality]
+            step = self.intervals[modality].exit_id
             if step >= limit:
                 raise ValueError(
-                    f"{modality}_step must be in [0,{limit}), got {step}"
+                    f"{modality}_exit_id must be in [0,{limit}), got {step}"
                 )
 
     def observe(
@@ -47,7 +55,8 @@ class SelfRolloutRecorder:
         timestep: torch.Tensor,
         sample: torch.Tensor,
     ) -> None:
-        if int(step_index) != self.record_steps[modality]:
+        interval = self.intervals[modality]
+        if int(step_index) != interval.exit_id:
             return
         records = self.video if modality == "video" else self.action
         frame_id = int(frame_id)
@@ -58,6 +67,9 @@ class SelfRolloutRecorder:
         records[frame_id] = RecordedDenoiseState(
             sample=sample.detach().clone(),
             timestep=torch.as_tensor(timestep, device=sample.device).detach().clone(),
+            exit_id=interval.exit_id,
+            denoisy_from=interval.denoisy_from,
+            denoisy_to=interval.denoisy_to,
         )
 
     def require_frames(self, frame_ids: list[int]) -> None:

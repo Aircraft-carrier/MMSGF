@@ -210,7 +210,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
             name=SELF_GRADIENT_FORCING_DMD,
             student_init=consistency_checkpoint,
             real_score_checkpoint=Path(args.student_init),
-            fake_score_init=autoregressive_checkpoint,
+            # DMD real/fake score estimators must share the same bidirectional
+            # VAMOT architecture and attention profile.  The private fake-score
+            # state is restored from DCP on resume.
+            fake_score_init=Path(args.student_init),
             resume_from=(
                 resume_from
                 if args.resume_method == SELF_GRADIENT_FORCING_DMD

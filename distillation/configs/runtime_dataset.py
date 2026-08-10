@@ -161,6 +161,27 @@ def prepare_distillation_dataset_config() -> None:
 
 
 def apply_distillation_runtime_overrides(config: Any) -> Any:
+    dataset_root = os.environ.get("MOT_DATASET_ROOT")
+    if dataset_root:
+        root = Path(dataset_root).resolve()
+        mot_config_path = root / "meta" / "mot_config.json"
+        if mot_config_path.is_file():
+            mot_config = json.loads(mot_config_path.read_text(encoding="utf-8"))
+            config.dataset_path = str(root)
+            config.mot_config_path = str(mot_config_path)
+            for key in (
+                "mot_manifest_path",
+                "empty_emb_path",
+                "text_emb_cache_path",
+                "action_cache_manifest_path",
+                "norm_stat",
+                "norm_stats_by_task",
+            ):
+                if key in mot_config:
+                    value = mot_config[key]
+                    if key == "action_cache_manifest_path" and not value:
+                        value = None
+                    config[key] = value
     load_worker = os.environ.get("MOT_LOAD_WORKER")
     if load_worker is not None:
         config.load_worker = int(load_worker)

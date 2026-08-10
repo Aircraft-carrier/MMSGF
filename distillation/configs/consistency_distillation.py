@@ -6,7 +6,7 @@ from easydict import EasyDict
 from distillation.configs.runtime_dataset import apply_distillation_runtime_overrides
 from wan_va.configs import VA_CONFIGS
 
-consistency_distillation_cfg = EasyDict(copy.deepcopy(VA_CONFIGS["umi_3dwam_train"]))
+consistency_distillation_cfg = EasyDict(copy.deepcopy(VA_CONFIGS["wan22_train"]))
 apply_distillation_runtime_overrides(consistency_distillation_cfg)
 consistency_distillation_cfg.cfg_prob = 0.0
 consistency_distillation_cfg.distill = EasyDict(

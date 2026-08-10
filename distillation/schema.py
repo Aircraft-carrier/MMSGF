@@ -1,4 +1,5 @@
 """Shared distillation data structures."""
+import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -11,6 +12,14 @@ class VAPrediction:
 
     video: torch.Tensor
     action: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class VADiffusionOutput:
+    """Flow-matching velocity and the corresponding clean V/A prediction."""
+
+    velocity: VAPrediction
+    x0: VAPrediction
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +48,38 @@ class VAMasks:
 class VALossWeights:
     video: float = 1.0
     action: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class DenoisyInterval:
+    """One modality's sampled rollout exit and DMD timestep interval."""
+
+    exit_id: int
+    denoisy_from: float
+    denoisy_to: float
+
+    def __post_init__(self) -> None:
+        if int(self.exit_id) < 0:
+            raise ValueError("exit_id must be non-negative")
+        denoisy_from = float(self.denoisy_from)
+        denoisy_to = float(self.denoisy_to)
+        if (
+            not math.isfinite(denoisy_from)
+            or not math.isfinite(denoisy_to)
+            or not 0.0 <= denoisy_to < denoisy_from
+        ):
+            raise ValueError(
+                "denoisy interval requires 0 <= denoisy_to < denoisy_from, "
+                f"got from={denoisy_from}, to={denoisy_to}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class VADenoisySelection:
+    """Independent video and action rollout exits."""
+
+    video: DenoisyInterval
+    action: DenoisyInterval
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,25 +121,29 @@ class TrainingStepResult:
 class ReplayContext:
     """Stage3 no-grad record 与有梯度 replay 之间的完整边界。
 
-    Student batch 使用预测 target V/A，teacher batch 保持 GT V/A；
-    ``rollout_noisy`` 是 rollout 某个真实 denoise step 的 sampler state，
-    ``pred_clean`` 是最终预测 clean，``teacher_clean`` 是 dataset GT clean。
+    ``rollout_noisy`` 是 V/A 各自 exit 的真实 sampler state；
+    ``final_clean_context`` 是 GT history/anchor 加完整 rollout 的最终 x0。
     所有 record tensor 都已 detach，梯度只在 replay 时重新建立。
     """
 
-    student_batch: dict[str, Any]
-    teacher_batch: dict[str, Any]
+    replay_batch: dict[str, Any]
     rollout_timesteps: VATimesteps
     rollout_noisy: VAPrediction
-    pred_clean: VAPrediction
-    teacher_clean: VAPrediction
+    final_clean_context: VAPrediction
     masks: VAMasks
+    denoisy_selection: VADenoisySelection
 
     @property
     def batch(self) -> dict[str, Any]:
-        """Compatibility alias for the legacy student replay batch."""
+        """Compatibility alias for callers that consume the replay batch."""
 
-        return self.student_batch
+        return self.replay_batch
+
+    @property
+    def student_batch(self) -> dict[str, Any]:
+        """Compatibility alias for the former field name."""
+
+        return self.replay_batch
 
     @property
     def timesteps(self) -> VATimesteps:
@@ -110,4 +155,10 @@ class ReplayContext:
 
     @property
     def generated(self) -> VAPrediction:
-        return self.pred_clean
+        return self.final_clean_context
+
+    @property
+    def pred_clean(self) -> VAPrediction:
+        """Compatibility alias for the former final-clean field name."""
+
+        return self.final_clean_context

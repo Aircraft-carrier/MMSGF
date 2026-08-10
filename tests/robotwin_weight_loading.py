@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Interactively load a saved RoboTwin MOT transformer checkpoint.
+"""Load a WAN2.2 video backbone using the RoboTwin MOT training path.
 
 Example:
-    python -m ipdb tests/robotwin_weight_loading.py \
-        --checkpoint /path/to/checkpoint_or_transformer
+    python tests/robotwin_weight_loading.py \
+        --checkpoint playground/Pretrained_models/Wan2.2-TI2V-5B
+
+The default ``video-backbone`` mode mirrors a fresh training run with
+``init_model_from_lingbot=False`` and ``initialize_from=None``: it loads the
+base WAN2.2 transformer, creates the Video+Action MOT model, then initializes
+the action blocks from the video blocks.  Use ``mot-checkpoint`` only for an
+already exported MOT checkpoint that contains the action weights.
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ from wan_va.modules.model_va_mot import VAMOTTransformer3DModel
 
 
 def transformer_directory(checkpoint: Path) -> Path:
-    """Accept either a checkpoint directory or its transformer subdirectory."""
+    """Accept a model root, a checkpoint directory, or its transformer directory."""
 
     checkpoint = checkpoint.resolve()
     transformer_path = checkpoint / "transformer"
@@ -38,11 +44,40 @@ def transformer_directory(checkpoint: Path) -> Path:
     )
 
 
-def load_robotwin_transformer(checkpoint: Path, *, dtype: torch.dtype) -> VAMOTTransformer3DModel:
-    """Load the complete transformer export saved by MOT training."""
+def mot_training_overrides() -> dict[str, object]:
+    """Match the new-model initialization parameters in ``train_mot.py``."""
+
+    return {
+        "max_num_views": 3,
+        "action_dim": 20,
+        "action_hidden_dim": 768,
+        "action_ffn_dim": 3072,
+        "attn_mode": "torch",
+        "num_layers": 30,
+        "masked_attn_backend": "fa4",
+        "init_noise_seed": 42,
+    }
+
+
+def load_robotwin_transformer(
+    checkpoint: Path,
+    *,
+    dtype: torch.dtype,
+    load_mode: str,
+) -> VAMOTTransformer3DModel:
+    """Load either a base WAN2.2 video backbone or a complete MOT export."""
+
+    transformer_path = transformer_directory(checkpoint)
+    if load_mode == "video-backbone":
+        model, _report = VAMOTTransformer3DModel.from_video_backbone(
+            str(transformer_path),
+            init_model_from_lingbot=False,
+            config_overrides=mot_training_overrides(),
+        )
+        return model.to(dtype=dtype)
 
     return VAMOTTransformer3DModel.from_pretrained(
-        transformer_directory(checkpoint),
+        transformer_path,
         torch_dtype=dtype,
     )
 
@@ -52,16 +87,26 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=os.getenv("MOT_INITIALIZE_FROM"),
-        required=os.getenv("MOT_INITIALIZE_FROM") is None,
-        help="Checkpoint directory or its transformer subdirectory. Defaults to MOT_INITIALIZE_FROM.",
+        default=os.getenv("WAN22_PRETRAINED_MODEL_PATH"),
+        required=os.getenv("WAN22_PRETRAINED_MODEL_PATH") is None,
+        help="WAN2.2 model root or MOT checkpoint. Defaults to WAN22_PRETRAINED_MODEL_PATH.",
+    )
+    parser.add_argument(
+        "--load-mode",
+        choices=("video-backbone", "mot-checkpoint"),
+        default="video-backbone",
+        help="Use video-backbone to mirror fresh MOT training (default).",
     )
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument("--device", default="cpu", help="Optional device after loading, e.g. cuda:0.")
     args = parser.parse_args()
 
     dtype = getattr(torch, args.dtype)
-    model = load_robotwin_transformer(args.checkpoint, dtype=dtype).to(args.device)
+    model = load_robotwin_transformer(
+        args.checkpoint,
+        dtype=dtype,
+        load_mode=args.load_mode,
+    ).to(args.device)
     model.eval()
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
@@ -69,6 +114,7 @@ def main() -> None:
         "\n".join(
             (
                 f"transformer_dir: {transformer_directory(args.checkpoint)}",
+                f"load_mode: {args.load_mode}",
                 f"device: {next(model.parameters()).device}",
                 f"dtype: {next(model.parameters()).dtype}",
                 f"parameters: {parameter_count}",

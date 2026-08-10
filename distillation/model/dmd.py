@@ -14,10 +14,9 @@ from distillation.pipeline.self_gradient_forcing_training import SelfGradientFor
 class SGFDMDModel:
     """Own stage3 student/real-score/fake-score and optimizer routing.
 
-    student 是 stage2 checkpoint 导出的 EMA；real-score/teacher 使用 stage1
-    自回归训练前的源 teacher checkpoint，并保留原始 wan_va mask 语义；fake-score
-    仍通常从 stage1 AR 初始化。real-score 同时作为 GT-clean CFG teacher，并在
-    DMD 分支估计 real distribution；它永久冻结，fake 有独立 AdamW。每个
+    student 是 stage2 checkpoint 导出的 EMA；real-score/fake-score 都使用
+    双向 VAMOT 模型和原始 wan_va mask。real-score 在 DMD 分支估计 real
+    distribution 并永久冻结，fake 有独立 AdamW。每个
     microstep 先 no-grad 生成 ReplayContext，再根据 optimizer_step 只建立一条
     梯度路径。
     """
@@ -43,7 +42,18 @@ class SGFDMDModel:
             validate_distillation_profile=False,
             autoregressive=False,
         )
-        self.fake_score = build_trainable_transformer(fake_score_init, config, device)
+        self.fake_score = build_trainable_transformer(
+            fake_score_init,
+            config,
+            device,
+            install_distillation_profile=False,
+            validate_distillation_profile=False,
+            autoregressive=False,
+        )
+        if type(self.real_score) is not type(self.fake_score):
+            raise TypeError(
+                "DMD real-score and fake-score must use the same bidirectional model class"
+            )
 
         self.pipeline = SelfGradientForcingTrainingPipeline(
             config=config,
@@ -72,6 +82,8 @@ class SGFDMDModel:
     def state_dict(self) -> dict[str, Any]:
         return {
             "fake_score_update_ratio": self.update_schedule.fake_score_steps,
+            "video_denoisy_step_list": tuple(self.pipeline.sgf_schedule.video_steps),
+            "action_denoisy_step_list": tuple(self.pipeline.sgf_schedule.action_steps),
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -81,4 +93,14 @@ class SGFDMDModel:
                 self.update_schedule.fake_score_steps,
             )
         )
+        expected_video = tuple(self.pipeline.sgf_schedule.video_steps)
+        expected_action = tuple(self.pipeline.sgf_schedule.action_steps)
+        saved_video = tuple(state.get("video_denoisy_step_list", expected_video))
+        saved_action = tuple(state.get("action_denoisy_step_list", expected_action))
+        if saved_video != expected_video or saved_action != expected_action:
+            raise ValueError(
+                "SGF denoisy step lists do not match checkpoint: "
+                f"saved video/action={saved_video}/{saved_action}, "
+                f"configured={expected_video}/{expected_action}"
+            )
         self.update_schedule = DMDUpdateSchedule(fake_score_steps=ratio)
