@@ -12,6 +12,9 @@ AGENTS.md
 /train_out
 /wan_va_pi3_haoranVersion
 /tests
+!/tests/
+!/tests/robotwin_data_loading.py
+!/tests/robotwin_weight_loading.py
 /inference_logs
 /modelscope_pointcloud_logs
 /debugfa4_real_training_logs

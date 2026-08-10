@@ -142,6 +142,7 @@ class ConsistencyTrainer(DistillationTrainerBase):
         artifacts = save_rollout_artifacts(
             rollout,
             batch,
+            decode_latents_to_rgb_views=self._decode_rollout_latents,
             output_dir=output_dir,
             video_fps=fps,
         )
@@ -152,12 +153,11 @@ class ConsistencyTrainer(DistillationTrainerBase):
         ) is not None:
             self.wandb.log(
                 {
-                    "rollout/video_target_vs_generated": self.wandb.Video(
+                    "rollout/video_action_comparison": self.wandb.Video(
                         artifacts["video"],
                         fps=fps,
                         format="mp4",
                     ),
-                    "rollout/actions": self.wandb.Image(artifacts["actions"]),
                 },
                 step=completed_step,
             )

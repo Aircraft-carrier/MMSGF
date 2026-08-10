@@ -434,8 +434,9 @@ class MotTrainData(Dataset):
         norm_stats_by_task: dict[str, dict[str, Any]],
         action_chunk_size: int,
         video_downsample_ratio: int,
-        text_emb_cache_path: str | Path,
+        text_emb_cache_path: str | Path | None,
         empty_emb_path: str | Path | None = None,
+        text_emb_cache: dict[str, torch.Tensor] | None = None,
         action_cache_manifest_path: str | Path | None = None,
         video_decoder_cache_size: int = MOT_DEFAULT_VIDEO_DECODER_CACHE_SIZE,
         action_cache_size: int = MOT_DEFAULT_ACTION_CACHE_SIZE,
@@ -511,7 +512,11 @@ class MotTrainData(Dataset):
             raise ValueError(
                 f"action_sequence_length={self.action_sequence_length} must equal action_chunk_size+1={expected_sequence_length}"
             )
-        self.text_emb_cache = torch.load(text_emb_cache_path, map_location="cpu", weights_only=False)
+        if text_emb_cache is None:
+            if text_emb_cache_path is None:
+                raise ValueError("text_emb_cache_path is required unless text_emb_cache is supplied")
+            text_emb_cache = torch.load(text_emb_cache_path, map_location="cpu", weights_only=False)
+        self.text_emb_cache = text_emb_cache
         self.empty_text_emb = (
             torch.load(empty_emb_path, map_location="cpu", weights_only=False)
             if empty_emb_path is not None
