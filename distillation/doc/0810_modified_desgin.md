@@ -18,7 +18,7 @@
 
 - `distillation/configs/self_gradient_forcing_dmd.py`
 - `distillation/model/dmd.py::SGFDMDModel`
-- `distillation/pipeline/self_gradient_forcing_training.py::SelfGradientForcingTrainingPipeline`
+- `distillation/model/dmd.py::SelfGradientForcingModel`
 - `distillation/trainer/self_gradient_forcing_dmd.py::SelfGradientForcingDMDTrainer`
 - `distillation/model/objectives.py`
 - `distillation/schema.py::ReplayContext`
@@ -46,22 +46,25 @@
 
 ### 1.2 术语与时间步语义
 
-本文统一采用“实际送入模型并可由 scheduler 查到最近 sigma 的 timestep 值”，不再使用参考实现中 `1000 - scheduler index` 的间接表示：
+本文采用参考实现的两套显式坐标，禁止把二者混用：配置、exit interval 与 DMD 均匀采样使用线性去噪进度 `d`；模型 forward、replay 与 scheduler sigma lookup 使用 warp 后的实际 timestep `t`：
 
 ```text
-video_denoisy_step_list = [t_v0, t_v1, ..., t_v(Kv-1)]
-action_denoisy_step_list = [t_a0, t_a1, ..., t_a(Ka-1)]
+video_denoisy_step_list = [d_v0, d_v1, ..., d_v(Kv-1)]
+action_denoisy_step_list = [d_a0, d_a1, ..., d_a(Ka-1)]
 
-t_0 > t_1 > ... > t_last > 0
+d_0 > d_1 > ... > d_last > 0
 
 video_exit_id  ~ UniformInteger[0, Kv)
 action_exit_id ~ UniformInteger[0, Ka)
 
-denoisy_from = step_list[exit_id]
-denoisy_to   = step_list[exit_id + 1]，若 exit_id 是最后一项则为 0
+denoisy_from = d_list[exit_id]
+denoisy_to   = d_list[exit_id + 1]，若 exit_id 是最后一项则为 0
+
+k = T - d
+t = scheduler.timesteps[k]
 ```
 
-`denoisy_from` 表示区间的高噪声端，`denoisy_to` 表示低噪声端，必须满足 `0 <= denoisy_to < denoisy_from <= num_train_timesteps`。DMD timestep 在闭区间语义 `[denoisy_to, denoisy_from]` 内按模态独立采样；实现使用整数采样时需保证上界可达或明确采用半开区间等价写法。
+`denoisy_from/to` 始终位于线性 `d` 坐标，必须满足 `0 <= denoisy_to < denoisy_from <= T`。`ts_schedule` 控制下界是否采用 `to`，`ts_schedule_max` 控制上界是否采用 `from`；只有两者都为 true 时才严格采样 `[to,from)`。采样出的 `d` 再由各自 scheduler 映射成实际 `t`，最后在 `t` 坐标 clamp。相同 `d` 在 video shift=5 与 action shift=1 下可以得到不同的 `t`。
 
 ### 1.3 已确认的当前实现事实
 
@@ -70,7 +73,7 @@ denoisy_to   = step_list[exit_id + 1]，若 exit_id 是最后一项则为 0
 1. `self_rollout` 当前使用 `scheduler.step(velocity, t, x_t)` 做 Euler/ODE 更新。这条路径是正确的正式推理模式，必须保留；缺失的是并列的 SGF re-noise 模式，即 `velocity -> x0` 后用新高斯噪声把 `x0` 加噪到下一 timestep。
 2. 当前 `SelfRolloutRecorder` 已能为 video/action 记录不同 step，这一能力应保留；问题是 step 来源是两个 `num_steps`，而不是两个显式、可审计的 `denoisy_step_list`。
 3. 当前 student loss 是 `replay_target_loss + dmd_loss`，额外 frozen-teacher flow MSE 改变了参考 SGF 的 generator 优化目标。
-4. 当前 `fake_score_step()` 直接用 `context.pred_clean`（final rollout clean）训练 fake score，没有先运行 exit replay；它训练的分布与 student DMD 分支中的 generator sample 不是同一个分布。
+4. 重构前 fake-score 路径直接用 `context.pred_clean`（final rollout clean）训练，没有先运行 exit replay；它训练的分布与 student DMD 分支中的 generator sample 不是同一个分布。
 5. 当前 real-score 由 `autoregressive=False` 构建，fake-score 却由默认 `autoregressive=True` 构建；二者使用不同模型类和 attention order，`fake_x0 - real_x0` 不是同构 score estimator 的可比差值。
 6. 当前 DMD 只采样一份 `[B,F] score_t` 给 V/A，共享 nominal timestep；需求要求 V/A 根据各自 exit interval 分别采样。
 7. 当前 score timestep 由全局 `score_timestep_min/max` 决定，与 rollout exit 没有关联；`denoisy_from/to` 没有成为 ReplayContext 的一等数据。
@@ -85,7 +88,7 @@ denoisy_to   = step_list[exit_id + 1]，若 exit_id 是最后一项则为 0
 
 ```text
 velocity -> x0
-  -> 当前：pipeline._predict_x0() 局部实现，仅覆盖 full train forward
+  -> 当前：model conversion 局部实现，仅覆盖 full train forward
   -> 目标：model/wan_wrapper.py::WanDiffusionWrapper，覆盖 AR student 与双向 score
 
 x0 -> next x_t rollout
@@ -102,8 +105,8 @@ exit 与 DMD 范围
   -> 目标：V/A 独立 exit_id -> V/A 独立 denoisy_from/to -> V/A 独立 DMD t
 
 student loss
-  -> 当前：replay_target_loss + dmd_surrogate_loss
-  -> 目标：只保留 dmd_surrogate_loss
+  -> 重构前：replay_target_loss + 独立 dmd surrogate helper
+  -> 目标：只保留 SGFDMDModel 内的 KL gradient + 0.5*MSE surrogate
 
 fake sample
   -> 当前：final rollout clean
@@ -137,7 +140,7 @@ no-grad autoregressive rollout(mode="sgf_renoise")
 - 每个 microstep 有独立的 `video_exit_id` 和 `action_exit_id`，可相同但不强制相同。
 - 两个 exit id 分别受各自列表长度约束。
 - `self_rollout` 默认/显式 `inference` 模式继续逐步调用 native `scheduler.step()`，无需 SGF recorder 或 re-noise schedule 即可直接服务推理。
-- SGF pipeline 显式传入 `transition_mode="sgf_renoise"`；该模式不会被推理入口误选为默认值。
+- SGF model 显式传入 `transition_mode="sgf_renoise"`；该模式不会被推理入口误选为默认值。
 - 在 `sgf_renoise` mode 中，每个生成 frame 的 video/action history cache 值均等于该模态 rollout 最后一次预测的 `x0`；`inference` mode 则保持提交 native scheduler 的最终 sample。
 - exit 仅决定 replay 输入 `x_t/t`，不会导致 rollout 提前退出。
 - final-clean context 在进入 replay/score model 前未经过 `add_noise`。
@@ -160,7 +163,7 @@ no-grad autoregressive rollout(mode="sgf_renoise")
 
 ### 2.4 验收标准
 
-1. 两套不同长度、不同值的 V/A `denoisy_step_list` 能通过配置和 launcher 进入 pipeline。
+1. 两套不同长度、不同值的 V/A `denoisy_step_list` 能通过配置和 launcher 进入 model。
 2. `inference` rollout 与修改前的 scheduler/Euler trajectory 等价，并能在没有 SGF 专用参数时直接运行。
 3. `sgf_renoise` rollout 对每个相邻 step 执行 `velocity -> x0 -> fresh-noise add_noise(next_t)`，最后直接返回 x0。
 4. 单个 joint replay 支持 V/A 不同 timestep，并分别转换为 x0。
@@ -184,11 +187,10 @@ MMSGF/
       0810_modified_desgin.md             [MODIFY][DOC] 本设计
     model/
       __init__.py                         [MODIFY] 导出 wrapper，移除 replay loss 导出
-      dmd.py                              [MODIFY] 构造三类 wrapper、双向 fake-score、保存 schedule contract
+      dmd.py                              [MODIFY] Base/SGF/DMD 分层、rollout/replay/loss 与 schedule contract
       objectives.py                       [MODIFY] 删除 replay_target_loss，保留 DMD/fake-score loss
       wan_wrapper.py                      [ADD] 统一 velocity/x0 的 V/A scheduler-aware adapter
-    pipeline/
-      self_gradient_forcing_training.py   [MODIFY] final-clean rollout、exit replay、V/A 独立 DMD；移除 replay teacher
+      utils.py                            [MODIFY] 合并 model state 与共享 input/tensor adapters
     self_rollout/
       __init__.py                         [MODIFY] 导出 SGF schedule/record contract
       engine.py                           [MODIFY] 保留 inference transition，新增并列 SGF re-noise transition
@@ -211,7 +213,7 @@ MMSGF/
                                            [EXISTING CONTEXT] stage3 launcher 与 checkpoint 来源检查
 ```
 
-不修改 `distillation/checkpoint.py`：现有 DCP 已能保存 raw student、student optimizer、fake-score 和 fake-score optimizer。schedule 兼容信息由 `SGFDMDModel.state_dict()` 写入现有 method state。
+`distillation/checkpoint.py` 只调整为通过 wrapper 的 `.model` 保存 fake-score；DCP 内容仍是 raw student、student optimizer、fake-score 和 fake-score optimizer。schedule 兼容信息由 `SGFDMDModel.state_dict()` 写入现有 method state。
 
 ## 4. 文件级设计
 
@@ -219,15 +221,15 @@ MMSGF/
 
 **总体职责**：为同一 V/A flow-matching 参数化提供唯一的 `velocity -> x0`、模型调用和输出规范化边界。
 
-**新增原因**：当前 conversion 散落在 pipeline，增量 AR rollout 又直接使用 raw velocity，导致 full replay 与 rollout 容易采用不同公式。
+**新增原因**：当前 conversion 散落在训练逻辑，增量 AR rollout 又直接使用 raw velocity，导致 full replay 与 rollout 容易采用不同公式。
 
-**计划内容**：新增非 `nn.Module` 的 `WanDiffusionWrapper`。它借用已经由 trainer/FSDP 拥有的模型，不注册或复制参数，不改变 checkpoint key。wrapper 持有 video/action scheduler 引用，提供 joint full-forward 适配和单模态 conversion。
+**计划内容**：新增非 `nn.Module` 的 `WanDiffusionWrapper`。它可以包装 trainer 已初始化的 AR student，也负责从 checkpoint 构造 frozen/trainable 双向模型；每个 wrapper 自行创建 video/action scheduler。统一 `forward -> flow+x0` 与双向高精度 conversion，同时不改变底层模型 checkpoint key。
 
 **契约**：
 
-- caller：SGF pipeline、self-rollout engine。
-- callee：AR student 或 bidirectional score 的 `model(input_dict, mode="train")`，以及 `distillation.diffusion_utils.flow_to_x0()`。
-- wrapper 不调用 `.to()`、`.train()`、`.eval()`，不拥有 optimizer/state_dict。
+- caller：SGF model、self-rollout engine。
+- callee：AR student 或 bidirectional score 的 `model(input_dict, mode="train")`，以及 model factory/`FlowMatchScheduler`。
+- wrapper 负责 model/scheduler 初始化，但不注册底层模型为子模块，不拥有 optimizer/state_dict。
 - conversion 在输入 dtype/device 上返回；sigma lookup 允许 `[B,F]`。
 - V/A shape 分别为 `[B,Cv,F,V,H,W]` 与 `[B,Ca,F,N,1]`。
 
@@ -260,7 +262,8 @@ MMSGF/
 **计划内容**：
 
 - 新增 `renoise_x0(x0, next_timestep, scheduler, *, generator=None)`，采样 fresh Gaussian 并调用 `add_noise()`。
-- 新增 `sample_interval_timesteps(interval, shape, device, mask)`，在 from/to 区间按 frame 采样并对无效位置写 0。
+- 新增 `sample_interval_progress(interval, shape, device, mask)`，在线性 `[to,from)` 区间为每个 batch 样本采一个 `d`，复制到所有帧，并对无效位置写 0。
+- 新增 `warp_denoisy_progress(progress, scheduler)`，执行 `d -> k=T-d -> scheduler.timesteps[k]`。
 - 不用 native `FlowMatchScheduler.add_noise()`，因为其 `t_dim`/CPU timestep 行为不适合通用 `[B,F]` V/A tensor；继续复用本文件逐 frame sigma lookup。
 
 **验证**：固定 generator 的手算与边界测试；确保相邻两次调用消费不同随机数。
@@ -273,9 +276,9 @@ MMSGF/
 
 - 新增 `RolloutTransitionMode = Literal["inference", "sgf_renoise"]`（或等价 `StrEnum`）。
 - `inference` 使用现有 `FlowMatchScheduler.step()`；`sgf_renoise` 使用 wrapper conversion 与 `renoise_x0()`。
-- 新增 `SGFRolloutSchedule(video_steps, action_steps, video_scheduler, action_scheduler)`。
+- 新增 `SGFRolloutSchedule(video_steps, action_steps, video_timesteps, action_timesteps, video_scheduler, action_scheduler)`；`steps` 保存线性 `d`，`timesteps` 保存实际 `t`。
 - 新增 `build_sgf_rollout_schedule(config, video_scheduler, action_scheduler)`。
-- V/A list 分别校验：长度至少 1、严格递减、元素 finite、`0 < t <= num_train_timesteps`。
+- V/A list 分别校验：长度至少 1、严格递减、元素 finite 且为整数网格值、`0 < d <= num_train_timesteps`。
 - 不在 builder 内按 `num_steps` 重新生成 timestep；配置 list 是唯一真值来源。
 
 **兼容性**：`build_rollout_schedulers()` 和 inference 的 native scheduler trajectory 行为不变；新增 mode 不能改变现有推理调用的默认结果。
@@ -323,12 +326,12 @@ MMSGF/
 
 - 删除 `replay_target_loss()`。
 - 保留 `_video_mse()` / `_action_mse()` 的 frame/token 归一方式。
-- 保留 `dmd_surrogate_loss()` 当前按模态、按有效 mask 计算 normalizer 的设计；它比参考实现把所有维度统一求均值更适合 V/A 不同尺度。
+- 删除独立 `dmd_surrogate_loss()`；KL gradient、normalizer 和 `0.5*MSE` surrogate 收进 `SGFDMDModel`，与参考 DMD 类一致。
 - 保留 `fake_score_flow_loss()`。
 
 **验证**：DMD direction 手算、全 False mask、normalizer eps、V/A 权重测试。
 
-### 4.8 `distillation/pipeline/self_gradient_forcing_training.py` `[MODIFY]`
+### 4.8 `distillation/model/dmd.py::BaseModel/SelfGradientForcingModel` `[MODIFY]`
 
 **总体职责**：拥有一个 microstep 的 SGF trajectory、exit replay、DMD score 和 fake-score regression 数据流。
 
@@ -343,16 +346,17 @@ MMSGF/
 
 **新增或修改**：
 
-- 构造 student/real/fake 三个 `WanDiffusionWrapper`，其中 scheduler 引用相同，模型对象不同。
+- 构造 `generator`/`real_score`/`fake_score` 三个 `WanDiffusionWrapper`；每个 wrapper 初始化自己的等价 V/A scheduler。
 - 从 config 读取两套 list 并构建 SGF schedule。
 - `_sample_exit_ids()` 分别按 V/A list 长度采样。
-- `generate_and_record_context()` 完整跑完两个模态 lists，构造 final-clean context、exit noisy state 和 V/A bounds。
-- `_replay_student_x0(context, *, requires_grad)` 成为 student/fake 两条路径共享的 generator sample 定义。
-- `_sample_dmd_timesteps(selection, masks)` 返回 V/A 独立 timestep。
+- `run_generator()` 完整跑完两个模态 lists，构造 final-clean context、exit noisy state 和 V/A bounds。
+- `record()` 建立 rollout 与 replay 之间的 detached `ReplayContext`。
+- `replay(context, *, requires_grad)` 成为 student/fake 两条路径共享的 generator sample 定义。
+- `_get_timestep(interval, shape, mask)` 采样单模态 timestep，`_get_va_timesteps()` 分别调用。
 - `_add_dmd_noise()` 返回 `(noisy, sampled_noise)`，供 fake target 直接使用 `noise - x0`。
-- `_predict_score_x0()` 通过 wrapper 统一把 real/fake velocity 转 x0。
-- `replay_and_score()` 只返回 DMD loss。
-- `fake_score_step()` 先 no-grad replay，再训练 fake-score。
+- `_compute_kl_grad()` 内部直接调用 real/fake wrapper，统一得到 flow+x0。
+- `BaseModel` 负责三模型初始化、wrapper 与 timestep/noise 公共逻辑。
+- `SelfGradientForcingModel(BaseModel)` 负责 generator rollout、record 与 replay。
 
 **梯度边界**：
 
@@ -370,15 +374,16 @@ fake-score optimizer step:
   -> grad-enabled fake-score forward -> fake-score only
 ```
 
-### 4.9 `distillation/model/dmd.py` `[MODIFY]`
+### 4.9 `distillation/model/dmd.py::SGFDMDModel` `[MODIFY]`
 
-**总体职责**：拥有 stage3 student/real-score/fake-score 对象、wrapper/pipeline 生命周期和 optimizer 路由。
+**总体职责**：继承 SGF generation/replay，负责 KL gradient、distribution matching、generator/fake-score loss 和 optimizer 路由。
 
 **计划内容**：
 
 - real-score 继续 `autoregressive=False`、frozen、保留源 `wan_va` mask。
 - fake-score 改为 `autoregressive=False`，且 `install_distillation_profile=False`、`validate_distillation_profile=False`；其模型类和 mask 必须与 real-score 相同。
 - student 仍为 stage2 EMA export 的 AR model。
+- `_compute_kl_grad()`、`compute_distribution_matching_loss()`、`generator_loss()`、`critic_loss()` 位于本类。
 - wrapper 不取代这些模型的 state/parameter ownership。
 - `state_dict()` 增加两套 denoisy lists；resume 时与当前 config 比较，不相同则 fail fast。
 
@@ -401,9 +406,8 @@ fake-score optimizer step:
 
 ```python
 distill.denoisy_step_list = EasyDict(
-    # Proposed defaults preserve the approximate two-step schedules implied by
-    # the current video/action shifts; final experiment values remain explicit.
-    video=[1000, 833],
+    # Values are linear d; video shift=5 maps d=500 to actual t=833.33.
+    video=[1000, 500],
     action=[1000, 500],
 )
 ```
@@ -418,7 +422,7 @@ distill.denoisy_step_list = EasyDict(
 
 保留：generation profile、horizon、masked attention backend、real CFG 范围、DMD normalizer、optimizer ratio 和 checkpoint paths。
 
-默认值 `[1000,833]` / `[1000,500]` 是根据当前 2-step、`snr_shift=5` / `action_snr_shift=1` 的近似显式化，不是参考仓库 `[1000,750,500,250]` 的机械复制。实际实验若选择其他列表，应直接修改两套显式值，不再通过 `num_steps` 隐式推导。
+默认两套线性列表均为 `[1000,500]`。由于 `snr_shift=5` / `action_snr_shift=1`，实际网络 timestep 分别约为 video `[1000,833.33]` 与 action `[1000,500]`。实验若选择 `[1000,750,500,250]`，video 实际值约为 `[1000,937.5,833.33,625]`。
 
 ### 4.11a `distillation/configs/runtime_dataset.py` `[MODIFY][CONFIG]`
 
@@ -458,20 +462,21 @@ class WanDiffusionWrapper:
     #   不拥有模型参数、optimizer、checkpoint 或 rollout cache。
     # Why A Class:
     #   三个模型共享两套 scheduler 和一致 conversion invariant；这些借用资源
-    #   跨多次调用存在，且需要防止 pipeline/rollout 各自实现公式。
+    #   跨多次调用存在，且需要防止 model/rollout 各自实现公式。
     # Construction Inputs:
-    #   model: 已配置/FSDP 化的 AR 或 bidirectional model，borrowed。
-    #   video_scheduler/action_scheduler: trainer 拥有的 1000-step scheduler，borrowed。
+    #   model 或 checkpoint+config/device；autoregressive/trainable role。
+    #   wrapper 自行初始化 video_scheduler/action_scheduler。
     # Owned State:
     #   仅 Python 引用；无 Tensor parameter/buffer，无 state_dict。
     # Collaborators:
-    #   model(..., mode="train")；distillation.diffusion_utils.flow_to_x0。
+    #   model factory；FlowMatchScheduler；model(..., mode="train")。
     # Lifecycle:
-    #   SGFDMDModel 构造 -> pipeline 多次调用 -> 随 model/trainer 释放。
+    #   SGFDMDModel 构造 -> model methods 多次调用 -> 随 model/trainer 释放。
     # Invariants:
     #   velocity/noisy/timestep 的 B/F 对齐；V/A 使用各自 scheduler。
     # Public Interface:
-    #   predict_joint(...), velocity_to_x0(...), video_x0(...), action_x0(...)
+    #   forward/__call__(...) -> VADiffusionOutput(flow,x0)；
+    #   velocity_to_x0(...)；x0_to_velocity(...)；get_scheduler(...)
     # Runtime Boundaries:
     #   不主动改变 grad/no_grad/autocast/model mode；完全继承 caller context。
     # Persistence:
@@ -489,7 +494,7 @@ class DenoisyInterval:
     # Status/Location: [ADD] distillation/schema.py
     # Responsibility: 一个模态一次 microstep 的 exit 与 DMD interval。
     # Owned State:
-    #   exit_id: Python int；denoisy_from/to: float 或 int actual timestep。
+    #   exit_id: Python int；denoisy_from/to: 线性去噪进度 d。
     # Invariants:
     #   exit_id >= 0；0 <= to < from；from 是 list[exit_id]。
     # Persistence:
@@ -548,10 +553,10 @@ class SelfRolloutRecorder:
     pass
 ```
 
-### 5.5 `SelfGradientForcingTrainingPipeline` `[MODIFY]`
+### 5.5 `SelfGradientForcingModel` `[MODIFY]`
 
 ```python
-class SelfGradientForcingTrainingPipeline:
+class SelfGradientForcingModel(BaseModel):
     # Responsibility:
     #   协调 final-clean rollout、独立 exit replay、DMD 与 fake regression。
     # Owned State:
@@ -569,19 +574,19 @@ class SelfGradientForcingTrainingPipeline:
     #   generate always no_grad；replay grad 由 optimizer target 决定；
     #   real-score always frozen/no_grad；fake score 仅 fake step 建 graph。
     # Persistence:
-    #   schedule values 由 SGFDMDModel method state 校验，不在 pipeline 单独保存。
+    #   schedule values 由 SGFDMDModel method state 校验，由 SGFDMDModel 统一保存。
     pass
 ```
 
 ### 5.6 `SGFDMDModel` `[MODIFY]`
 
 ```python
-class SGFDMDModel:
+class SGFDMDModel(SelfGradientForcingModel):
     # Responsibility:
-    #   拥有三模型角色、双向 fake-score lifecycle、pipeline 与 update schedule。
+    #   继承 rollout/record/replay，拥有 DMD loss 与 update schedule。
     # Owned State:
     #   student: borrowed trainer.transformer；real_score: frozen bidirectional；
-    #   fake_score: trainable bidirectional；pipeline；DMDUpdateSchedule。
+    #   fake_score: trainable bidirectional；DMDUpdateSchedule。
     # Invariants:
     #   type(real_score) is type(fake_score)；二者 attention profile 相同；
     #   student 是 AR generation profile；real 永不进入 optimizer。
@@ -619,7 +624,7 @@ def velocity_to_x0(
     pass
 
 
-def predict_joint(
+def forward(
     self,
     input_dict: dict,
     noisy: VAPrediction,
@@ -627,7 +632,7 @@ def predict_joint(
 ) -> VADiffusionOutput:
     # Status: [ADD]
     # Behavior:
-    #   model(input_dict, mode="train") -> V/A velocity -> 各自 velocity_to_x0。
+    #   model(input_dict, mode="train") -> V/A flow -> FP64 conversion -> V/A x0。
     # Gradient:
     #   完全由 caller 的 grad context 决定。
     pass
@@ -654,7 +659,7 @@ def renoise_x0(
     pass
 
 
-def sample_interval_timesteps(
+def sample_interval_progress(
     interval: DenoisyInterval,
     shape: tuple[int, int],
     device: torch.device,
@@ -664,9 +669,9 @@ def sample_interval_timesteps(
     # Inputs:
     #   shape=[B,F]；mask=[B,F]。
     # Outputs:
-    #   [B,F]，有效位置在 [to,from]，无效位置为 0。
+    #   [B,F]，有效位置的线性 d 在 [to,from)，无效位置为 0。
     # Behavior:
-    #   按位置独立采样；video/action 分开调用，不共享随机 tensor。
+    #   每个 batch 样本采一个 d 并复制到所有帧；video/action 分开调用。
     pass
 ```
 
@@ -674,7 +679,7 @@ def sample_interval_timesteps(
 
 ```python
 def _sample_exit_ids(self) -> VADenoisySelection:
-    # Status: [ADD] SelfGradientForcingTrainingPipeline
+    # Status: [ADD] SelfGradientForcingModel
     # Reads:
     #   self.video_denoisy_steps / self.action_denoisy_steps。
     # Behavior:
@@ -790,11 +795,11 @@ def sample_sgf_stream(sample, steps, interval, scheduler, predict_velocity):
 
 关键点：即使 `exit_id=0`，循环仍执行到最后；exit 只负责 recorder，不负责 break。
 
-### 6.5 `generate_and_record_context()`
+### 6.5 `run_generator()` / `record()`
 
 ```python
 @torch.no_grad()
-def generate_and_record_context(self, batch: dict) -> ReplayContext:
+def run_generator(self, batch: dict) -> ReplayContext:
     # Status: [MODIFY]
     # Inputs:
     #   materialized batch；latents [B,Cv,F,V,H,W]；actions [B,Ca,F,N,1]。
@@ -817,7 +822,7 @@ def generate_and_record_context(self, batch: dict) -> ReplayContext:
 ### 6.6 共享 student exit replay
 
 ```python
-def _replay_student_x0(
+def replay(
     self,
     context: ReplayContext,
     *,
@@ -827,7 +832,7 @@ def _replay_student_x0(
     # Behavior:
     #   1. replace_va_streams(replay_batch, rollout_noisy,
     #      final_clean_context, rollout_timesteps)。
-    #   2. student_wrapper.predict_joint() 得到 V/A exit x0。
+    #   2. generator(replay_input, noisy, timesteps) 得到 V/A exit flow+x0。
     #   3. mask 外用 final_clean_context 精确覆盖，不能依赖 t=0 的近似 sigma。
     # Gradient:
     #   student step requires_grad=True；fake step在 torch.no_grad() 调用。
@@ -839,15 +844,15 @@ def _replay_student_x0(
 ### 6.7 Student DMD step
 
 ```python
-def replay_and_score(self, context: ReplayContext):
+def generator_loss(self, batch: dict):
     # Status: [MODIFY]
     # Behavior:
-    #   1. student_x0 = grad-enabled _replay_student_x0(context)。
-    #   2. dmd_t.video 从 video [to,from] 采样；action 独立采样。
-    #   3. 分别采样 V/A Gaussian，把 student_x0 加噪；mask 外保持 clean。
+    #   1. context = _run_generator(batch)，student_x0 = grad-enabled replay(context)。
+    #   2. 分别在线性 [to,from) 采样 V/A d，再用各自 scheduler warp/clamp 为 t。
+    #   3. 分别采样 V/A Gaussian，在实际 t 上把 student_x0 加噪；mask 外保持 clean。
     #   4. real/fake 使用相同 score input；real video 做 CFG，action conditional。
-    #   5. 两个 score forward 均 no_grad，经 wrapper 得到 real_x0/fake_x0。
-    #   6. total = dmd_surrogate_loss(...)；直接 return。
+    #   5. _compute_kl_grad 内执行两个 score forward 和 real CFG。
+    #   6. total = 0.5 * masked MSE(student, student-kl_grad)。
     # Removed:
     #   GT-clean teacher forward、replay_target_loss、replay metrics、等权相加。
     # Metrics:
@@ -858,13 +863,13 @@ def replay_and_score(self, context: ReplayContext):
 ### 6.8 Fake-score step
 
 ```python
-def fake_score_step(self, context: ReplayContext):
+def critic_loss(self, batch: dict):
     # Status: [MODIFY]
     # Behavior:
-    #   1. with no_grad: generated_x0 = _replay_student_x0(context, False)。
+    #   1. context = _run_generator(batch)；no_grad replay 得 generated_x0。
     #   2. V/A 各自从 selection interval 采样 dmd_t 和 Gaussian noise。
     #   3. noisy = add_noise(generated_x0, noise, dmd_t)。
-    #   4. fake velocity = fake_wrapper model forward（只在这里有梯度）。
+    #   4. fake_score(...) 返回 flow+x0（只在这里有梯度）。
     #   5. exact target velocity = noise - generated_x0；无需除 sigma。
     #   6. fake_score_flow_loss()。
     # Invariants:
@@ -905,7 +910,7 @@ def __init__(..., real_score_checkpoint: str, fake_score_init: str):
     #   fake_score = build_trainable_transformer(..., autoregressive=False,
     #       install_distillation_profile=False, validate_distillation_profile=False)
     #   assert exact model class/profile compatibility
-    #   pipeline = SelfGradientForcingTrainingPipeline(...)
+    #   BaseModel -> SelfGradientForcingModel -> SGFDMDModel
     # Runtime:
     #   student/fake parameters由各自 optimizer管理；real requires_grad=False。
     pass
@@ -968,7 +973,7 @@ top_level_config = {
     # Owner: MOTTrainer runtime。
 
     # [MODIFY] distill: EasyDict
-    # Owner: DistillationTrainerBase / SGFDMDModel / SGF pipeline。
+    # Owner: DistillationTrainerBase / SGFDMDModel / SGF model。
 
     # [RUNTIME] rank, local_rank, world_size, device
     # Owner: distillation.train.run()。
@@ -981,10 +986,12 @@ top_level_config = {
 distill = {
     # [EXISTING] method/model_architecture/generation_shape/max_grad_norm
     # [EXISTING] fake_score_update_ratio
-    # [ADD] denoisy_step_list.video: list[int|float], required, strictly descending
-    # [ADD] denoisy_step_list.action: list[int|float], required, strictly descending
+    # [ADD] denoisy_step_list.video: linear d list[int], required, strictly descending
+    # [ADD] denoisy_step_list.action: linear d list[int], required, strictly descending
     # [EXISTING] rollout_horizon_frames/rollout_masked_attn_backend
     # [EXISTING] teacher_cfg_min/teacher_cfg_max：仅 real-score DMD CFG
+    # [ADD] ts_schedule/ts_schedule_max/min_score_timestep：线性 d 采样边界
+    # [ADD] dmd_timestep_min/max：warp 后实际 t 的 clamp 范围
     # [EXISTING] dmd_normalizer_eps
     # [DELETE] rollout_video_num_steps/rollout_action_num_steps
     # [DELETE] score_timestep_min/score_timestep_max
@@ -996,22 +1003,22 @@ distill = {
 参数传播：
 
 ```text
-DISTILL_VIDEO_DENOISY_STEP_LIST="1000,833"
+DISTILL_VIDEO_DENOISY_STEP_LIST="1000,500"
   -> _train_distill_common.sh --video-denoisy-step-list
     -> train.parse_args(): list[float]
       -> config.distill.denoisy_step_list.video
-        -> SelfGradientForcingTrainingPipeline.video_denoisy_steps
-          -> exit sampler + SGF video rollout + video DMD interval
+        -> BaseModel.sgf_schedule.video_steps
+          -> linear exit interval + video scheduler warp + SGF rollout
 
 DISTILL_ACTION_DENOISY_STEP_LIST="1000,500"
   -> --action-denoisy-step-list
     -> config.distill.denoisy_step_list.action
-      -> action exit sampler + action rollout + action DMD interval
+      -> linear exit interval + action scheduler warp + SGF rollout
 ```
 
 `denoisy_from/to` 不是用户手工配置项；它们必须由 list 与 exit id 推导，避免配置给出自相矛盾的三份真值。
 
-`transition_mode` 同样不作为 SGF 实验超参暴露：它由调用入口拥有。正式 inference/evaluation 调用 `self_rollout(..., transition_mode="inference")`（也是向后兼容默认值）；`SelfGradientForcingTrainingPipeline` 必须显式调用 `transition_mode="sgf_renoise"`。这样既保留两种公共能力，又避免训练配置意外把 SGF 算法切回 inference trajectory。
+`transition_mode` 同样不作为 SGF 实验超参暴露：它由调用入口拥有。正式 inference/evaluation 调用 `self_rollout(..., transition_mode="inference")`（也是向后兼容默认值）；`SelfGradientForcingModel.run_generator()` 必须显式调用 `transition_mode="sgf_renoise"`。这样既保留两种公共能力，又避免训练配置意外把 SGF 算法切回 inference trajectory。
 
 ### 7.3 兼容与 resume
 
@@ -1030,21 +1037,21 @@ DISTILL_ACTION_DENOISY_STEP_LIST="1000,500"
   -> [MODIFY] distillation.train.run(config)
     -> [MODIFY] SelfGradientForcingDMDTrainer
       -> [MODIFY] SGFDMDModel.compute_step(batch, "student")
-        -> [MODIFY] pipeline.generate_and_record_context(batch) [no_grad]
+        -> [MODIFY] method_model.run_generator(batch) [no_grad]
           -> [MODIFY] self_rollout(transition_mode="sgf_renoise", sgf_schedule=...)
             -> AR predict velocity
             -> [ADD] WanDiffusionWrapper.velocity_to_x0
             -> [ADD] renoise_x0(next_t) for non-final steps
             -> commit final x0 without noise
           <- ReplayContext(V/A exit + final clean + bounds)
-        -> [ADD] _replay_student_x0(requires_grad=True)
+        -> [ADD] replay(requires_grad=True)
           -> one joint AR student forward
           -> wrapper V/A velocity -> x0
         -> [ADD] V/A independent DMD t/noise
         -> [MODIFY] bidirectional real/fake score [no_grad]
           -> same noisy/context/t; real video CFG
           -> wrapper V/A velocity -> real_x0/fake_x0
-        -> [EXISTING] dmd_surrogate_loss
+        -> [MODIFY] SGFDMDModel._compute_kl_grad + 0.5*MSE surrogate
       <- DMD loss + metrics
     -> [EXISTING] backward/clip/student optimizer.step/lr_scheduler.step
     -> [EXISTING] log/checkpoint
@@ -1070,7 +1077,7 @@ DISTILL_ACTION_DENOISY_STEP_LIST="1000,500"
 [EXISTING] trainer optimizer schedule -> target="fake_score"
   -> [MODIFY] SGFDMDModel.compute_step
     -> [MODIFY] final-clean rollout + ReplayContext [no_grad]
-    -> [ADD] _replay_student_x0(requires_grad=False) [no_grad]
+    -> [ADD] replay(requires_grad=False) [no_grad]
     -> [ADD] V/A independent interval t + Gaussian
     -> add_noise(generated_x0)
     -> [MODIFY] bidirectional fake_score forward [grad]
@@ -1124,8 +1131,8 @@ mode 是一次 `self_rollout` 调用级不可变值，不随 frame、模态或 s
 
 ```python
 denoisy_step_list = {
-    "video": "list[float], Kv>=1, strictly descending, values in (0,T]",
-    "action": "list[float], Ka>=1, strictly descending, values in (0,T]",
+    "video": "linear d list[int], Kv>=1, strictly descending, values in (0,T]",
+    "action": "linear d list[int], Ka>=1, strictly descending, values in (0,T]",
 }
 ```
 
@@ -1137,8 +1144,8 @@ denoisy_step_list = {
 replay_context = {
     "replay_batch": "dict，text/stream/mask metadata + final clean V/A tensors",
     "rollout_timesteps": {
-        "video": "Tensor[B,F]，生成 mask 内等于 video denoisy_from",
-        "action": "Tensor[B,F]，生成 mask 内等于 action denoisy_from",
+        "video": "Tensor[B,F]，生成 mask 内为 video scheduler warp 后的实际 t",
+        "action": "Tensor[B,F]，生成 mask 内为 action scheduler warp 后的实际 t",
     },
     "rollout_noisy": {
         "video": "Tensor[B,Cv,F,V,H,W]，mask 内 recorded video exit x_t",
@@ -1178,11 +1185,12 @@ VADiffusionOutput(
 
 ### 9.5 DMD noise bundle
 
-pipeline 内部无需新增持久 dataclass，局部结构即可：
+SGFDMDModel 内部无需新增持久 dataclass，局部结构即可：
 
 ```python
 dmd_state = {
-    "timesteps": "VATimesteps，V/A 分别来自自己的 interval",
+    "progress": "VATimesteps，V/A 分别在线性 [to,from) 采样的 d",
+    "timesteps": "VATimesteps，V/A 由各自 scheduler warp 并 clamp 后的 t",
     "noise": "VAPrediction，V/A 独立 Gaussian",
     "noisy": "VAPrediction，mask 外精确保留 clean",
 }
@@ -1214,9 +1222,8 @@ metrics = {
 
 ```python
 def compute_student_step(batch):
-    # generate_and_record_context 内部显式调用
-    # self_rollout(transition_mode="sgf_renoise")。
-    ctx = generate_and_record_context(batch)       # no_grad, full final-clean rollout
+    # generator_loss 内部调用 _run_generator，后者显式调用 sgf_renoise rollout。
+    ctx = _run_generator(batch)                    # no_grad, full final-clean rollout
 
     student_x0 = replay_student_x0(ctx, grad=True) # V/A use different exit t
 
@@ -1233,30 +1240,32 @@ def compute_student_step(batch):
         timesteps=dmd_t,
     )
     with torch.no_grad():
-        real_x0 = real_score_cfg_wrapper(score_input, score_noisy, dmd_t)
-        fake_x0 = fake_wrapper.predict_joint(score_input, score_noisy, dmd_t).x0
+        kl_grad, logs = _compute_kl_grad(
+            score_input, batch, score_noisy, student_x0, dmd_t, ctx.masks
+        )
 
-    loss, metrics = dmd_surrogate_loss(
-        student_x0, fake_x0, real_x0, ctx.masks, loss_weights, eps
-    )
+    target = stop_gradient(student_x0 - kl_grad)
+    loss = 0.5 * masked_va_mse(student_x0, target, ctx.masks)
     return loss, metrics                         # no replay_target_loss
 
 
-def compute_fake_step(batch):
-    ctx = generate_and_record_context(batch)       # internal mode="sgf_renoise"
+def critic_loss(batch):
+    ctx = _run_generator(batch)                    # internal mode="sgf_renoise"
     with torch.no_grad():
         generated_x0 = replay_student_x0(ctx, grad=False)
 
     dmd_t = sample_va_intervals(ctx.selection, ctx.masks)
     noisy, noise = add_dmd_noise(generated_x0, dmd_t, ctx.masks)
-    fake_velocity = fake_wrapper.predict_joint_velocity(
-        prepare_score_input(ctx.replay_batch, noisy, generated_x0, dmd_t)
+    fake_output = fake_score(
+        prepare_score_input(ctx.replay_batch, noisy, generated_x0, dmd_t),
+        noisy,
+        dmd_t,
     )
     exact_target = VAPrediction(
         noise.video - generated_x0.video,
         noise.action - generated_x0.action,
     )
-    return fake_score_flow_loss(fake_velocity, exact_target, ctx.masks)
+    return fake_score_flow_loss(fake_output.velocity, exact_target, ctx.masks)
 ```
 
 ## 11. 验证方案
@@ -1279,7 +1288,8 @@ def compute_fake_step(batch):
 
 - `test_velocity_to_x0_hand_calculation`：`5-.75*4=2`。
 - `test_video_action_use_different_scheduler_sigmas`：同一 nominal t 下 V/A x0 不应错误共享 sigma。
-- `test_predict_joint_preserves_gradient`：student x0 可回传到 velocity/model parameter。
+- `test_forward_returns_flow_x0_and_preserves_student_gradient`：统一 forward 同时返回 flow/x0，并保留梯度。
+- `test_wrapper_initializes_video_and_action_schedulers`：wrapper 自行构建两套 scheduler。
 - `test_wrapper_does_not_register_model_parameters`：wrapper 无 `state_dict`/parameter ownership。
 - `test_condition_locations_are_restored_by_pipeline_mask`。
 
@@ -1299,12 +1309,13 @@ def compute_fake_step(batch):
 - `test_rollout_rng_advances_between_microsteps`。
 - `test_last_exit_maps_to_denoisy_to_zero`。
 
-### 11.4 Pipeline/loss/梯度测试
+### 11.4 Model/loss/梯度测试
 
 `distillation/tests/test_self_gradient_forcing_dmd.py`：
 
 - `test_context_contains_independent_va_intervals`。
-- `test_dmd_timesteps_respect_each_modality_interval`。
+- `test_dmd_progress_respects_each_modality_interval`。
+- `test_linear_progress_warps_through_each_modality_scheduler`。
 - `test_student_total_is_dmd_only`：总 loss 与 DMD 相等，无 replay metric。
 - `test_student_step_gradients_only_student`。
 - `test_fake_step_replays_student_without_grad`。
@@ -1355,7 +1366,7 @@ pytest -q \
 
 ### 12.2 两套 denoisy list 的最终实验值
 
-本文给出的 `[1000,833]` / `[1000,500]` 只是把当前 2-step + 不同 shift 的隐式 schedule 显式化，以便实现有确定默认。若目标实验已有指定 V/A lists，应在编码前替换；接口、bounds 与测试设计不受数值变化影响。
+默认线性列表为 `[1000,500]` / `[1000,500]`。不同 shift 会把它们映射为不同实际 timestep；若目标实验使用四段 schedule，可显式配置 `[1000,750,500,250]`，无需手工填写 warp 后的数值。
 
 ### 12.3 双向 fake-score checkpoint 来源
 
@@ -1382,9 +1393,9 @@ fake-score step 从“final clean 直接训练”变为“完整 rollout + 一�
 1. 固化 `wan22_train` base config 与 distillation dataset runtime override，并验证配置可导入。
 2. 实现 schema、scheduler pure helpers 和 wrapper，并完成 CPU 数学测试。
 3. 先把当前 scheduler path 固化为显式 `inference` mode 并完成数值等价测试；再实现 V/A schedule、recorder 与 `sgf_renoise` transition，完成双 mode fake-model rollout 测试。
-4. 精简 ReplayContext 和 pipeline，先跑 student DMD-only path，再接 fake replay path。
+4. 精简 ReplayContext 和 model，先跑 student DMD-only path，再接 fake replay path。
 5. 把 fake-score 切为双向，修正 fresh/resume/workflow 初始化来源。
 6. 删除 replay loss 定义/导出与旧配置字段，增加 CLI/shell 传播。
-7. 跑现有 cache 回归、pipeline 梯度测试和最小多 GPU smoke。
+7. 跑现有 cache 回归、model 梯度测试和最小多 GPU smoke。
 
 该顺序保证每一步都有独立可验证的 tensor 契约，也避免在 wrapper、rollout、loss 和 checkpoint 同时变化时难以定位错误。

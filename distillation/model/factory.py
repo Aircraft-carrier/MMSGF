@@ -8,7 +8,6 @@ import json
 import torch
 
 from distillation.model.utils import freeze_model, set_trainable
-from distillation.mask_profile import validate_checkpoint_generation_profile
 from distillation.model.autoregressive_mot import (
     AutoregressiveVAMOTTransformer3DModel,
 )
@@ -19,7 +18,6 @@ def load_transformer_export(
     checkpoint_path: str | Path,
     config: Any,
     *,
-    validate_distillation_profile: bool = True,
     autoregressive: bool = True,
 ) -> AutoregressiveVAMOTTransformer3DModel:
     """Load only a published cross-stage ``transformer/`` export.
@@ -53,11 +51,6 @@ def load_transformer_export(
             f"checkpoint={metadata.get('model_architecture')!r}, "
             f"expected={expected_architecture!r}"
         )
-    if validate_distillation_profile:
-        validate_checkpoint_generation_profile(
-            checkpoint_path,
-            config.distill.generation_shape,
-        )
     transformer_path = checkpoint_path / "transformer"
     model_cls = (
         AutoregressiveVAMOTTransformer3DModel
@@ -68,8 +61,6 @@ def load_transformer_export(
         transformer_path,
         torch_dtype=config.param_dtype,
     )
-    if autoregressive:
-        model.configure_generation_profile(config.distill.generation_shape)
     masked_attn_backend = getattr(config, "masked_attn_backend", None)
     if masked_attn_backend is not None:
         model.masked_attn_backend = str(masked_attn_backend)
@@ -81,20 +72,12 @@ def build_frozen_transformer(
     config: Any,
     device: torch.device,
     *,
-    install_distillation_profile: bool = True,
-    validate_distillation_profile: bool = True,
     autoregressive: bool = True,
 ) -> AutoregressiveVAMOTTransformer3DModel:
-    """Load a frozen transformer.
-
-    Stage2 teachers and EMA targets use the default distillation profile checks.
-    Stage3's real-score teacher intentionally disables both switches so the
-    source teacher checkpoint keeps its original wan_va attention mask.
-    """
+    """Load a frozen transformer."""
     model = load_transformer_export(
         checkpoint_path,
         config,
-        validate_distillation_profile=validate_distillation_profile,
         autoregressive=autoregressive,
     )
     return _configure_distillation_model(
@@ -102,7 +85,6 @@ def build_frozen_transformer(
         config,
         device,
         trainable=False,
-        install_distillation_profile=install_distillation_profile,
     )
 
 
@@ -111,14 +93,11 @@ def build_trainable_transformer(
     config: Any,
     device: torch.device,
     *,
-    install_distillation_profile: bool = True,
-    validate_distillation_profile: bool = True,
     autoregressive: bool = True,
 ) -> AutoregressiveVAMOTTransformer3DModel:
     model = load_transformer_export(
         checkpoint_path,
         config,
-        validate_distillation_profile=validate_distillation_profile,
         autoregressive=autoregressive,
     )
     return _configure_distillation_model(
@@ -126,7 +105,6 @@ def build_trainable_transformer(
         config,
         device,
         trainable=True,
-        install_distillation_profile=install_distillation_profile,
     )
 
 
@@ -136,7 +114,6 @@ def _configure_distillation_model(
     device: torch.device,
     *,
     trainable: bool,
-    install_distillation_profile: bool = True,
 ) -> VAMOTTransformer3DModel:
     from functools import partial
 
@@ -147,8 +124,6 @@ def _configure_distillation_model(
         shard_mot_model,
     )
 
-    if install_distillation_profile and hasattr(model, "configure_generation_profile"):
-        model.configure_generation_profile(config.distill.generation_shape)
     if trainable:
         set_trainable(model)
         apply_mot_parameter_ownership(model)

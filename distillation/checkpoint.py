@@ -76,7 +76,7 @@ class DistillationCheckpointIO:
         try:
             self._save_dcp_state(trainer, temp_dir / MOT_DCP_DIR_NAME)
             export_model = (
-                trainer.method_model.ema_student
+                trainer.model.ema_student
                 if trainer.method == CONSISTENCY_DISTILLATION
                 else trainer.transformer
             )
@@ -246,7 +246,7 @@ class DistillationCheckpointIO:
                 options=options,
             )
             ema_state = get_model_state_dict(
-                trainer.method_model.ema_student,
+                trainer.model.ema_student,
                 options=options,
             )
             return {
@@ -261,7 +261,7 @@ class DistillationCheckpointIO:
                 options=options,
             )
             fake_state, fake_optimizer_state = get_state_dict(
-                trainer.method_model.fake_score,
+                trainer.model.fake_score.model,
                 trainer.fake_score_optimizer,
                 options=options,
             )
@@ -292,13 +292,13 @@ class DistillationCheckpointIO:
         )
         if trainer.method == CONSISTENCY_DISTILLATION:
             set_model_state_dict(
-                trainer.method_model.ema_student,
+                trainer.model.ema_student,
                 state["ema_student"],
                 options=options,
             )
         else:
             set_state_dict(
-                trainer.method_model.fake_score,
+                trainer.model.fake_score.model,
                 trainer.fake_score_optimizer,
                 model_state_dict=state["fake_score"],
                 optim_state_dict=state["fake_score_optimizer"],

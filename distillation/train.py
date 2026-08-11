@@ -50,38 +50,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="Trainable fake-score initialization for DMD.")
     parser.add_argument("--resume-from", default=None, type=str,
                         help="Checkpoint root to resume the selected method.")
-    parser.add_argument("--rollout-interval", default=None, type=int,
-                        help="Run a consistency rollout every N completed training steps; <=0 disables it.")
-    parser.add_argument("--rollout-video-num-steps", default=None, type=int,
-                        help="Video denoising steps used by each training rollout.")
-    parser.add_argument("--rollout-action-num-steps", default=None, type=int,
-                        help="Action denoising steps used by each training rollout.")
     parser.add_argument(
         "--video-denoisy-step-list",
         default=None,
         type=_parse_timestep_list,
-        help="Comma-separated SGF video timesteps, strictly descending.",
+        help=(
+            "Comma-separated SGF video linear denoising progress values, "
+            "strictly descending."
+        ),
     )
     parser.add_argument(
         "--action-denoisy-step-list",
         default=None,
         type=_parse_timestep_list,
-        help="Comma-separated SGF action timesteps, strictly descending.",
+        help=(
+            "Comma-separated SGF action linear denoising progress values, "
+            "strictly descending."
+        ),
     )
     parser.add_argument("--rollout-horizon-frames", default=None, type=int,
                         help="Logical target frames generated after the clean target anchor.")
-    parser.add_argument(
-        "--rollout-gt-mode",
-        default=None,
-        choices=("none", "offline", "provider"),
-        help="Choose no GT replacement, offline batch GT, or an explicit provider API.",
-    )
-    parser.add_argument(
-        "--rollout-replacement-policy",
-        default=None,
-        choices=("require_ground_truth", "recompute_predicted"),
-        help="How to rebuild downstream action state after a partial GT replacement.",
-    )
     parser.add_argument("--cfg-min", default=None, type=float,
                         help="Minimum teacher video CFG scale for consistency distillation.")
     parser.add_argument("--cfg-max", default=None, type=float,
@@ -127,24 +115,11 @@ def run(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if value:
             config.distill[name] = Path(value)
-    for name in (
-        "rollout_interval",
-        "rollout_video_num_steps",
-        "rollout_action_num_steps",
-        "rollout_horizon_frames",
-    ):
+    for name in ("rollout_horizon_frames",):
         value = getattr(args, name)
         if value is not None:
             config.distill[name] = int(value)
     if args.method == SELF_GRADIENT_FORCING_DMD:
-        if (
-            args.rollout_video_num_steps is not None
-            or args.rollout_action_num_steps is not None
-        ):
-            raise ValueError(
-                "self_gradient_forcing_dmd uses --video/--action-denoisy-step-list "
-                "instead of rollout num steps"
-            )
         if args.video_denoisy_step_list is not None:
             config.distill.denoisy_step_list.video = list(
                 args.video_denoisy_step_list
@@ -166,10 +141,6 @@ def run(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if value is not None:
             config.distill[name] = float(value)
-    for name in ("rollout_gt_mode", "rollout_replacement_policy"):
-        value = getattr(args, name)
-        if value is not None:
-            config.distill[name] = str(value)
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size

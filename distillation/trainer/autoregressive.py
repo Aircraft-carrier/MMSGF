@@ -35,7 +35,6 @@ class AutoregressiveTrainer(MOTTrainer):
         elif config.distill.student_init is not None:
             config.initialize_from = str(config.distill.student_init)
         super().__init__(config)
-        self.transformer.configure_generation_profile(config.distill.generation_shape)
 
     def _write_checkpoint_metadata(self, checkpoint_dir: Path, *, has_full_state: bool) -> None:
         super()._write_checkpoint_metadata(checkpoint_dir, has_full_state=has_full_state)

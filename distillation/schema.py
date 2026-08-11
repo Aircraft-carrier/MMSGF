@@ -1,5 +1,4 @@
 """Shared distillation data structures."""
-import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -52,26 +51,16 @@ class VALossWeights:
 
 @dataclass(frozen=True, slots=True)
 class DenoisyInterval:
-    """One modality's sampled rollout exit and DMD timestep interval."""
+    """One rollout exit and its candidate DMD bounds in linear progress d.
+
+    ``denoisy_from`` and ``denoisy_to`` are not network timesteps. The DMD
+    schedule switches decide whether each bound is active; sampled ``d`` is
+    only then mapped through the modality-specific scheduler.
+    """
 
     exit_id: int
     denoisy_from: float
     denoisy_to: float
-
-    def __post_init__(self) -> None:
-        if int(self.exit_id) < 0:
-            raise ValueError("exit_id must be non-negative")
-        denoisy_from = float(self.denoisy_from)
-        denoisy_to = float(self.denoisy_to)
-        if (
-            not math.isfinite(denoisy_from)
-            or not math.isfinite(denoisy_to)
-            or not 0.0 <= denoisy_to < denoisy_from
-        ):
-            raise ValueError(
-                "denoisy interval requires 0 <= denoisy_to < denoisy_from, "
-                f"got from={denoisy_from}, to={denoisy_to}"
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,16 +88,16 @@ class CheckpointMetadata:
 class DMDUpdateSchedule:
     """用已完成 optimizer_step 决定下一窗口更新谁。
 
-    ``fake_score_steps=4`` 时 step 0..4 为 fake,fake,fake,fake,student，之后
+    ``fake_score_steps=4`` 时 step 0..4 为 fake,fake,fake,fake,generator，之后
     重复。gradient accumulation 期间 optimizer_step 不变，因此一个累积窗口
     不会在中途切换模型或 optimizer。
     """
 
     fake_score_steps: int
 
-    def optimizer_for_step(self, step: int) -> Literal["student", "fake_score"]:
+    def optimizer_for_step(self, step: int) -> Literal["generator", "fake_score"]:
         cycle_step = step % (self.fake_score_steps + 1)
-        return "student" if cycle_step == self.fake_score_steps else "fake_score"
+        return "generator" if cycle_step == self.fake_score_steps else "fake_score"
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +129,7 @@ class ReplayContext:
         return self.replay_batch
 
     @property
-    def student_batch(self) -> dict[str, Any]:
+    def generator_batch(self) -> dict[str, Any]:
         """Compatibility alias for the former field name."""
 
         return self.replay_batch

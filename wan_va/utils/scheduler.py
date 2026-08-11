@@ -97,14 +97,20 @@ class FlowMatchScheduler():
         return model_output
 
     def add_noise(self, original_samples, noise, timestep, t_dim=2):
-        if isinstance(timestep, torch.Tensor):
-            timestep = timestep.cpu()
-        timestep = timestep[None]
-        timestep_id = torch.argmin((self.timesteps[:, None] - timestep).abs(),
-                                   dim=0)
+        timestep = torch.as_tensor(timestep,
+                                   device=original_samples.device,
+                                   dtype=torch.float32)
+        if timestep.ndim == 0:
+            timestep = timestep[None]
+        timestep_id = torch.argmin(
+            (self.timesteps.to(original_samples.device)[:, None] -
+             timestep).abs(),
+            dim=0)
         shape = [1] * noise.ndim
         shape[t_dim] = timestep_id.shape[0]
-        sigma = self.sigmas[timestep_id].to(original_samples).view(shape)
+        sigma = self.sigmas.to(device=original_samples.device,
+                               dtype=original_samples.dtype)[
+            timestep_id].view(shape)
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
 

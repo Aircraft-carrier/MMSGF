@@ -1,50 +1,17 @@
 """Flow-matching tensor utilities for MOT distillation."""
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import torch
 
-from distillation.schema import DenoisyInterval
+from distillation.model.wan_wrapper import (
+    broadcast_frame_values,
+    sigmas_for_timesteps,
+)
 
 if TYPE_CHECKING:
     from wan_va.utils.scheduler import FlowMatchScheduler
-
-
-def sigmas_for_timesteps(
-    scheduler: "FlowMatchScheduler",
-    timesteps: torch.Tensor,
-    *,
-    dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Look up scheduler sigmas for an arbitrary timestep tensor.
-
-    原生 FlowMatchScheduler 的部分接口只正确处理一维 timestep；蒸馏需要
-    ``[B,F]``，例如 ``[[0,0,700,320]]``。这里把 scheduler 表扩成
-    ``[S,1,1]``，逐样本逐帧找最近离散点，返回同形 ``[B,F]`` sigma。
-    数值 timestep=0 可能映射到一个很小但非零的 sigma，所以 condition 是否
-    保持 clean 必须由调用方 mask 显式保证。
-    """
-    scheduler_timesteps = scheduler.timesteps.to(timesteps.device).reshape(
-        -1, *([1] * timesteps.ndim)
-    )
-    indices = (scheduler_timesteps - timesteps.unsqueeze(0)).abs().argmin(dim=0)
-    return scheduler.sigmas.to(timesteps.device)[indices].to(dtype=dtype)
-
-
-def broadcast_frame_values(values: torch.Tensor, sample: torch.Tensor) -> torch.Tensor:
-    """Broadcast ``[B,F]`` values over a MOT sample's channel/spatial axes.
-
-    video: ``[B,F] -> [B,1,F,1,1,1]``；
-    action: ``[B,F] -> [B,1,F,1,1]``。frame 轴固定是 sample 的 dim=2。
-    """
-    return values.reshape(
-        values.shape[0],
-        1,
-        values.shape[1],
-        *([1] * (sample.ndim - 3)),
-    )
 
 
 def sample_consistency_timesteps(
@@ -68,11 +35,6 @@ def sample_consistency_timesteps(
     有 sigma=0 的离散点。
     """
     schedule = scheduler.timesteps.to(device)
-    if len(schedule) < 2:
-        raise ValueError("Consistency training requires at least two scheduler states")
-    if num_steps <= 0:
-        raise ValueError(f"num_steps must be positive, got {num_steps}")
-
     stride = min(max(1, len(schedule) // num_steps), len(schedule) - 1)
     current_state_count = len(schedule) - stride
     timestep_ids = torch.randint(current_state_count, shape, device=device)
@@ -116,30 +78,6 @@ def renoise_x0(
         generator=generator,
     )
     return add_noise(x0, noise, next_timesteps, scheduler), noise
-
-
-def sample_interval_timesteps(
-    interval: DenoisyInterval,
-    shape: tuple[int, int],
-    device: torch.device,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    """Sample integer model timesteps within one exit-derived DMD interval."""
-    if len(shape) != 2:
-        raise ValueError(f"timestep shape must be [B,F], got {shape}")
-    if tuple(mask.shape) != tuple(shape):
-        raise ValueError(
-            f"timestep mask must have shape {shape}, got {tuple(mask.shape)}"
-        )
-    low = int(math.ceil(float(interval.denoisy_to)))
-    high = int(math.floor(float(interval.denoisy_from))) + 1
-    if high <= low:
-        raise ValueError(
-            "denoisy interval contains no integer timestep: "
-            f"[{interval.denoisy_to}, {interval.denoisy_from}]"
-        )
-    timesteps = torch.randint(low, high, shape, device=device)
-    return torch.where(mask.to(device=device, dtype=torch.bool), timesteps, 0)
 
 
 def flow_to_x0(

@@ -8,31 +8,58 @@ from torch import nn
 
 from distillation.configs.runtime_dataset import apply_distillation_runtime_overrides
 from distillation.model import objectives
-from distillation.model.dmd import SGFDMDModel
-from distillation.pipeline.self_gradient_forcing_training import (
-    SelfGradientForcingTrainingPipeline,
+from distillation.model.consistency import (
+    ConsistencyBaseModel,
+    ConsistencyModel,
+    ConsistencyTrainingModel,
 )
-from distillation.diffusion_utils import sample_interval_timesteps
+from distillation.model.dmd import (
+    BaseModel,
+    SGFDMDModel,
+    SelfGradientForcingModel,
+)
+from distillation.model.wan_wrapper import (
+    WanDiffusionWrapper as _RealWrapper,
+)
+from distillation.pipeline import SelfGradientForcingTrainingPipeline
 from distillation.schema import (
     DMDUpdateSchedule,
     DenoisyInterval,
     ReplayContext,
-    VADenoisySelection,
     VALossWeights,
+    VADenoisySelection,
     VAMasks,
     VAPrediction,
     VATimesteps,
 )
-from distillation.self_rollout.transitions import build_sgf_rollout_schedule
 from distillation.train import parse_args
+from wan_va.utils.scheduler import FlowMatchScheduler
 
 
-def test_video_action_intervals_are_independent() -> None:
-    video = SelfGradientForcingTrainingPipeline._interval((1000.0, 833.0), 0)
-    action = SelfGradientForcingTrainingPipeline._interval((1000.0, 500.0), 1)
+def test_training_models_keep_behavior_in_model_modules() -> None:
+    assert issubclass(SelfGradientForcingModel, BaseModel)
+    assert issubclass(SGFDMDModel, SelfGradientForcingModel)
+    assert issubclass(ConsistencyTrainingModel, ConsistencyBaseModel)
+    assert issubclass(ConsistencyModel, ConsistencyTrainingModel)
 
-    assert video == DenoisyInterval(0, 1000, 833)
-    assert action == DenoisyInterval(1, 500, 0)
+    for method in {"_initialize_models", "_prepare_input"}:
+        assert method in BaseModel.__dict__
+    for method in {"run_generator", "record", "replay"}:
+        assert method in SelfGradientForcingModel.__dict__
+    for method in {
+        "_get_timestep",
+        "_warp_timestep",
+        "_get_va_timesteps",
+        "_add_dmd_noise",
+        "_empty_text_condition",
+        "_compute_kl_grad",
+        "compute_distribution_matching_loss",
+        "generator_loss",
+        "critic_loss",
+    }:
+        assert method in SGFDMDModel.__dict__
+    assert BaseModel.__module__ == "distillation.model.dmd"
+    assert ConsistencyModel.__module__ == "distillation.model.consistency"
 
 
 def test_cli_parses_independent_video_action_lists() -> None:
@@ -80,53 +107,126 @@ def test_runtime_dataset_override_populates_wan22_base_paths(
     assert config.action_cache_manifest_path is None
 
 
-def test_sgf_schedule_rejects_non_descending_modality() -> None:
-    config = SimpleNamespace(
-        distill=SimpleNamespace(
-            denoisy_step_list=SimpleNamespace(
-                video=[1000, 833],
-                action=[500, 750],
-            )
-        )
-    )
-    scheduler = SimpleNamespace(num_train_timesteps=1000)
-
-    with pytest.raises(ValueError, match="strictly descending"):
-        build_sgf_rollout_schedule(
-            config,
-            video_scheduler=scheduler,
-            action_scheduler=scheduler,
-        )
-
-
-def test_interval_timestep_sampling_respects_mask_and_bounds() -> None:
+def test_interval_progress_sampling_respects_mask_and_half_open_bounds() -> None:
     interval = DenoisyInterval(exit_id=0, denoisy_from=700, denoisy_to=300)
     mask = torch.tensor([[True, False, True], [False, True, False]])
+    model = SGFDMDModel.__new__(SGFDMDModel)
+    model.device = torch.device("cpu")
+    model.ts_schedule = True
+    model.ts_schedule_max = True
+    model.min_score_timestep = 0
+    model.num_train_timestep = 1000
 
-    timesteps = sample_interval_timesteps(
+    progress = model._get_timestep(
         interval,
         tuple(mask.shape),
-        torch.device("cpu"),
         mask,
     )
 
-    assert torch.equal(timesteps[~mask], torch.zeros_like(timesteps[~mask]))
-    assert bool((timesteps[mask] >= 300).all())
-    assert bool((timesteps[mask] <= 700).all())
+    assert torch.equal(progress[~mask], torch.zeros_like(progress[~mask]))
+    assert bool((progress[mask] >= 300).all())
+    assert bool((progress[mask] < 700).all())
 
 
-def test_student_objective_is_dmd_only_and_has_expected_direction() -> None:
-    assert not hasattr(objectives, "replay_target_loss")
-    student_video = torch.zeros(1, 1, 1, 1, 1, 1, requires_grad=True)
-    student_action = torch.zeros(1, 1, 1, 1, 1, requires_grad=True)
-    student = VAPrediction(student_video, student_action)
-    fake = VAPrediction(
-        torch.zeros_like(student_video),
-        torch.zeros_like(student_action),
+def test_interval_progress_is_uniform_across_frames_per_batch_item() -> None:
+    mask = torch.ones(4, 8, dtype=torch.bool)
+    model = SGFDMDModel.__new__(SGFDMDModel)
+    model.device = torch.device("cpu")
+    model.ts_schedule = True
+    model.ts_schedule_max = True
+    model.min_score_timestep = 0
+    model.num_train_timestep = 1000
+
+    progress = model._get_timestep(
+        DenoisyInterval(exit_id=1, denoisy_from=750, denoisy_to=500),
+        tuple(mask.shape),
+        mask,
     )
-    real = VAPrediction(
-        torch.ones_like(student_video),
-        torch.ones_like(student_action),
+
+    assert torch.equal(progress, progress[:, :1].expand_as(progress))
+
+
+@pytest.mark.parametrize(
+    ("ts_schedule", "ts_schedule_max", "expected_low", "expected_high"),
+    [
+        (False, False, 100, 1000),
+        (True, False, 300, 1000),
+        (False, True, 100, 700),
+        (True, True, 300, 700),
+    ],
+)
+def test_dmd_schedule_switches_select_linear_sampling_bounds(
+    ts_schedule,
+    ts_schedule_max,
+    expected_low,
+    expected_high,
+) -> None:
+    model = SGFDMDModel.__new__(SGFDMDModel)
+    model.device = torch.device("cpu")
+    model.ts_schedule = ts_schedule
+    model.ts_schedule_max = ts_schedule_max
+    model.min_score_timestep = 100
+    model.num_train_timestep = 1000
+    mask = torch.ones(32, 16, dtype=torch.bool)
+
+    progress = model._get_timestep(
+        DenoisyInterval(exit_id=0, denoisy_from=700, denoisy_to=300),
+        tuple(mask.shape),
+        mask,
+    )
+
+    assert bool((progress >= expected_low).all())
+    assert bool((progress < expected_high).all())
+
+
+def test_linear_progress_warps_through_each_modality_scheduler() -> None:
+    video_scheduler = FlowMatchScheduler(
+        shift=5.0,
+        sigma_min=0.0,
+        extra_one_step=True,
+    )
+    action_scheduler = FlowMatchScheduler(
+        shift=1.0,
+        sigma_min=0.0,
+        extra_one_step=True,
+    )
+    video_scheduler.set_timesteps(1000, training=True)
+    action_scheduler.set_timesteps(1000, training=True)
+    progress = torch.tensor([1000, 750, 500, 250, 0])
+
+    torch.testing.assert_close(
+        SelfGradientForcingTrainingPipeline.warp_denoisy_progress(
+            progress,
+            video_scheduler,
+        ),
+        torch.tensor([1000.0, 937.5, 833.3333, 625.0, 0.0]),
+        rtol=1e-5,
+        atol=1e-4,
+    )
+    torch.testing.assert_close(
+        SelfGradientForcingTrainingPipeline.warp_denoisy_progress(
+            progress,
+            action_scheduler,
+        ),
+        progress.float(),
+    )
+
+
+def test_dmd_losses_are_explicit() -> None:
+    assert not hasattr(objectives, "replay_target_loss")
+    assert callable(objectives.dmd_surrogate_loss)
+    assert "_compute_kl_grad" in SGFDMDModel.__dict__
+    assert "compute_distribution_matching_loss" in SGFDMDModel.__dict__
+
+
+def test_dmd_surrogate_loss_is_half_masked_mse() -> None:
+    x0 = VAPrediction(
+        video=torch.zeros(1, 1, 1, 1, 1, 1),
+        action=torch.zeros(1, 1, 1, 1, 1),
+    )
+    target = VAPrediction(
+        video=torch.ones(1, 1, 1, 1, 1, 1),
+        action=torch.ones(1, 1, 1, 1, 1),
     )
     masks = VAMasks(
         video=torch.ones(1, 1, dtype=torch.bool),
@@ -134,32 +234,24 @@ def test_student_objective_is_dmd_only_and_has_expected_direction() -> None:
     )
 
     loss, metrics = objectives.dmd_surrogate_loss(
-        student,
-        fake,
-        real,
+        x0,
+        target,
         masks,
-        VALossWeights(),
+        VALossWeights(video=1.0, action=1.0),
     )
-    loss.backward()
 
-    assert set(metrics) == {
-        "distill/dmd_video_loss",
-        "distill/dmd_action_loss",
-        "distill/dmd_total_loss",
-    }
-    assert student_video.grad.item() < 0
-    assert student_action.grad.item() < 0
+    # Per-stream MSE = 1, weighted total = 2, surrogate = 0.5 * 2 = 1.
+    assert torch.allclose(loss, torch.tensor(1.0))
+    assert torch.allclose(metrics["distill/dmd_video_loss"], torch.tensor(0.5))
+    assert torch.allclose(metrics["distill/dmd_action_loss"], torch.tensor(0.5))
+    assert torch.allclose(metrics["distill/dmd_total_loss"], torch.tensor(1.0))
 
 
 def test_resume_rejects_changed_denoisy_lists() -> None:
     model = SGFDMDModel.__new__(SGFDMDModel)
     model.update_schedule = DMDUpdateSchedule(fake_score_steps=4)
-    model.pipeline = SimpleNamespace(
-        sgf_schedule=SimpleNamespace(
-            video_steps=(1000.0, 833.0),
-            action_steps=(1000.0, 500.0),
-        )
-    )
+    model.video_denoising_step_list = (1000.0, 833.0)
+    model.action_denoising_step_list = (1000.0, 500.0)
 
     with pytest.raises(ValueError, match="do not match checkpoint"):
         model.load_state_dict(
@@ -212,14 +304,21 @@ class _TinyTrainer:
         return torch.zeros(1, 1, 1)
 
 
-def _tiny_pipeline_and_context():
+def _tiny_model_and_context(monkeypatch):
     config = SimpleNamespace(
         video_loss_weight=1.0,
         action_loss_weight=1.0,
+        snr_shift=1.0,
+        action_snr_shift=1.0,
         distill=SimpleNamespace(
+            fake_score_update_ratio=4,
             dmd_normalizer_eps=1e-6,
+            ts_schedule=True,
+            ts_schedule_max=True,
+            min_score_timestep=0,
+            dmd_timestep_min=20,
+            dmd_timestep_max=980,
             rollout_horizon_frames=1,
-            rollout_masked_attn_backend="dense",
             teacher_cfg_min=1.0,
             teacher_cfg_max=1.0,
             denoisy_step_list=SimpleNamespace(
@@ -232,13 +331,24 @@ def _tiny_pipeline_and_context():
     student = _TinyScore(0.1, trainable=True)
     real = _TinyScore(0.2, trainable=False)
     fake = _TinyScore(0.3, trainable=True)
-    pipeline = SelfGradientForcingTrainingPipeline(
-        config,
-        trainer,
-        torch.device("cpu"),
-        student,
-        real,
-        fake,
+
+    sources = iter([student, real, fake])
+
+    def fake_load_model(checkpoint_path, config, *, autoregressive):
+        del checkpoint_path, config, autoregressive
+        return next(sources)
+
+    monkeypatch.setattr(
+        _RealWrapper,
+        "_load_model",
+        staticmethod(fake_load_model),
+    )
+    model = SGFDMDModel(
+        config=config,
+        student_init="/tmp/tiny-student",
+        device=torch.device("cpu"),
+        real_score_checkpoint="/tmp/tiny-real",
+        fake_score_init="/tmp/tiny-fake",
     )
     final_clean = VAPrediction(
         video=torch.zeros(1, 1, 2, 1, 1, 1),
@@ -272,13 +382,37 @@ def _tiny_pipeline_and_context():
         masks=masks,
         denoisy_selection=selection,
     )
-    return pipeline, context, student, real, fake
+    return model, context, trainer, student, real, fake
 
 
-def test_pipeline_student_and_fake_steps_isolate_gradients() -> None:
-    pipeline, context, student, real, fake = _tiny_pipeline_and_context()
+def test_dmd_model_loads_models_from_paths_only(monkeypatch) -> None:
+    model, _context, _trainer, _student, _real, _fake = _tiny_model_and_context(
+        monkeypatch
+    )
 
-    student_loss, student_metrics = pipeline.replay_and_score(context)
+    assert not hasattr(model, "text_encoder")
+    assert not hasattr(model, "vae")
+    assert model.generator.video_scheduler.timesteps.device.type == "cpu"
+
+
+def test_dmd_model_hierarchy_and_steps_isolate_gradients(monkeypatch) -> None:
+    model, context, trainer, student, real, fake = _tiny_model_and_context(
+        monkeypatch
+    )
+    assert isinstance(model, SelfGradientForcingModel)
+    assert isinstance(model, BaseModel)
+    model._run_generator = lambda _batch: context
+    base_input = trainer._prepare_joint_input_dict(
+        context.replay_batch,
+        add_noise=False,
+    )
+    empty_text_emb = trainer._get_empty_text_emb()
+
+    student_loss, student_metrics = model.generator_loss(
+        {},
+        base_input=base_input,
+        empty_text_emb=empty_text_emb,
+    )
     student_loss.backward()
     assert student.scale.grad is not None
     assert fake.scale.grad is None
@@ -287,8 +421,156 @@ def test_pipeline_student_and_fake_steps_isolate_gradients() -> None:
     assert not any("replay" in key for key in student_metrics)
 
     student.scale.grad = None
-    fake_loss, _ = pipeline.fake_score_step(context)
+    fake_loss, _ = model.critic_loss({}, base_input=base_input)
     fake_loss.backward()
     assert student.scale.grad is None
     assert fake.scale.grad is not None
     assert real.scale.grad is None
+
+
+def test_add_dmd_noise_supports_batch_gt_one(monkeypatch) -> None:
+    """Per-sample [B,F] timesteps must broadcast on the frame axis, not crash."""
+    from distillation.model.wan_wrapper import (
+        broadcast_frame_values,
+        sigmas_for_timesteps,
+    )
+
+    model, _context, _trainer, _student, _real, _fake = _tiny_model_and_context(
+        monkeypatch
+    )
+    clean = VAPrediction(
+        video=torch.zeros(3, 1, 2, 1, 1, 1),
+        action=torch.zeros(3, 1, 2, 1, 1),
+    )
+    masks = VAMasks(
+        video=torch.tensor([[True, False], [True, True], [False, True]]),
+        action=torch.tensor(
+            [
+                [[[[True]], [[False]]]],
+                [[[[True]], [[True]]]],
+                [[[[False]], [[True]]]],
+            ]
+        ),
+    )
+    timesteps = VATimesteps(
+        video=torch.tensor(
+            [[500.0, 0.0], [500.0, 500.0], [0.0, 500.0]],
+        ),
+        action=torch.tensor(
+            [[500.0, 0.0], [500.0, 500.0], [0.0, 500.0]],
+        ),
+    )
+
+    noisy, noise = model._add_dmd_noise(clean, timesteps, masks)
+
+    assert noisy.video.shape == clean.video.shape
+    assert noisy.action.shape == clean.action.shape
+    video_mask = masks.video[:, None, :, None, None, None]
+    sigma_video = broadcast_frame_values(
+        sigmas_for_timesteps(
+            model.generator.video_scheduler,
+            timesteps.video,
+            dtype=torch.float32,
+        ),
+        noisy.video,
+    )
+    expected_video = torch.where(
+        video_mask,
+        (1.0 - sigma_video) * clean.video + sigma_video * noise.video,
+        clean.video,
+    )
+    assert torch.equal(
+        noisy.video,
+        expected_video,
+    )
+    sigma_action = broadcast_frame_values(
+        sigmas_for_timesteps(
+            model.generator.action_scheduler,
+            timesteps.action,
+            dtype=torch.float32,
+        ),
+        noisy.action,
+    )
+    expected_action = torch.where(
+        masks.action,
+        (1.0 - sigma_action) * clean.action + sigma_action * noise.action,
+        clean.action,
+    )
+    assert torch.equal(
+        noisy.action,
+        expected_action,
+    )
+
+
+def test_critic_loss_score_input_can_use_gt_clean(monkeypatch) -> None:
+    """score_input_use_gt_clean=True feeds GT clean as the score condition."""
+    model, context, _trainer, _student, _real, _fake = _tiny_model_and_context(
+        monkeypatch
+    )
+    gt_video = torch.randn(1, 1, 2, 1, 1, 1)
+    gt_action = torch.randn(1, 1, 2, 1, 1)
+    base_input = {
+        "latent_dict": {
+            "latent": gt_video,
+            "text_emb": torch.ones(1, 1, 1),
+        },
+        "action_dict": {
+            "latent": gt_action,
+            "text_emb": torch.ones(1, 1, 1),
+        },
+        "stream_ids": torch.zeros(1, 1, dtype=torch.long),
+    }
+    model._run_generator = lambda _batch: context
+    model.score_input_use_gt_clean = True
+    original_fake = model.fake_score
+    captured = {}
+
+    def spy_score(input_dict, noisy, timesteps):
+        captured["latent"] = input_dict["latent_dict"]["latent"]
+        captured["action_latent"] = input_dict["action_dict"]["latent"]
+        return original_fake(input_dict, noisy, timesteps)
+
+    model.fake_score = spy_score
+    model.critic_loss({}, base_input=base_input)
+
+    assert torch.equal(captured["latent"], gt_video)
+    assert torch.equal(captured["action_latent"], gt_action)
+
+
+def test_generator_loss_score_input_can_use_gt_clean(monkeypatch) -> None:
+    """score_input_use_gt_clean=True also feeds GT clean in the generator loss."""
+    model, context, _trainer, _student, _real, _fake = _tiny_model_and_context(
+        monkeypatch
+    )
+    gt_video = torch.randn(1, 1, 2, 1, 1, 1)
+    gt_action = torch.randn(1, 1, 2, 1, 1)
+    base_input = {
+        "latent_dict": {
+            "latent": gt_video,
+            "text_emb": torch.ones(1, 1, 1),
+        },
+        "action_dict": {
+            "latent": gt_action,
+            "text_emb": torch.ones(1, 1, 1),
+        },
+        "stream_ids": torch.zeros(1, 1, dtype=torch.long),
+    }
+    model._run_generator = lambda _batch: context
+    model.score_input_use_gt_clean = True
+    original_fake = model.fake_score
+    captured = {}
+
+    def spy_score(input_dict, noisy, timesteps):
+        captured["latent"] = input_dict["latent_dict"]["latent"]
+        captured["action_latent"] = input_dict["action_dict"]["latent"]
+        return original_fake(input_dict, noisy, timesteps)
+
+    model.fake_score = spy_score
+    model.generator_loss(
+        {},
+        base_input=base_input,
+        empty_text_emb=torch.zeros(1, 1, 1),
+    )
+
+    assert torch.equal(captured["latent"], gt_video)
+    assert torch.equal(captured["action_latent"], gt_action)

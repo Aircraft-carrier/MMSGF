@@ -4,8 +4,8 @@ from __future__ import annotations
 
 def __getattr__(name: str):
     if name == "WanDiffusionWrapper":
-        from distillation.model.wan_wrapper import WanDiffusionWrapper
-        return WanDiffusionWrapper
+        from distillation.model import wan_wrapper
+        return getattr(wan_wrapper, name)
     if name in {
         "AutoregressiveVAMOTTransformer3DModel",
         "AutoregressiveVAMOTBlock",
@@ -18,14 +18,22 @@ def __getattr__(name: str):
             "AutoregressiveVAMOTTransformer3DModel": AutoregressiveVAMOTTransformer3DModel,
             "AutoregressiveVAMOTBlock": AutoregressiveVAMOTBlock,
         }[name]
-    if name in {"ConsistencyModel", "SGFDMDModel"}:
-        if name == "ConsistencyModel":
-            from distillation.model.consistency import ConsistencyModel
-            return ConsistencyModel
-        from distillation.model.dmd import SGFDMDModel
-        return SGFDMDModel
     if name in {
+        "ConsistencyBaseModel",
+        "ConsistencyTrainingModel",
+        "ConsistencyModel",
+    }:
+        from distillation.model import consistency
+        return getattr(consistency, name)
+    if name in {"BaseModel", "SelfGradientForcingModel", "SGFDMDModel"}:
+        from distillation.model import dmd
+        return getattr(dmd, name)
+    if name in {
+        "add_noise_to_va",
         "freeze_model",
+        "mask_clean_targets",
+        "replace_text_condition",
+        "replace_va_streams",
         "set_trainable",
         "update_ema",
     }:
@@ -53,13 +61,21 @@ __all__ = [
     "AutoregressiveVAMOTTransformer3DModel",
     "AutoregressiveVAMOTBlock",
     "ConsistencyModel",
+    "ConsistencyBaseModel",
+    "ConsistencyTrainingModel",
+    "BaseModel",
     "SGFDMDModel",
+    "SelfGradientForcingModel",
     "action_aware_loss",
+    "add_noise_to_va",
     "build_frozen_transformer",
     "build_trainable_transformer",
     "freeze_model",
+    "mask_clean_targets",
     "load_transformer_export",
     "set_trainable",
+    "replace_text_condition",
+    "replace_va_streams",
     "update_ema",
     "consistency_loss",
     "dmd_surrogate_loss",
