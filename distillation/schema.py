@@ -110,44 +110,13 @@ class TrainingStepResult:
 class ReplayContext:
     """Stage3 no-grad record 与有梯度 replay 之间的完整边界。
 
-    ``rollout_noisy`` 是 V/A 各自 exit 的真实 sampler state；
-    ``final_clean_context`` 是 GT history/anchor 加完整 rollout 的最终 x0。
+    ``noisy_at_t`` 是 V/A 各自 exit 的真实 sampler state；
+    ``clean_hat`` 是 GT history/anchor 加完整 rollout 的最终 x0。
     所有 record tensor 都已 detach，梯度只在 replay 时重新建立。
     """
 
-    replay_batch: dict[str, Any]
-    rollout_timesteps: VATimesteps
-    rollout_noisy: VAPair
-    final_clean_context: VAPair
+    exit_timesteps: VATimesteps
+    noisy_at_t: VAPair
+    clean_hat: VAPair
     masks: VAMasks
     denoisy_selection: VADenoisySelection
-
-    @property
-    def batch(self) -> dict[str, Any]:
-        """Compatibility alias for callers that consume the replay batch."""
-
-        return self.replay_batch
-
-    @property
-    def generator_batch(self) -> dict[str, Any]:
-        """Compatibility alias for the former field name."""
-
-        return self.replay_batch
-
-    @property
-    def timesteps(self) -> VATimesteps:
-        return self.rollout_timesteps
-
-    @property
-    def noisy(self) -> VAPair:
-        return self.rollout_noisy
-
-    @property
-    def generated(self) -> VAPair:
-        return self.final_clean_context
-
-    @property
-    def pred_clean(self) -> VAPair:
-        """Compatibility alias for the former final-clean field name."""
-
-        return self.final_clean_context

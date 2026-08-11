@@ -19,6 +19,7 @@ from distillation.model.dmd import (
     BaseModel,
     SGFDMDModel,
     SelfGradientForcingModel,
+    warp_denoisy_progress,
 )
 from distillation.model.wan_wrapper import (
     WanDiffusionWrapper as _RealWrapper,
@@ -197,7 +198,7 @@ def test_linear_progress_warps_through_each_modality_scheduler() -> None:
     progress = torch.tensor([1000, 750, 500, 250, 0])
 
     torch.testing.assert_close(
-        SelfGradientForcingTrainingPipeline.warp_denoisy_progress(
+        warp_denoisy_progress(
             progress,
             video_scheduler,
         ),
@@ -206,7 +207,7 @@ def test_linear_progress_warps_through_each_modality_scheduler() -> None:
         atol=1e-4,
     )
     torch.testing.assert_close(
-        SelfGradientForcingTrainingPipeline.warp_denoisy_progress(
+        warp_denoisy_progress(
             progress,
             action_scheduler,
         ),
@@ -371,16 +372,12 @@ def _tiny_model_and_context(monkeypatch):
         action=DenoisyInterval(1, 500, 0),
     )
     context = ReplayContext(
-        replay_batch={
-            "text_emb": torch.ones(1, 1, 1),
-            "stream_ids": torch.zeros(1, 1, dtype=torch.long),
-        },
-        rollout_timesteps=VATimesteps(
+        exit_timesteps=VATimesteps(
             video=torch.tensor([[0.0, 1000.0]]),
             action=torch.tensor([[0.0, 500.0]]),
         ),
-        rollout_noisy=noisy,
-        final_clean_context=final_clean,
+        noisy_at_t=noisy,
+        clean_hat=final_clean,
         masks=masks,
         denoisy_selection=selection,
     )
@@ -405,7 +402,10 @@ def test_dmd_model_hierarchy_and_steps_isolate_gradients(monkeypatch) -> None:
     assert isinstance(model, BaseModel)
     model._run_generator = lambda _batch: context
     base_input = trainer._prepare_joint_input_dict(
-        context.replay_batch,
+        {
+            "text_emb": torch.ones(1, 1, 1),
+            "stream_ids": torch.zeros(1, 1, dtype=torch.long),
+        },
         add_noise=False,
     )
     empty_text_emb = trainer._get_empty_text_emb()
@@ -430,6 +430,42 @@ def test_dmd_model_hierarchy_and_steps_isolate_gradients(monkeypatch) -> None:
     assert real.scale.grad is None
 
 
+def test_generator_loss_uses_batch_empty_text_embedding(monkeypatch) -> None:
+    model, context, _trainer, _student, _real, _fake = _tiny_model_and_context(
+        monkeypatch
+    )
+    model._run_generator = lambda _batch: context
+    batch_empty_text_emb = torch.full((1, 1, 1), 2.0)
+    captured = {}
+
+    def capture_kl_grad(
+        _score_input,
+        _noisy,
+        estimated_clean,
+        _timesteps,
+        _masks,
+        empty_text_emb,
+    ):
+        captured["empty_text_emb"] = empty_text_emb
+        return VAPair(
+            video=torch.zeros_like(estimated_clean.video),
+            action=torch.zeros_like(estimated_clean.action),
+        ), {}
+
+    model._compute_kl_grad = capture_kl_grad
+    model.generator_loss(
+        {"empty_text_emb": batch_empty_text_emb},
+        base_input={
+            "latent_dict": {"text_emb": torch.ones(1, 1, 1)},
+            "action_dict": {"text_emb": torch.ones(1, 1, 1)},
+            "stream_ids": torch.zeros(1, 1, dtype=torch.long),
+        },
+        empty_text_emb=torch.zeros(1, 1, 1),
+    )
+
+    assert captured["empty_text_emb"] is batch_empty_text_emb
+
+
 def test_generator_loss_handles_all_false_action_mask(monkeypatch) -> None:
     model, context, trainer, student, _real, _fake = _tiny_model_and_context(
         monkeypatch
@@ -443,7 +479,10 @@ def test_generator_loss_handles_all_false_action_mask(monkeypatch) -> None:
     )
     model._run_generator = lambda _batch: context
     base_input = trainer._prepare_joint_input_dict(
-        context.replay_batch,
+        {
+            "text_emb": torch.ones(1, 1, 1),
+            "stream_ids": torch.zeros(1, 1, dtype=torch.long),
+        },
         add_noise=False,
     )
 

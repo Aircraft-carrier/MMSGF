@@ -10,7 +10,6 @@ import torch.nn as nn
 
 from distillation.model.objectives import dmd_surrogate_loss, fake_score_flow_loss
 from distillation.model.utils import (
-    add_noise_to_va,
     replace_text_condition,
     replace_va_streams,
 )
@@ -30,6 +29,63 @@ from distillation.schema import (
     VATimesteps,
 )
 from wan_va.utils.scheduler import FlowMatchScheduler
+
+
+def warp_denoisy_progress(
+    progress: torch.Tensor,
+    scheduler: FlowMatchScheduler,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Map linear denoising progress ``d`` to the scheduler's network timestep.
+
+    ``d`` uses the reference SGF coordinate ``[0,T]`` with ``d=T`` at the
+    noisiest end and ``d=0`` at the clean end.
+    """
+    total = int(scheduler.num_train_timesteps)
+    shift = float(scheduler.shift)
+    progress_f = torch.as_tensor(
+        progress,
+        device=progress.device,
+        dtype=torch.float32,
+    )
+
+    # Stage 1/3: Linear progress d -> linear sigma = d / T.
+    #
+    # Example (T=1000):
+    #   d=1000 -> sigma=1.0
+    #   d=250  -> sigma=0.25
+    #   d=0    -> sigma=0.0
+    sigma = progress_f / float(total)
+
+    # Stage 2/3: Apply the FlowMatchScheduler rational shift.
+    #
+    #                    shift * sigma
+    #   warped_sigma = ---------------------
+    #                   1 + (shift-1)*sigma
+    #
+    # Example (shift=5, sigma=0.25): 1.25 / 2 = 0.625.
+    warped_sigma = shift * sigma / (1.0 + (shift - 1.0) * sigma)
+
+    # Stage 3/3: Warped sigma back to the network timestep t = sigma * T.
+    #
+    # Example: 0.625 * 1000 = 625.
+    warped_timestep = warped_sigma * float(total)
+
+    # Pin the two exact endpoints to avoid floating-point drift:
+    #   d=0 -> t=0, d=T -> t=T.
+    warped_timestep = torch.where(
+        progress_f == 0,
+        torch.zeros_like(warped_timestep),
+        warped_timestep,
+    )
+    warped_timestep = torch.where(
+        progress_f == total,
+        torch.full_like(warped_timestep, float(total)),
+        warped_timestep,
+    )
+    network_timestep = warped_timestep.to(dtype=dtype)
+    return network_timestep
 
 
 class BaseModel:
@@ -88,16 +144,19 @@ class BaseModel:
         """Load the generator/real/fake wrappers from checkpoint paths only."""
         if student_init is None:
             raise ValueError("student_init path is required")
+        # 自回归学生：负责 SGF rollout 和最终生成
         self.generator = WanDiffusionWrapper(
             config=self.config,
             checkpoint_path=student_init,
             autoregressive=True,
         )
+        # 冻结的双向教师：近似真实数据分布
         self.real_score = WanDiffusionWrapper(
             config=self.config,
             checkpoint_path=real_score_checkpoint,
             autoregressive=False,
         )
+        # 可训练的双向 score：近似 generator 当前分布
         self.fake_score = WanDiffusionWrapper(
             config=self.config,
             checkpoint_path=fake_score_init,
@@ -112,6 +171,8 @@ class BaseModel:
         fake_score: nn.Module | None = None,
     ) -> None:
         """Install trainer-wrapped (FSDP/AC) models back into the wrappers."""
+        # Trainer 完成 FSDP、activation checkpoint 等包装后，
+        # 把包装后的 nn.Module 重新放回 wrapper。
         if generator is not None:
             self.generator.model = generator
         if real_score is not None:
@@ -189,14 +250,21 @@ class SelfGradientForcingModel(BaseModel):
         clean: VAPair,
         masks: VAMasks,
     ) -> VAPair:
-        return VAPair(
+        """Keep rollout noise in masked regions and clean context elsewhere."""
+        masked_noisy = VAPair(
             video=torch.where(
+                # Video uses a frame-level mask [B, F]. Expand it to
+                # [B, 1, F, 1, 1, 1] so the decision is shared across
+                # channels, views, and spatial positions in each frame.
                 masks.video[:, None, :, None, None, None],
                 noisy.video,
                 clean.video,
             ),
+            # The action mask already matches the element-level action layout
+            # [B, Ca, F, N, 1], so no additional broadcasting axes are needed.
             action=torch.where(masks.action, noisy.action, clean.action),
         )
+        return masked_noisy
 
     def record(
         self,
@@ -204,20 +272,32 @@ class SelfGradientForcingModel(BaseModel):
         rollout,
     ) -> ReplayContext:
         """Build the detached boundary between rollout and gradient replay.
-
+        VADenoisySelection = {
+            "video" = {
+                "exit_id"                              # video 退出采样的 id = 2 
+                "denoisy_from"                         # video 线性去噪区间起点 500 ([1000, 750, 500, 250] )
+                "denoisy_to"                           # video 线性去噪区间终点 250 
+            },
+            "action" = {
+                "exit_id"
+                "denoisy_from"
+                "denoisy_to"
+            }
+        }
         ReplayContext = {
-            "replay_batch":        dict,                # 生成区间替换为 rollout 预测的 batch(latents/actions/masks 已更新)
-            "rollout_timesteps":   VATimesteps,         # exit 时刻网络 timestep,video/action 各 [B,F]
-            "rollout_noisy":       VAPrediction,        # exit 时刻加噪输入(video [B,Cv,F,V,H,W],action [B,Ca,F,N,1])
-            "final_clean_context": VAPrediction,        # 全轨迹 clean(生成区间=rollout x0,其余=GT)
-            "masks":               VAMasks,             # video [B,F],action [B,Ca,F,N,1],只覆盖生成区间
-            "denoisy_selection":   VADenoisySelection,  # 各模态 exit interval(线性 d 坐标)
+            "exit_timesteps":    VATimesteps,         # exit 时刻网络 timestep,video/action 各 [B,F]
+            "noisy_at_t":        VAPair,              # exit 时刻加噪输入(video [B,Cv,F,V,H,W],action [B,Ca,F,N,1])
+            "clean_hat":         VAPair,              # 全轨迹 clean(生成区间=rollout x0,其余=GT)
+            "masks":             VAMasks,             # video [B,F],action [B,Ca,F,N,1],只覆盖生成区间
+            "denoisy_selection": VADenoisySelection,  # 各模态 exit interval(线性 d 坐标)
         }
         """
         frames = int(batch["latents"].shape[2])
+        # 阶段 1/4：确定生成区间
         generated_ids = list(rollout.pred_frame_ids)
         generated_start = generated_ids[0]
         generated_end = generated_ids[-1] + 1
+        # 保存 video/action 各自的退出位置和线性去噪区间
         selection = VADenoisySelection(
             video=DenoisyInterval(
                 exit_id=rollout.video_exit_id,
@@ -230,67 +310,73 @@ class SelfGradientForcingModel(BaseModel):
                 denoisy_to=rollout.action_denoised_timestep_to,
             ),
         )
-
+        
+        # 阶段 2/4：只监督“有效且属于生成区间”的位置
+        # generated_frames: [B,F]
         generated_frames = torch.zeros(
             (batch["latents"].shape[0], frames),
             dtype=torch.bool,
             device=batch["latents"].device,
         )
         generated_frames[:, generated_start:generated_end] = True
+        # video_mask:  [B,F]
+        # action_mask: [B,Ca,F,N,1]
         video_mask = batch["video_latent_valid_mask"].bool() & generated_frames
         action_mask = batch["action_valid_mask"].bool() & generated_frames[
             :, None, :, None, None
         ]
         masks = VAMasks(video=video_mask, action=action_mask)
-
-        replay_batch = dict(batch)
-        replay_batch["latents"] = batch["latents"].clone()
-        replay_batch["actions"] = batch["actions"].clone()
-        replay_batch["latents"][:, :, generated_start:generated_end] = (
+        
+        # 阶段 3/4：构造最终 clean 上下文
+        # 历史/条件区间保留 GT，生成区间换成 rollout 最终预测。
+        final_clean_video = batch["latents"].clone()
+        final_clean_action = batch["actions"].clone()
+        final_clean_video[:, :, generated_start:generated_end] = (
             rollout.predicted_clean.video
         )
-        replay_batch["actions"][:, :, generated_start:generated_end] = (
+        final_clean_action[:, :, generated_start:generated_end] = (
             rollout.predicted_clean.action
         )
-        replay_batch["video_latent_loss_mask"] = video_mask
-        replay_batch["action_loss_mask"] = action_mask
 
-        final_clean = VAPair(
-            video=replay_batch["latents"].detach(),
-            action=replay_batch["actions"].detach(),
+        clean_hat = VAPair(
+            video=final_clean_video.detach(),
+            action=final_clean_action.detach(),
         )
-        noisy_video = final_clean.video.clone()
-        noisy_action = final_clean.action.clone()
-        video_timesteps = torch.zeros(
-            (final_clean.video.shape[0], frames),
-            dtype=torch.float32,
-            device=final_clean.video.device,
-        )
-        action_timesteps = torch.zeros_like(video_timesteps)
+        
+        # 阶段 4/4：构造各模态退出时的 noisy 状态
+        noisy_video = clean_hat.video.clone()
+        noisy_action = clean_hat.action.clone()
         noisy_video[:, :, generated_start:generated_end] = rollout.noisy_at_t.video
         noisy_action[:, :, generated_start:generated_end] = rollout.noisy_at_t.action
-        video_timesteps[:, generated_start:generated_end] = rollout.video_exit_timestep
-        action_timesteps[:, generated_start:generated_end] = rollout.action_exit_timestep
-
-        rollout_noisy = self._masked_noisy(
+        noisy_at_t = self._masked_noisy(
             VAPair(noisy_video, noisy_action),
-            final_clean,
+            clean_hat,
             masks,
         )
+        # video/action 的退出 timestep 
+        video_timesteps = torch.zeros(
+            (clean_hat.video.shape[0], frames),
+            dtype=torch.float32,
+            device=clean_hat.video.device,
+        )
+        action_timesteps = torch.zeros_like(video_timesteps)
+        video_timesteps[:, generated_start:generated_end] = rollout.video_exit_timestep
+        action_timesteps[:, generated_start:generated_end] = rollout.action_exit_timestep
         video_timesteps = torch.where(video_mask, video_timesteps, 0)
         action_timesteps = torch.where(
             action_mask.any(dim=(1, 3, 4)),
             action_timesteps,
             0,
         )
-        return ReplayContext(
-            replay_batch=replay_batch,
-            rollout_timesteps=VATimesteps(video_timesteps, action_timesteps),
-            rollout_noisy=rollout_noisy,
-            final_clean_context=final_clean,
+        exit_timesteps = VATimesteps(video_timesteps, action_timesteps)
+        replay_context = ReplayContext(
+            exit_timesteps=exit_timesteps,
+            noisy_at_t=noisy_at_t,
+            clean_hat=clean_hat,
             masks=masks,
             denoisy_selection=selection,
         )
+        return replay_context
 
     @torch.no_grad()
     def _run_generator(self, batch: dict) -> ReplayContext:
@@ -328,31 +414,36 @@ class SelfGradientForcingModel(BaseModel):
         base_input: dict,
     ) -> VAPair:
         """Replay recorded exit states once through the generator."""
+        # context.noisy_at_t.video -> replay_input["latent_dict"]["noisy_latents"]
+        # context.noisy_at_t.action -> replay_input["action_dict"]["noisy_latents"]
+        # context.clean_hat.video -> replay_input["latent_dict"]["latent"]
+        # context.clean_hat.action -> replay_input["action_dict"]["latent"]
         replay_input = self._prepare_input(
-            context.rollout_noisy,
-            context.final_clean_context,
-            context.rollout_timesteps,
+            context.noisy_at_t,
+            context.clean_hat,
+            context.exit_timesteps,
             base_input,
         )
         grad_context = nullcontext() if requires_grad else torch.no_grad()
         with grad_context:
             estimated = self.generator(
                 replay_input,
-                context.rollout_noisy,
-                context.rollout_timesteps,
+                context.noisy_at_t,
+                context.exit_timesteps,
             ).x0
-        return VAPair(
+        replayed_x0 = VAPair(
             video=torch.where(
                 context.masks.video[:, None, :, None, None, None],
                 estimated.video,
-                context.final_clean_context.video,
+                context.clean_hat.video,
             ),
             action=torch.where(
                 context.masks.action,
                 estimated.action,
-                context.final_clean_context.action,
+                context.clean_hat.action,
             ),
         )
+        return replayed_x0
 
 class SGFDMDModel(SelfGradientForcingModel):
     """Compute DMD generator/fake-score losses on top of SGF replay."""
@@ -406,7 +497,7 @@ class SGFDMDModel(SelfGradientForcingModel):
         mask: torch.Tensor,
     ) -> torch.Tensor:
         """Convert linear progress ``d`` to a clamped network timestep ``t``."""
-        timestep = SelfGradientForcingTrainingPipeline.warp_denoisy_progress(
+        timestep = warp_denoisy_progress(
             progress,
             scheduler,
         )
@@ -475,8 +566,8 @@ class SGFDMDModel(SelfGradientForcingModel):
     ) -> tuple[VAPair, VAPair]:
         """Add DMD noise: x_t = (1-sigma) * x0 + sigma * noise.
 
-        输入/输出 VAPrediction:
-        VAPrediction = {
+        输入/输出 VAPair:
+        VAPair = {
             "video":  [B,Cv,F,V,H,W],  # video latents(V=视角数,H/W=空间)
             "action": [B,Ca,F,N,1],    # action(N=每帧 action token 数)
         }
@@ -487,13 +578,51 @@ class SGFDMDModel(SelfGradientForcingModel):
             video=torch.randn_like(clean.video),
             action=torch.randn_like(clean.action),
         )
-        noisy = add_noise_to_va(
-            clean,
-            noise,
-            timesteps,
-            masks,
-            self.generator.video_scheduler,
-            self.generator.action_scheduler,
+
+        batch_size, frames = timesteps.video.shape
+        # clean.video:
+        #   [B, Cv, F, V, H, W]
+        #       ↓ movedim(2, 1)：把 frame 轴移到 channel 前面
+        #   [B, F, Cv, V, H, W]
+        #       ↓ flatten(0, 1)：把 batch 和 frame 合并
+        #   [B*F, Cv, V, H, W]
+        video_clean_by_frame = clean.video.movedim(2, 1).flatten(0, 1)
+        video_noise_by_frame = noise.video.movedim(2, 1).flatten(0, 1)
+        noisy_video_by_frame = self.generator.video_scheduler.add_noise(
+            video_clean_by_frame,
+            video_noise_by_frame,
+            timesteps.video.flatten(), # timesteps.video: [B, F] -> [B*F]
+            t_dim=0,
+        )
+        noisy_video = noisy_video_by_frame.unflatten(
+            0,
+            (batch_size, frames),
+        ).movedim(1, 2)
+
+        action_clean_by_frame = clean.action.movedim(2, 1).flatten(0, 1)
+        action_noise_by_frame = noise.action.movedim(2, 1).flatten(0, 1)
+        noisy_action_by_frame = self.generator.action_scheduler.add_noise(
+            action_clean_by_frame,
+            action_noise_by_frame,
+            timesteps.action.flatten(),
+            t_dim=0,
+        )
+        noisy_action = noisy_action_by_frame.unflatten(
+            0,
+            (batch_size, frames),
+        ).movedim(1, 2)
+
+        noisy = VAPair(
+            video=torch.where(
+                masks.video[:, None, :, None, None, None],
+                noisy_video,
+                clean.video,
+            ),
+            action=torch.where(
+                masks.action,
+                noisy_action,
+                clean.action,
+            ),
         )
         return noisy, noise
 
@@ -505,21 +634,18 @@ class SGFDMDModel(SelfGradientForcingModel):
         """Return the score condition clean stream under the GT-clean option."""
         if not self.score_input_use_gt_clean:
             return generated_x0
-        return VAPair(
+        score_clean = VAPair(
             video=base_input["latent_dict"]["latent"],
             action=base_input["action_dict"]["latent"],
         )
+        return score_clean
 
     def _empty_text_condition(
         self,
-        batch: dict,
         text_emb: torch.Tensor,
         empty_text_emb: torch.Tensor,
     ) -> torch.Tensor:
-        empty = batch.get("empty_text_emb")
-        if empty is None:
-            empty = empty_text_emb
-        return empty.to(
+        return empty_text_emb.to(
             device=text_emb.device,
             dtype=text_emb.dtype,
         ).expand_as(text_emb)
@@ -575,7 +701,6 @@ class SGFDMDModel(SelfGradientForcingModel):
     def _compute_kl_grad(
         self,
         score_input: dict,
-        batch: dict,
         noisy: VAPair,
         estimated_clean: VAPair,
         timesteps: VATimesteps,
@@ -595,7 +720,7 @@ class SGFDMDModel(SelfGradientForcingModel):
         text_emb = score_input["latent_dict"]["text_emb"]
         unconditional_input = replace_text_condition(
             score_input,
-            self._empty_text_condition(batch, text_emb, empty_text_emb),
+            self._empty_text_condition(text_emb, empty_text_emb),
         )
         real_unconditional = self.real_score(
             unconditional_input,
@@ -678,7 +803,6 @@ class SGFDMDModel(SelfGradientForcingModel):
             )
             kl_grad, metrics = self._compute_kl_grad(
                 score_input,
-                context.replay_batch,
                 score_noisy,
                 generator_x0,
                 score_timesteps,
@@ -716,6 +840,9 @@ class SGFDMDModel(SelfGradientForcingModel):
         empty_text_emb: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Run SGF generation, replay with gradients, and compute DMD loss."""
+        batch_empty_text_emb = batch.get("empty_text_emb")
+        if batch_empty_text_emb is not None:
+            empty_text_emb = batch_empty_text_emb
         context = self._run_generator(self._rollout_batch(batch, base_input))
         generator_x0 = self.replay(
             context,
@@ -814,7 +941,8 @@ class SGFDMDModel(SelfGradientForcingModel):
             )
         else:
             loss, metrics = self.critic_loss(batch, base_input=base_input)
-        return TrainingStepResult(loss=loss, metrics=metrics)
+        step_result = TrainingStepResult(loss=loss, metrics=metrics)
+        return step_result
 
     def state_dict(self) -> dict[str, Any]:
         return {

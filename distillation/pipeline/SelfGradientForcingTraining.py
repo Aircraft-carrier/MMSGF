@@ -13,7 +13,6 @@ from .base_pipeline import BasePipeline
 
 if TYPE_CHECKING:
     from distillation.model.wan_wrapper import WanDiffusionWrapper
-    from wan_va.utils.scheduler import FlowMatchScheduler
 
 
 class DenoisingStepList(Protocol):
@@ -137,62 +136,6 @@ class SelfGradientForcingTrainingPipeline(BasePipeline):
             steps = steps[:-1]
         return steps
 
-    @staticmethod
-    def warp_denoisy_progress(
-        progress: torch.Tensor,
-        scheduler: FlowMatchScheduler,
-        *,
-        dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:
-        """Map linear denoising progress ``d`` to the scheduler's warped timestep.
-
-        ``d`` uses the reference SGF coordinate ``[0,T]`` with ``d=T`` at the
-        noisiest end and ``d=0`` at the clean end.
-        """
-        total = int(scheduler.num_train_timesteps)
-        shift = float(scheduler.shift)
-        progress_f = torch.as_tensor(
-            progress,
-            device=progress.device,
-            dtype=torch.float32,
-        )
-
-        # Stage 1/3: Linear progress d -> linear sigma = d / T.
-        #
-        # Example (T=1000):
-        #   d=1000 -> sigma=1.0
-        #   d=250  -> sigma=0.25
-        #   d=0    -> sigma=0.0
-        sigma = progress_f / float(total)
-
-        # Stage 2/3: Apply the FlowMatchScheduler rational shift.
-        #
-        #                    shift * sigma
-        #   warped_sigma = ---------------------
-        #                   1 + (shift-1)*sigma
-        #
-        # Example (shift=5, sigma=0.25): 1.25 / 2 = 0.625.
-        warped_sigma = shift * sigma / (1.0 + (shift - 1.0) * sigma)
-
-        # Stage 3/3: Warped sigma back to the network timestep t = sigma * T.
-        #
-        # Example: 0.625 * 1000 = 625.
-        warped_timestep = warped_sigma * float(total)
-
-        # Pin the two exact endpoints to avoid floating-point drift:
-        #   d=0 -> t=0, d=T -> t=T.
-        warped_timestep = torch.where(
-            progress_f == 0,
-            torch.zeros_like(warped_timestep),
-            warped_timestep,
-        )
-        warped_timestep = torch.where(
-            progress_f == total,
-            torch.full_like(warped_timestep, float(total)),
-            warped_timestep,
-        )
-        return warped_timestep.to(dtype=dtype)
-    
     def _sample_exit_id(self, num_steps: int, device: torch.device) -> int:
         if self.per_rank_exit_step:
             return int(torch.randint(num_steps, (), device=device).item())
@@ -344,6 +287,10 @@ class SelfGradientForcingTrainingPipeline(BasePipeline):
         recorder: SelfRolloutRecorder | None = None,
     ) -> RolloutResult:
         """Run one no-grad incremental rollout and optionally record exit states."""
+        # dmd.py owns the shared warp function but also constructs this pipeline.
+        # Import at execution time to avoid a module-initialization cycle.
+        from distillation.model.dmd import warp_denoisy_progress
+
         rollout_frames = int(rollout_frames)
         history_frames = int(history_frames)
 
@@ -355,11 +302,11 @@ class SelfGradientForcingTrainingPipeline(BasePipeline):
         if action_valid is not None:
             action_valid = action_valid.to(device=device, dtype=torch.bool)
 
-        video_steps = self.warp_denoisy_progress(
+        video_steps = warp_denoisy_progress(
             torch.tensor(self.video_denoising_step_list, dtype=torch.float32),
             self.scheduler,
         ).to(device=device)
-        action_steps = self.warp_denoisy_progress(
+        action_steps = warp_denoisy_progress(
             torch.tensor(self.action_denoising_step_list, dtype=torch.float32),
             self.action_scheduler,
         ).to(device=device)
