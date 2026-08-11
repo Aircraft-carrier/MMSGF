@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from distillation.diffusion_utils import add_noise
-from distillation.schema import VAMasks, VAPrediction, VATimesteps
+from distillation.schema import VAMasks, VAPair, VATimesteps
 
 if TYPE_CHECKING:
     from wan_va.utils.scheduler import FlowMatchScheduler
@@ -18,13 +18,13 @@ _MISSING = object()
 
 
 def add_noise_to_va(
-    clean: VAPrediction,
-    noise: VAPrediction,
+    clean: VAPair,
+    noise: VAPair,
     timesteps: VATimesteps,
     masks: VAMasks,
     video_scheduler: "FlowMatchScheduler",
     action_scheduler: "FlowMatchScheduler",
-) -> VAPrediction:
+) -> VAPair:
     noisy_video = add_noise(
         clean.video,
         noise.video,
@@ -38,7 +38,7 @@ def add_noise_to_va(
         action_scheduler,
     )
     video_mask = masks.video[:, None, :, None, None, None]
-    return VAPrediction(
+    return VAPair(
         video=torch.where(video_mask, noisy_video, clean.video),
         action=torch.where(masks.action, noisy_action, clean.action),
     )
@@ -46,8 +46,8 @@ def add_noise_to_va(
 
 def replace_va_streams(
     base_input: dict,
-    noisy: VAPrediction,
-    clean: VAPrediction,
+    noisy: VAPair,
+    clean: VAPair,
     timesteps: VATimesteps,
 ) -> dict:
     """Install one synthetic V/A state into the native MOT training input.
@@ -101,11 +101,11 @@ def replace_text_condition(input_dict: dict, text_emb: torch.Tensor) -> dict:
 
 
 def mask_clean_targets(
-    clean: VAPrediction,
+    clean: VAPair,
     masks: VAMasks,
-) -> VAPrediction:
+) -> VAPair:
     video_mask = masks.video[:, None, :, None, None, None]
-    return VAPrediction(
+    return VAPair(
         video=torch.where(video_mask, torch.zeros_like(clean.video), clean.video),
         action=torch.where(masks.action, torch.zeros_like(clean.action), clean.action),
     )

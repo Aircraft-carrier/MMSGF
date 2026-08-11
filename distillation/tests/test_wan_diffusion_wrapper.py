@@ -11,7 +11,7 @@ from distillation.pipeline import KVCache
 from distillation.model.wan_wrapper import (
     WanDiffusionWrapper,
 )
-from distillation.schema import VAPrediction, VATimesteps
+from distillation.schema import VAPair, VATimesteps
 
 
 def _scheduler(timestep: float, sigma: float):
@@ -107,7 +107,7 @@ def test_forward_returns_flow_x0_and_preserves_student_gradient(monkeypatch) -> 
         config=config,
         checkpoint_path="dummy",
     )
-    noisy = VAPrediction(
+    noisy = VAPair(
         video=torch.ones(1, 1, 1, 1, 1, 1),
         action=torch.ones(1, 1, 1, 1, 1),
     )

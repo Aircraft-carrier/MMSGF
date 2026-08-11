@@ -6,7 +6,7 @@ import torch
 
 
 @dataclass(frozen=True, slots=True)
-class VAPrediction:
+class VAPair:
     """一对同阶段 V/A tensor；video 6-D，action 5-D，二者共享 B/F。"""
 
     video: torch.Tensor
@@ -17,8 +17,8 @@ class VAPrediction:
 class VADiffusionOutput:
     """Flow-matching velocity and the corresponding clean V/A prediction."""
 
-    velocity: VAPrediction
-    x0: VAPrediction
+    velocity: VAPair
+    x0: VAPair
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,8 +117,8 @@ class ReplayContext:
 
     replay_batch: dict[str, Any]
     rollout_timesteps: VATimesteps
-    rollout_noisy: VAPrediction
-    final_clean_context: VAPrediction
+    rollout_noisy: VAPair
+    final_clean_context: VAPair
     masks: VAMasks
     denoisy_selection: VADenoisySelection
 
@@ -139,15 +139,15 @@ class ReplayContext:
         return self.rollout_timesteps
 
     @property
-    def noisy(self) -> VAPrediction:
+    def noisy(self) -> VAPair:
         return self.rollout_noisy
 
     @property
-    def generated(self) -> VAPrediction:
+    def generated(self) -> VAPair:
         return self.final_clean_context
 
     @property
-    def pred_clean(self) -> VAPrediction:
+    def pred_clean(self) -> VAPair:
         """Compatibility alias for the former final-clean field name."""
 
         return self.final_clean_context

@@ -24,7 +24,7 @@ from distillation.schema import (
     TrainingStepResult,
     VALossWeights,
     VAMasks,
-    VAPrediction,
+    VAPair,
     VATimesteps,
 )
 from wan_va.utils.scheduler import FlowMatchScheduler
@@ -149,12 +149,12 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
         self,
         model: nn.Module,
         input_dict: dict,
-        noisy: VAPrediction,
+        noisy: VAPair,
         timesteps: VATimesteps,
-    ) -> VAPrediction:
+    ) -> VAPair:
         out = model(input_dict, mode="train")
-        flow = VAPrediction(out["latent_pred"], out["action_pred"])
-        return VAPrediction(
+        flow = VAPair(out["latent_pred"], out["action_pred"])
+        return VAPair(
             video=consistency_prediction(
                 flow.video,
                 noisy.video,
@@ -175,7 +175,7 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
         input_dict: dict,
         batch: dict,
         empty_text_emb: torch.Tensor,
-    ) -> tuple[VAPrediction, float]:
+    ) -> tuple[VAPair, float]:
         conditioned = self.teacher(input_dict, mode="train")
         text_emb = input_dict["latent_dict"]["text_emb"]
         empty_text_emb = self._empty_text_condition(
@@ -193,7 +193,7 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
         video = unconditioned["latent_pred"] + cfg_scale * (
             conditioned["latent_pred"] - unconditioned["latent_pred"]
         )
-        return VAPrediction(video, conditioned["action_pred"]), cfg_scale
+        return VAPair(video, conditioned["action_pred"]), cfg_scale
 
     def compute_loss(
         self,
@@ -213,8 +213,8 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
         )
         timesteps, next_timesteps = self._sample_timesteps(masks)
 
-        clean = VAPrediction(batch["latents"], batch["actions"])
-        noise = VAPrediction(
+        clean = VAPair(batch["latents"], batch["actions"])
+        noise = VAPair(
             torch.randn_like(clean.video),
             torch.randn_like(clean.action),
         )
@@ -239,7 +239,7 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
                 batch,
                 empty_text_emb,
             )
-            next_noisy = VAPrediction(
+            next_noisy = VAPair(
                 flow_step(
                     teacher_flow.video,
                     noisy.video,
@@ -270,11 +270,11 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
 
         student_input = replace_va_streams(base_input, noisy, clean, timesteps)
         student_out = self.student(student_input, mode="train")
-        student_flow = VAPrediction(
+        student_flow = VAPair(
             student_out["latent_pred"],
             student_out["action_pred"],
         )
-        student_consistency = VAPrediction(
+        student_consistency = VAPair(
             video=consistency_prediction(
                 student_flow.video,
                 noisy.video,

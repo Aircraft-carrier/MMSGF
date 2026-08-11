@@ -75,7 +75,6 @@ class SelfGradientForcingDMDTrainer(DistillationTrainerBase):
             student_init=str(student_init),
             real_score_checkpoint=str(real_score_checkpoint),
             fake_score_init=str(fake_score_init),
-            resume_from=self._resume_from,
         )
 
     def _wrap_method_models(self) -> None:

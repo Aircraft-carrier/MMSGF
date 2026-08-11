@@ -92,10 +92,10 @@ def test_pipeline_rollout_commits_blocks_and_records_exit() -> None:
     )
 
     assert tuple(result.pred_frame_ids) == (2, 3)
-    assert tuple(result.video_hat.shape) == (1, 1, 2, 1, 1, 1)
-    assert tuple(result.action_hat.shape) == (1, 1, 2, 1, 1)
-    assert tuple(result.video_noisy_at_t.shape) == (1, 1, 2, 1, 1, 1)
-    assert tuple(result.action_noisy_at_t.shape) == (1, 1, 2, 1, 1)
+    assert tuple(result.predicted_clean.video.shape) == (1, 1, 2, 1, 1, 1)
+    assert tuple(result.predicted_clean.action.shape) == (1, 1, 2, 1, 1)
+    assert tuple(result.noisy_at_t.video.shape) == (1, 1, 2, 1, 1, 1)
+    assert tuple(result.noisy_at_t.action.shape) == (1, 1, 2, 1, 1)
     assert isinstance(result.video_exit_timestep, float)
     assert isinstance(result.action_exit_timestep, float)
     # Video denoises through 2 steps, action through 3, then clean commits.

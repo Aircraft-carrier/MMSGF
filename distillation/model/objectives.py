@@ -2,7 +2,7 @@
 import torch
 import torch.nn.functional as F
 
-from distillation.schema import VALossWeights, VAMasks, VAPrediction
+from distillation.schema import VALossWeights, VAMasks, VAPair
 
 
 def _video_mse(
@@ -51,8 +51,8 @@ def _action_mse(
 
 
 def _va_loss(
-    pred: VAPrediction,
-    target: VAPrediction,
+    pred: VAPair,
+    target: VAPair,
     masks: VAMasks,
     weights: VALossWeights,
     name: str,
@@ -68,8 +68,8 @@ def _va_loss(
 
 
 def consistency_loss(
-    student_x0: VAPrediction,
-    target_x0: VAPrediction,
+    student_x0: VAPair,
+    target_x0: VAPair,
     masks: VAMasks,
     weights: VALossWeights = VALossWeights(),
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -83,8 +83,8 @@ def consistency_loss(
 
 
 def dmd_surrogate_loss(
-    generator_x0: VAPrediction,
-    target_x0: VAPrediction,
+    generator_x0: VAPair,
+    target_x0: VAPair,
     masks: VAMasks,
     weights: VALossWeights = VALossWeights(),
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -113,8 +113,8 @@ def action_aware_loss(
 
 
 def fake_score_flow_loss(
-    fake_flow: VAPrediction,
-    target_flow: VAPrediction,
+    fake_flow: VAPair,
+    target_flow: VAPair,
     masks: VAMasks,
     weights: VALossWeights = VALossWeights(),
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:

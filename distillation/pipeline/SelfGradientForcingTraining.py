@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence
 import torch
 import torch.distributed as dist
 
-from distillation.schema import DenoisyInterval
+from distillation.schema import DenoisyInterval, VAPair
 
 from .base_pipeline import BasePipeline
 
@@ -74,16 +74,14 @@ class SelfRolloutRecorder:
 class RolloutResult:
     """Predicted rollout content and organized exit information.
 
-    ``*_hat`` tensors cover only ``pred_frame_ids``; no GT tensors are kept.
-    ``*_noisy_at_t`` are the exit-step noisy inputs, and the denoised timestep
+    ``predicted_clean`` covers only ``pred_frame_ids``; no GT tensors are kept.
+    ``noisy_at_t`` contains the exit-step noisy inputs, and the denoised timestep
     interval/exits summarize the recorder state.
     """
 
     pred_frame_ids: tuple[int, ...]
-    video_hat: torch.Tensor
-    action_hat: torch.Tensor
-    video_noisy_at_t: torch.Tensor
-    action_noisy_at_t: torch.Tensor
+    predicted_clean: VAPair
+    noisy_at_t: VAPair
     video_exit_timestep: float
     action_exit_timestep: float
     video_exit_id: int
@@ -442,15 +440,19 @@ class SelfGradientForcingTrainingPipeline(BasePipeline):
         generated_ids: list[int],
         recorder: SelfRolloutRecorder,
     ) -> RolloutResult:
-        video_hat = torch.cat([predicted_video[f] for f in generated_ids], dim=2)
-        action_hat = torch.cat([predicted_action[f] for f in generated_ids], dim=2)
-        video_noisy_at_t = torch.cat(
-            [recorder.records[("video", f)].sample for f in generated_ids],
-            dim=2,
+        predicted_clean = VAPair(
+            video=torch.cat([predicted_video[f] for f in generated_ids], dim=2),
+            action=torch.cat([predicted_action[f] for f in generated_ids], dim=2),
         )
-        action_noisy_at_t = torch.cat(
-            [recorder.records[("action", f)].sample for f in generated_ids],
-            dim=2,
+        noisy_at_t = VAPair(
+            video=torch.cat(
+                [recorder.records[("video", f)].sample for f in generated_ids],
+                dim=2,
+            ),
+            action=torch.cat(
+                [recorder.records[("action", f)].sample for f in generated_ids],
+                dim=2,
+            ),
         )
         first = generated_ids[0]
         video_record = recorder.records[("video", first)]
@@ -459,10 +461,8 @@ class SelfGradientForcingTrainingPipeline(BasePipeline):
         action_exit_timestep = float(action_record.timestep)
         return RolloutResult(
             pred_frame_ids=tuple(generated_ids),
-            video_hat=video_hat,
-            action_hat=action_hat,
-            video_noisy_at_t=video_noisy_at_t,
-            action_noisy_at_t=action_noisy_at_t,
+            predicted_clean=predicted_clean,
+            noisy_at_t=noisy_at_t,
             video_exit_timestep=video_exit_timestep,
             action_exit_timestep=action_exit_timestep,
             video_exit_id=video_record.exit_id,

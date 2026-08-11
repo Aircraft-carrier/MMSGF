@@ -26,7 +26,7 @@ from distillation.schema import (
     VADenoisySelection,
     VALossWeights,
     VAMasks,
-    VAPrediction,
+    VAPair,
     VATimesteps,
 )
 from wan_va.utils.scheduler import FlowMatchScheduler
@@ -42,12 +42,9 @@ class BaseModel:
         student_init: str | None,
         real_score_checkpoint: str | None,
         fake_score_init: str | None,
-        *,
-        resume_from: str | None = None,
     ) -> None:
         self.config = config
         self.device = device
-        self.resume_from = resume_from
         self._initialize_models(
             student_init=student_init,
             real_score_checkpoint=real_score_checkpoint,
@@ -124,8 +121,8 @@ class BaseModel:
 
     def _prepare_input(
         self,
-        noisy: VAPrediction,
-        clean: VAPrediction,
+        noisy: VAPair,
+        clean: VAPair,
         timesteps: VATimesteps,
         base_input: dict,
     ) -> dict:
@@ -188,11 +185,11 @@ class SelfGradientForcingModel(BaseModel):
 
     @staticmethod
     def _masked_noisy(
-        noisy: VAPrediction,
-        clean: VAPrediction,
+        noisy: VAPair,
+        clean: VAPair,
         masks: VAMasks,
-    ) -> VAPrediction:
-        return VAPrediction(
+    ) -> VAPair:
+        return VAPair(
             video=torch.where(
                 masks.video[:, None, :, None, None, None],
                 noisy.video,
@@ -249,12 +246,16 @@ class SelfGradientForcingModel(BaseModel):
         replay_batch = dict(batch)
         replay_batch["latents"] = batch["latents"].clone()
         replay_batch["actions"] = batch["actions"].clone()
-        replay_batch["latents"][:, :, generated_start:generated_end] = rollout.video_hat
-        replay_batch["actions"][:, :, generated_start:generated_end] = rollout.action_hat
+        replay_batch["latents"][:, :, generated_start:generated_end] = (
+            rollout.predicted_clean.video
+        )
+        replay_batch["actions"][:, :, generated_start:generated_end] = (
+            rollout.predicted_clean.action
+        )
         replay_batch["video_latent_loss_mask"] = video_mask
         replay_batch["action_loss_mask"] = action_mask
 
-        final_clean = VAPrediction(
+        final_clean = VAPair(
             video=replay_batch["latents"].detach(),
             action=replay_batch["actions"].detach(),
         )
@@ -266,13 +267,13 @@ class SelfGradientForcingModel(BaseModel):
             device=final_clean.video.device,
         )
         action_timesteps = torch.zeros_like(video_timesteps)
-        noisy_video[:, :, generated_start:generated_end] = rollout.video_noisy_at_t
-        noisy_action[:, :, generated_start:generated_end] = rollout.action_noisy_at_t
+        noisy_video[:, :, generated_start:generated_end] = rollout.noisy_at_t.video
+        noisy_action[:, :, generated_start:generated_end] = rollout.noisy_at_t.action
         video_timesteps[:, generated_start:generated_end] = rollout.video_exit_timestep
         action_timesteps[:, generated_start:generated_end] = rollout.action_exit_timestep
 
         rollout_noisy = self._masked_noisy(
-            VAPrediction(noisy_video, noisy_action),
+            VAPair(noisy_video, noisy_action),
             final_clean,
             masks,
         )
@@ -309,13 +310,23 @@ class SelfGradientForcingModel(BaseModel):
         """Public alias for the reference-style ``_run_generator`` boundary."""
         return self._run_generator(batch)
 
+    @staticmethod
+    def _rollout_batch(batch: dict, base_input: dict) -> dict:
+        """Use the replay text condition for the corresponding SGF rollout."""
+        text_emb = base_input["latent_dict"]["text_emb"]
+        if batch.get("text_emb") is text_emb:
+            return batch
+        rollout_batch = dict(batch)
+        rollout_batch["text_emb"] = text_emb
+        return rollout_batch
+
     def replay(
         self,
         context: ReplayContext,
         *,
         requires_grad: bool,
         base_input: dict,
-    ) -> VAPrediction:
+    ) -> VAPair:
         """Replay recorded exit states once through the generator."""
         replay_input = self._prepare_input(
             context.rollout_noisy,
@@ -330,7 +341,7 @@ class SelfGradientForcingModel(BaseModel):
                 context.rollout_noisy,
                 context.rollout_timesteps,
             ).x0
-        return VAPrediction(
+        return VAPair(
             video=torch.where(
                 context.masks.video[:, None, :, None, None, None],
                 estimated.video,
@@ -354,24 +365,6 @@ class SGFDMDModel(SelfGradientForcingModel):
         self.score_input_use_gt_clean = bool(
             getattr(self.config.distill, "score_input_use_gt_clean", False)
         )
-        if self.resume_from is not None:
-            self._resume_method_state(self.resume_from)
-
-    def _resume_method_state(self, checkpoint_root: str) -> None:
-        """Restore this model's method state from a distillation checkpoint."""
-        from pathlib import Path
-
-        training_state = torch.load(
-            Path(checkpoint_root) / "training_state.pt",
-            map_location="cpu",
-            weights_only=True,
-        )
-        method_state = training_state.get("method_state_dict")
-        if method_state is None:
-            raise ValueError(
-                f"checkpoint {checkpoint_root} has no method_state_dict to resume"
-            )
-        self.load_state_dict(method_state)
 
     def _get_timestep(
         self,
@@ -476,10 +469,10 @@ class SGFDMDModel(SelfGradientForcingModel):
 
     def _add_dmd_noise(
         self,
-        clean: VAPrediction,
+        clean: VAPair,
         timesteps: VATimesteps,
         masks: VAMasks,
-    ) -> tuple[VAPrediction, VAPrediction]:
+    ) -> tuple[VAPair, VAPair]:
         """Add DMD noise: x_t = (1-sigma) * x0 + sigma * noise.
 
         输入/输出 VAPrediction:
@@ -490,7 +483,7 @@ class SGFDMDModel(SelfGradientForcingModel):
 
         sigma 按 timesteps [B,F] 逐帧查 scheduler 表；mask 外位置恢复 clean。
         """
-        noise = VAPrediction(
+        noise = VAPair(
             video=torch.randn_like(clean.video),
             action=torch.randn_like(clean.action),
         )
@@ -506,13 +499,13 @@ class SGFDMDModel(SelfGradientForcingModel):
 
     def _score_clean(
         self,
-        generated_x0: VAPrediction,
+        generated_x0: VAPair,
         base_input: dict,
-    ) -> VAPrediction:
+    ) -> VAPair:
         """Return the score condition clean stream under the GT-clean option."""
         if not self.score_input_use_gt_clean:
             return generated_x0
-        return VAPrediction(
+        return VAPair(
             video=base_input["latent_dict"]["latent"],
             action=base_input["action_dict"]["latent"],
         )
@@ -534,6 +527,7 @@ class SGFDMDModel(SelfGradientForcingModel):
     @staticmethod
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         values = values.float()
+        mask = mask.expand_as(values)
         return torch.where(mask, values, 0).sum() / mask.sum().clamp_min(1)
 
     def _selection_metrics(
@@ -582,12 +576,12 @@ class SGFDMDModel(SelfGradientForcingModel):
         self,
         score_input: dict,
         batch: dict,
-        noisy: VAPrediction,
-        estimated_clean: VAPrediction,
+        noisy: VAPair,
+        estimated_clean: VAPair,
         timesteps: VATimesteps,
         masks: VAMasks,
         empty_text_emb: torch.Tensor,
-    ) -> tuple[VAPrediction, dict[str, torch.Tensor]]:
+    ) -> tuple[VAPair, dict[str, torch.Tensor]]:
         """Compute real/fake score predictions and the normalized KL gradient.
 
         This mirrors the reference DMD implementation: fake score first, real
@@ -611,7 +605,7 @@ class SGFDMDModel(SelfGradientForcingModel):
         cfg_scale = self.teacher_cfg_min + torch.rand(()).item() * (
             self.teacher_cfg_max - self.teacher_cfg_min
         )
-        real_x0 = VAPrediction(
+        real_x0 = VAPair(
             video=real_unconditional.x0.video
             + cfg_scale
             * (real_conditional.x0.video - real_unconditional.x0.video),
@@ -622,12 +616,14 @@ class SGFDMDModel(SelfGradientForcingModel):
             mask = mask.expand_as(generator)
             gradient = fake - real
             error = torch.where(mask, (generator - real).abs(), 0)
-            normalizer = error.flatten(1).sum(1) / mask.flatten(1).sum(1)
+            valid = mask.flatten(1).sum(1)
+            normalizer = error.flatten(1).sum(1) / valid.clamp_min(1)
             normalizer = normalizer.clamp_min(self.normalizer_eps)
             normalizer = normalizer.reshape(-1, *([1] * (generator.ndim - 1)))
-            return gradient / normalizer
+            normalized = gradient / normalizer
+            return torch.where(mask, normalized, torch.zeros_like(normalized))
 
-        gradient = VAPrediction(
+        gradient = VAPair(
             video=normalized_gradient(
                 estimated_clean.video,
                 fake_output.x0.video,
@@ -642,8 +638,14 @@ class SGFDMDModel(SelfGradientForcingModel):
             ),
         )
         return gradient, {
-            "distill/dmd_video_gradient_norm": gradient.video.abs().mean().detach(),
-            "distill/dmd_action_gradient_norm": gradient.action.abs().mean().detach(),
+            "distill/dmd_video_gradient_norm": self._masked_mean(
+                gradient.video.abs(),
+                masks.video[:, None, :, None, None, None],
+            ).detach(),
+            "distill/dmd_action_gradient_norm": self._masked_mean(
+                gradient.action.abs(),
+                masks.action,
+            ).detach(),
             "distill/sgf_real_cfg_scale": gradient.video.detach().new_tensor(
                 cfg_scale
             ),
@@ -652,7 +654,7 @@ class SGFDMDModel(SelfGradientForcingModel):
     def compute_distribution_matching_loss(
         self,
         context: ReplayContext,
-        generator_x0: VAPrediction,
+        generator_x0: VAPair,
         *,
         base_input: dict,
         empty_text_emb: torch.Tensor,
@@ -683,7 +685,7 @@ class SGFDMDModel(SelfGradientForcingModel):
                 context.masks,
                 empty_text_emb,
             )
-        dmd_target = VAPrediction(
+        dmd_target = VAPair(
             video=generator_x0.video - kl_grad.video,
             action=generator_x0.action - kl_grad.action,
         )
@@ -714,7 +716,7 @@ class SGFDMDModel(SelfGradientForcingModel):
         empty_text_emb: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Run SGF generation, replay with gradients, and compute DMD loss."""
-        context = self._run_generator(batch)
+        context = self._run_generator(self._rollout_batch(batch, base_input))
         generator_x0 = self.replay(
             context,
             requires_grad=True,
@@ -734,7 +736,7 @@ class SGFDMDModel(SelfGradientForcingModel):
         base_input: dict,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Run SGF generation and train the fake score on generated samples."""
-        context = self._run_generator(batch)
+        context = self._run_generator(self._rollout_batch(batch, base_input))
         generated_x0 = self.replay(
             context,
             requires_grad=False,
@@ -760,7 +762,7 @@ class SGFDMDModel(SelfGradientForcingModel):
             score_noisy,
             score_timesteps,
         )
-        exact_target = VAPrediction(
+        exact_target = VAPair(
             video=noise.video - generated_x0.video,
             action=noise.action - generated_x0.action,
         )

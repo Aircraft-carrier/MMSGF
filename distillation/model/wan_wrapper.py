@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from distillation.model.autoregressive_types import AutoregressiveModelRequest
-from distillation.schema import VADiffusionOutput, VAPrediction, VATimesteps
+from distillation.schema import VADiffusionOutput, VAPair, VATimesteps
 from wan_va.utils.scheduler import FlowMatchScheduler
 
 
@@ -211,20 +211,20 @@ class WanDiffusionWrapper:
     def forward(
         self,
         input_dict: dict[str, Any],
-        noisy: VAPrediction,
+        noisy: VAPair,
         timesteps: VATimesteps,
     ) -> VADiffusionOutput:
         # Stage 1/3: One backbone call predicts both modality flows. No detach or
         # no_grad is introduced here; the caller controls gradient construction.
         output = self.model(input_dict, mode="train")
-        velocity = VAPrediction(
+        velocity = VAPair(
             video=output["latent_pred"],
             action=output["action_pred"],
         )
 
         # Stage 2/3: Convert each flow with its own scheduler and [B,F] table.
         # Both conversions preserve their input tensor shapes and output dtype.
-        x0 = VAPrediction(
+        x0 = VAPair(
             video=self._convert_flow_pred_to_x0(
                 self.video_scheduler,
                 velocity.video,
@@ -348,7 +348,7 @@ class WanDiffusionWrapper:
     def __call__(
         self,
         input_dict: dict[str, Any],
-        noisy: VAPrediction,
+        noisy: VAPair,
         timesteps: VATimesteps,
     ) -> VADiffusionOutput:
         # Match nn.Module call ergonomics without registering model parameters on

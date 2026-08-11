@@ -1,4 +1,6 @@
 import json
+from dataclasses import replace
+from inspect import signature
 from types import SimpleNamespace
 
 import pytest
@@ -29,7 +31,7 @@ from distillation.schema import (
     VALossWeights,
     VADenoisySelection,
     VAMasks,
-    VAPrediction,
+    VAPair,
     VATimesteps,
 )
 from distillation.train import parse_args
@@ -220,11 +222,11 @@ def test_dmd_losses_are_explicit() -> None:
 
 
 def test_dmd_surrogate_loss_is_half_masked_mse() -> None:
-    x0 = VAPrediction(
+    x0 = VAPair(
         video=torch.zeros(1, 1, 1, 1, 1, 1),
         action=torch.zeros(1, 1, 1, 1, 1),
     )
-    target = VAPrediction(
+    target = VAPair(
         video=torch.ones(1, 1, 1, 1, 1, 1),
         action=torch.ones(1, 1, 1, 1, 1),
     )
@@ -350,11 +352,11 @@ def _tiny_model_and_context(monkeypatch):
         real_score_checkpoint="/tmp/tiny-real",
         fake_score_init="/tmp/tiny-fake",
     )
-    final_clean = VAPrediction(
+    final_clean = VAPair(
         video=torch.zeros(1, 1, 2, 1, 1, 1),
         action=torch.zeros(1, 1, 2, 1, 1),
     )
-    noisy = VAPrediction(
+    noisy = VAPair(
         video=final_clean.video.clone(),
         action=final_clean.action.clone(),
     )
@@ -428,6 +430,78 @@ def test_dmd_model_hierarchy_and_steps_isolate_gradients(monkeypatch) -> None:
     assert real.scale.grad is None
 
 
+def test_generator_loss_handles_all_false_action_mask(monkeypatch) -> None:
+    model, context, trainer, student, _real, _fake = _tiny_model_and_context(
+        monkeypatch
+    )
+    context = replace(
+        context,
+        masks=VAMasks(
+            video=context.masks.video,
+            action=torch.zeros_like(context.masks.action),
+        ),
+    )
+    model._run_generator = lambda _batch: context
+    base_input = trainer._prepare_joint_input_dict(
+        context.replay_batch,
+        add_noise=False,
+    )
+
+    loss, metrics = model.generator_loss(
+        {},
+        base_input=base_input,
+        empty_text_emb=trainer._get_empty_text_emb(),
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.equal(
+        metrics["distill/dmd_action_gradient_norm"],
+        torch.zeros_like(metrics["distill/dmd_action_gradient_norm"]),
+    )
+    assert student.scale.grad is not None
+    assert torch.isfinite(student.scale.grad)
+
+
+@pytest.mark.parametrize("optimizer_name", ["generator", "fake_score"])
+def test_rollout_and_replay_share_text_condition(
+    monkeypatch,
+    optimizer_name,
+) -> None:
+    model, context, trainer, _student, _real, _fake = _tiny_model_and_context(
+        monkeypatch
+    )
+    raw_text = torch.ones(1, 1, 1)
+    effective_text = torch.full_like(raw_text, 2.0)
+    batch = {
+        "text_emb": raw_text,
+        "stream_ids": torch.zeros(1, 1, dtype=torch.long),
+    }
+    base_input = trainer._prepare_joint_input_dict(batch, add_noise=False)
+    base_input["latent_dict"]["text_emb"] = effective_text
+    base_input["action_dict"]["text_emb"] = effective_text
+    captured = {}
+
+    def capture_rollout(rollout_batch):
+        captured["text_emb"] = rollout_batch["text_emb"]
+        return context
+
+    model._run_generator = capture_rollout
+    model.compute_step(
+        batch,
+        optimizer_name,
+        base_input=base_input,
+        empty_text_emb=trainer._get_empty_text_emb(),
+    )
+
+    assert torch.equal(captured["text_emb"], effective_text)
+
+
+def test_dmd_model_does_not_own_resume_loading() -> None:
+    assert "resume_from" not in signature(BaseModel.__init__).parameters
+    assert not hasattr(SGFDMDModel, "_resume_method_state")
+
+
 def test_add_dmd_noise_supports_batch_gt_one(monkeypatch) -> None:
     """Per-sample [B,F] timesteps must broadcast on the frame axis, not crash."""
     from distillation.model.wan_wrapper import (
@@ -438,7 +512,7 @@ def test_add_dmd_noise_supports_batch_gt_one(monkeypatch) -> None:
     model, _context, _trainer, _student, _real, _fake = _tiny_model_and_context(
         monkeypatch
     )
-    clean = VAPrediction(
+    clean = VAPair(
         video=torch.zeros(3, 1, 2, 1, 1, 1),
         action=torch.zeros(3, 1, 2, 1, 1),
     )
