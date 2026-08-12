@@ -8,7 +8,7 @@ from typing import Any, Literal
 import torch
 import torch.nn as nn
 
-from distillation.model.utils import (
+from distillation.model.common.utils import (
     add_noise_to_va,
     apply_va_mask,
     randn_like_va,
@@ -16,7 +16,7 @@ from distillation.model.utils import (
     replace_va_streams,
     va_loss,
 )
-from distillation.model.wan_wrapper import (
+from distillation.model.common.wan_wrapper import (
     WanDiffusionWrapper,
 )
 from distillation.pipeline import SelfGradientForcingTrainingPipeline

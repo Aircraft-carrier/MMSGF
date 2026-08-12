@@ -8,7 +8,7 @@ import torch
 from .cache import KVCache
 
 if TYPE_CHECKING:
-    from distillation.model.wan_wrapper import WanDiffusionWrapper
+    from distillation.model.common.wan_wrapper import WanDiffusionWrapper
 
 
 class BasePipeline:

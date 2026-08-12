@@ -9,7 +9,7 @@ from distillation.model.autoregressive_mot import (
     AutoregressiveModelOutput,
 )
 from distillation.pipeline import KVCache
-from distillation.model.wan_wrapper import (
+from distillation.model.common.wan_wrapper import (
     WanDiffusionWrapper,
 )
 from distillation.schema import VAPair, VATimesteps
@@ -168,7 +168,7 @@ def test_wrapper_loads_autoregressive_or_bidirectional_model_in_place(
     autoregressive: bool,
     architecture: str,
 ) -> None:
-    from distillation.model import wan_wrapper
+    from distillation.model.common import wan_wrapper
 
     calls = []
 

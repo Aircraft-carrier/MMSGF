@@ -8,8 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from distillation.model.dmd import update_ema
-from distillation.model.utils import (
+from distillation.model.common.utils import (
     add_noise_to_va,
+    apply_va_mask,
     broadcast_frame_values,
     randn_like_va,
     replace_text_condition,
@@ -17,7 +18,7 @@ from distillation.model.utils import (
     sigmas_for_timesteps,
     va_loss,
 )
-from distillation.model.wan_wrapper import WanDiffusionWrapper
+from distillation.model.common.wan_wrapper import WanDiffusionWrapper
 from distillation.pipeline import SelfGradientForcingTrainingPipeline
 from distillation.schema import (
     TrainingStepResult,
@@ -116,7 +117,9 @@ class ConsistencyBaseModel:
         self.action_num_steps = int(config.distill.action_num_steps)
         self.cfg_min = float(config.distill.cfg_min)
         self.cfg_max = float(config.distill.cfg_max)
-        self.reuse_teacher_noise = bool(config.distill.reuse_teacher_noise)
+        self.use_cfg_velocity_transition = bool(
+            config.distill.use_cfg_velocity_transition
+        )
         self.sigma_data = float(config.distill.sigma_data)
         self.action_aware_weight = float(config.distill.action_aware_weight)
         self.loss_weights = VALossWeights(
@@ -215,17 +218,48 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
         noisy: VAPair,
         timesteps: VATimesteps,
     ) -> VAPair:
+        # output.x0:
+        #   video  [B,Cv,F,V,H,W]
+        #   action [B,Ca,F,N,1]
+        #
+        # noisy 的 shape 与对应 x0 一致；
+        # timesteps.video: [B,F]。
+
+        # Stage 1/3: Obtain the video sigma for every [batch, frame] pair.
+        # sigma: [B,F]
         sigma = sigmas_for_timesteps(
             self.train_scheduler_latent,
             timesteps.video,
             dtype=noisy.video.dtype,
         )
+
+        # Broadcast per-frame sigma over channels, views, and spatial dimensions:
+        # [B,F] -> [B,1,F,1,1,1].
         sigma = broadcast_frame_values(sigma, noisy.video)
+
+        # sigma_data is a fixed scalar hyperparameter, converted to the same
+        # dtype/device as the video latent tensor.
         sigma_data = noisy.video.new_tensor(self.sigma_data)
+
+        # Stage 2/3: Compute the EDM-style consistency coefficients:
+        #
+        # denominator = sigma^2 + sigma_data^2
+        # c_skip = sigma_data^2 / denominator
+        # c_out  = sigma * sigma_data / sqrt(denominator)
         denominator = sigma.square() + sigma_data.square()
         c_skip = sigma_data.square() / denominator
         c_out = sigma * sigma_data / denominator.sqrt()
+
+        # Stage 3/3: Produce the video consistency prediction.
+        #
+        # video = c_skip * x_t + c_out * x0_hat
+        #
+        # x_t is noisy.video and x0_hat is output.x0.video.
+        # All operations preserve [B,Cv,F,V,H,W].
         video = c_skip * noisy.video + c_out * output.x0.video
+
+        # Video uses the consistency parameterization above.
+        # Action currently uses the ordinary flow-to-x0 prediction directly.
         return VAPair(
             video=video,
             action=output.x0.action,
@@ -238,7 +272,7 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
         empty_text_emb: torch.Tensor,
         noisy: VAPair,
         timesteps: VATimesteps,
-    ) -> tuple[VAPair, float]:
+    ) -> tuple[VADiffusionOutput, float]:
         conditioned = self.teacher(input_dict, noisy, timesteps)
         text_emb = input_dict["latent_dict"]["text_emb"]
         empty_text_emb = self._empty_text_condition(
@@ -254,11 +288,72 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
         cfg_scale = self.cfg_min + torch.rand(()).item() * (
             self.cfg_max - self.cfg_min
         )
-        video = unconditioned.x0.video + cfg_scale * (
+        video_x0 = unconditioned.x0.video + cfg_scale * (
             conditioned.x0.video - unconditioned.x0.video
+        ) # equal:  xt - sigma* v_cfg
+        video_velocity = unconditioned.velocity.video + cfg_scale * (
+            conditioned.velocity.video - unconditioned.velocity.video
         )
-        teacher_x0 = VAPair(video=video, action=conditioned.x0.action)
-        return teacher_x0, cfg_scale
+        teacher_output = VADiffusionOutput(
+            velocity=VAPair(
+                video=video_velocity,
+                action=conditioned.velocity.action,
+            ),
+            x0=VAPair(
+                video=video_x0,
+                action=conditioned.x0.action,
+            ),
+        )
+        return teacher_output, cfg_scale
+
+    def _velocity_transition(
+        self,
+        noisy: VAPair,
+        velocity: VAPair,
+        timesteps: VATimesteps,
+        next_timesteps: VATimesteps,
+        clean: VAPair,
+        masks: VAMasks,
+    ) -> VAPair:
+        """Advance both V/A streams with the CFG velocity Euler update."""
+        video_sigma = broadcast_frame_values(
+            sigmas_for_timesteps(
+                self.train_scheduler_latent,
+                timesteps.video,
+                dtype=noisy.video.dtype,
+            ),
+            noisy.video,
+        )
+        next_video_sigma = broadcast_frame_values(
+            sigmas_for_timesteps(
+                self.train_scheduler_latent,
+                next_timesteps.video,
+                dtype=noisy.video.dtype,
+            ),
+            noisy.video,
+        )
+        action_sigma = broadcast_frame_values(
+            sigmas_for_timesteps(
+                self.train_scheduler_action,
+                timesteps.action,
+                dtype=noisy.action.dtype,
+            ),
+            noisy.action,
+        )
+        next_action_sigma = broadcast_frame_values(
+            sigmas_for_timesteps(
+                self.train_scheduler_action,
+                next_timesteps.action,
+                dtype=noisy.action.dtype,
+            ),
+            noisy.action,
+        )
+        next_noisy = VAPair(
+            video=noisy.video + velocity.video * (next_video_sigma - video_sigma),
+            action=noisy.action
+            + velocity.action * (next_action_sigma - action_sigma),
+        )
+        return apply_va_mask(next_noisy, clean, masks)
 
     def compute_loss(
         self,
@@ -297,27 +392,32 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
                 clean,
                 timesteps,
             )
-            teacher_x0, cfg_scale = self._teacher_cfg(
+            teacher_output, cfg_scale = self._teacher_cfg(
                 teacher_input,
                 batch,
                 empty_text_emb,
                 noisy,
                 timesteps,
             )
-            transition_noise = (
-                noise
-                if self.reuse_teacher_noise
-                else randn_like_va(clean)
-            )
-            next_noisy = add_noise_to_va(
-                teacher_x0,
-                transition_noise,
-                next_timesteps,
-                self.train_scheduler_latent,
-                self.train_scheduler_action,
-                clean,
-                masks,
-            )
+            if self.use_cfg_velocity_transition:
+                next_noisy = self._velocity_transition(
+                    noisy,
+                    teacher_output.velocity,
+                    timesteps,
+                    next_timesteps,
+                    clean,
+                    masks,
+                )
+            else:
+                next_noisy = add_noise_to_va(
+                    teacher_output.x0,
+                    randn_like_va(clean),
+                    next_timesteps,
+                    self.train_scheduler_latent,
+                    self.train_scheduler_action,
+                    clean,
+                    masks,
+                )
             ema_input = replace_va_streams(
                 base_input,
                 next_noisy,

@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence
 import torch
 import torch.distributed as dist
 
-from distillation.model.utils import add_noise
+from distillation.model.common.utils import add_noise
 from distillation.schema import DenoisyInterval, VAPair
 
 from .base_pipeline import BasePipeline
 
 if TYPE_CHECKING:
-    from distillation.model.wan_wrapper import WanDiffusionWrapper
+    from distillation.model.common.wan_wrapper import WanDiffusionWrapper
 
 
 class DenoisingStepList(Protocol):

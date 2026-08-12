@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from distillation.model.autoregressive_mot import AutoregressiveModelRequest
-from distillation.model.utils import broadcast_frame_values, sigmas_for_timesteps
+from distillation.model.common.utils import broadcast_frame_values, sigmas_for_timesteps
 from distillation.schema import VADiffusionOutput, VAPair, VATimesteps
 from wan_va.utils.scheduler import FlowMatchScheduler
 

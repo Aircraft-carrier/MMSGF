@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 
 from distillation.configs import SELF_GRADIENT_FORCING_DMD
-from distillation.model.utils import freeze_model, set_trainable
+from distillation.model.common.utils import freeze_model, set_trainable
 from distillation.schema import TrainingStepResult
 from distillation.trainer.base import DistillationTrainerBase, OptimizationTarget
 from wan_va.train_mot import (

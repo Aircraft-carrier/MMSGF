@@ -4,7 +4,7 @@ from __future__ import annotations
 
 def __getattr__(name: str):
     if name == "WanDiffusionWrapper":
-        from distillation.model import wan_wrapper
+        from distillation.model.common import wan_wrapper
         return getattr(wan_wrapper, name)
     if name in {
         "AutoregressiveVAMOTTransformer3DModel",
@@ -50,14 +50,14 @@ def __getattr__(name: str):
         "sigmas_for_timesteps",
         "va_loss",
     }:
-        from distillation.model import utils
+        from distillation.model.common import utils
         return getattr(utils, name)
     if name in {
         "load_transformer_export",
         "build_frozen_transformer",
         "build_trainable_transformer",
     }:
-        from distillation.model import factory
+        from distillation.model.common import factory
         return getattr(factory, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

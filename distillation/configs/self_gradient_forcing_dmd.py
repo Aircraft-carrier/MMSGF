@@ -3,11 +3,9 @@ import copy
 
 from easydict import EasyDict
 
-from distillation.configs.runtime_dataset import apply_distillation_runtime_overrides
 from wan_va.configs import VA_CONFIGS
 
 self_gradient_forcing_dmd_cfg = EasyDict(copy.deepcopy(VA_CONFIGS["wan22_train"]))
-apply_distillation_runtime_overrides(self_gradient_forcing_dmd_cfg)
 self_gradient_forcing_dmd_cfg.distill = EasyDict(
     method="self_gradient_forcing_dmd",
     model_architecture="autoregressive_va_mot_v1",
@@ -27,7 +25,7 @@ self_gradient_forcing_dmd_cfg.distill = EasyDict(
     # SGF then performs velocity -> x0 -> fresh noise -> x_t(next).
     denoisy_step_list=EasyDict(
         video=[1000, 500],
-        action=[1000, 500],
+        action=[1000, 750, 500, 250],
     ),
     rollout_horizon_frames=3,
     # Frozen real-score 作为 SGF teacher；CFG 只作用于 video，action 用 conditional。

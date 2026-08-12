@@ -6,7 +6,7 @@
 - 去掉本包内的 attention、state、transitions 复杂调度、provider 的 GT 替换、artifacts。
 - 新增 `SelfGradientForcingTrainingPipeline`，构造输入对齐参考实现 `Self_Gradient_Forcing/pipeline/self_gradient_forcing_training.py`：
   `denoising_step_list`、`scheduler`、`generator`、`num_frame_per_block`、`per_rank_exit_step`。
-- 由 `distillation/model/wan_wrapper.py` 承担自回归模型的单独 video / action 生成（直接返回 x0），pipeline 不再调用
+- 由 `distillation/model/common/wan_wrapper.py` 承担自回归模型的单独 video / action 生成（直接返回 x0），pipeline 不再调用
   `flow_to_x0(pred, sample, t, scheduler)`，也不再使用 `renoise_x0`，加噪直接用 `scheduler.add_noise`。
 - 新增 `BasePipeline`，负责持有 KV cache 并构建历史帧 cache，供 pipeline 及后续新 pipeline 复用。
 - 暂时移除一致性蒸馏的 rollout 阶段。

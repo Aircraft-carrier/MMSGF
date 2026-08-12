@@ -1,14 +1,11 @@
-import json
 from dataclasses import replace
 from inspect import signature
 from types import SimpleNamespace
 
 import pytest
 import torch
-from easydict import EasyDict
 from torch import nn
 
-from distillation.configs.runtime_dataset import apply_distillation_runtime_overrides
 from distillation.model.consistency import (
     ConsistencyBaseModel,
     ConsistencyModel,
@@ -21,8 +18,8 @@ from distillation.model.dmd import (
     dmd_surrogate_loss,
     warp_denoisy_progress,
 )
-from distillation.model.utils import add_noise
-from distillation.model.wan_wrapper import (
+from distillation.model.common.utils import add_noise
+from distillation.model.common.wan_wrapper import (
     WanDiffusionWrapper as _RealWrapper,
 )
 from distillation.schema import (
@@ -81,33 +78,6 @@ def test_cli_parses_independent_video_action_lists() -> None:
 
     assert args.video_denoisy_step_list == [1000.0, 833.0]
     assert args.action_denoisy_step_list == [1000.0, 500.0, 250.0]
-
-
-def test_runtime_dataset_override_populates_wan22_base_paths(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    root = tmp_path / "dataset"
-    meta = root / "meta"
-    meta.mkdir(parents=True)
-    payload = {
-        "mot_manifest_path": str(meta / "manifest.jsonl"),
-        "empty_emb_path": str(root / "empty.pt"),
-        "text_emb_cache_path": str(root / "text.pt"),
-        "action_cache_manifest_path": "",
-        "norm_stat": {"q01": [0], "q99": [1]},
-        "norm_stats_by_task": {"default": {"q01": [0], "q99": [1]}},
-    }
-    (meta / "mot_config.json").write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setenv("MOT_DATASET_ROOT", str(root))
-    config = EasyDict()
-
-    apply_distillation_runtime_overrides(config)
-
-    assert config.dataset_path == str(root.resolve())
-    assert config.mot_config_path == str((meta / "mot_config.json").resolve())
-    assert config.mot_manifest_path == payload["mot_manifest_path"]
-    assert config.action_cache_manifest_path is None
 
 
 def test_interval_progress_sampling_respects_mask_and_half_open_bounds() -> None:
@@ -561,7 +531,7 @@ def test_dmd_model_does_not_own_resume_loading() -> None:
 
 def test_add_dmd_noise_supports_batch_gt_one(monkeypatch) -> None:
     """Per-sample [B,F] timesteps must broadcast on the frame axis, not crash."""
-    from distillation.model.utils import (
+    from distillation.model.common.utils import (
         broadcast_frame_values,
         sigmas_for_timesteps,
     )

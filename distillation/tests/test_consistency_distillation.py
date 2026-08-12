@@ -8,7 +8,8 @@ from distillation.model.autoregressive_mot import (
     AutoregressiveVAMOTTransformer3DModel,
 )
 from distillation.model.consistency import ConsistencyModel
-from distillation.model.wan_wrapper import WanDiffusionWrapper
+from distillation.model.common.wan_wrapper import WanDiffusionWrapper
+from distillation.schema import VAMasks, VAPair, VATimesteps
 from wan_va.modules.model_va_mot import VAMOTTransformer3DModel
 from wan_va.modules.mot_attention import build_x_metadata
 
@@ -45,7 +46,7 @@ def _config():
             action_num_steps=2,
             cfg_min=2.0,
             cfg_max=2.0,
-            reuse_teacher_noise=False,
+            use_cfg_velocity_transition=False,
             sigma_data=0.5,
             action_aware_weight=0.01,
             generation_shape={"history_frames": 0},
@@ -156,10 +157,10 @@ def test_consistency_step_preserves_forward_and_gradient_boundaries(
 
 
 @torch.inference_mode()
-def test_consistency_teacher_renoise_can_reuse_or_resample_noise(
+def test_consistency_teacher_transition_selects_fresh_noise_or_cfg_velocity(
     monkeypatch,
 ) -> None:
-    for reuse_teacher_noise in (False, True):
+    for use_cfg_velocity_transition in (False, True):
         student = _TrackingModel(0.1, trainable=True)
         teacher = _TrackingModel(0.2, trainable=False)
         ema = _TrackingModel(0.3, trainable=False)
@@ -170,7 +171,7 @@ def test_consistency_teacher_renoise_can_reuse_or_resample_noise(
             staticmethod(lambda *args, **kwargs: next(loaded_models)),
         )
         config = _config()
-        config.distill.reuse_teacher_noise = reuse_teacher_noise
+        config.distill.use_cfg_velocity_transition = use_cfg_velocity_transition
         model = ConsistencyModel(
             config=config,
             device=torch.device("cpu"),
@@ -178,6 +179,7 @@ def test_consistency_teacher_renoise_can_reuse_or_resample_noise(
             teacher_checkpoint="teacher-checkpoint",
         )
         noises = []
+        velocity_transitions = []
 
         def track_noise(
             x0,
@@ -192,7 +194,12 @@ def test_consistency_teacher_renoise_can_reuse_or_resample_noise(
             noises.extend((noise.video, noise.action))
             return noise
 
+        def track_velocity_transition(*args):
+            velocity_transitions.append(args)
+            return args[0]
+
         monkeypatch.setattr(consistency_module, "add_noise_to_va", track_noise)
+        model._velocity_transition = track_velocity_transition
         batch, base_input = _batch_and_input()
         model.compute_step(
             batch,
@@ -200,8 +207,69 @@ def test_consistency_teacher_renoise_can_reuse_or_resample_noise(
             empty_text_emb=torch.zeros(1, 1, 1),
         )
 
-        assert (noises[0] is noises[2]) is reuse_teacher_noise
-        assert (noises[1] is noises[3]) is reuse_teacher_noise
+        if use_cfg_velocity_transition:
+            assert len(noises) == 2
+            assert len(velocity_transitions) == 1
+        else:
+            assert len(noises) == 4
+            assert noises[0] is not noises[2]
+            assert noises[1] is not noises[3]
+            assert not velocity_transitions
+
+
+def test_consistency_cfg_velocity_transition_uses_euler_update() -> None:
+    model = ConsistencyModel.__new__(ConsistencyModel)
+    config = _config()
+    model.train_scheduler_latent = WanDiffusionWrapper._initialize_schedulers(
+        config
+    )[0]
+    model.train_scheduler_action = WanDiffusionWrapper._initialize_schedulers(
+        config
+    )[1]
+    noisy = VAPair(
+        video=torch.full((1, 1, 2, 1, 1, 1), 5.0),
+        action=torch.full((1, 1, 2, 1, 1), 7.0),
+    )
+    velocity = VAPair(
+        video=torch.full_like(noisy.video, 2.0),
+        action=torch.full_like(noisy.action, 4.0),
+    )
+    clean = VAPair(
+        video=torch.ones_like(noisy.video),
+        action=torch.ones_like(noisy.action),
+    )
+    masks = VAMasks(
+        video=torch.tensor([[False, True]]),
+        action=torch.tensor([[[[[False]], [[True]]]]]),
+    )
+    timesteps = VATimesteps(
+        video=torch.tensor([[0.0, 1000.0]]),
+        action=torch.tensor([[0.0, 1000.0]]),
+    )
+    next_timesteps = VATimesteps(
+        video=torch.tensor([[0.0, 500.0]]),
+        action=torch.tensor([[0.0, 500.0]]),
+    )
+
+    result = model._velocity_transition(
+        noisy,
+        velocity,
+        timesteps,
+        next_timesteps,
+        clean,
+        masks,
+    )
+
+    assert result.video[0, 0, 0, 0, 0, 0] == 1
+    assert result.action[0, 0, 0, 0, 0] == 1
+    torch.testing.assert_close(
+        result.video[:, :, 1:],
+        torch.full_like(result.video[:, :, 1:], 4.0),
+    )
+    torch.testing.assert_close(
+        result.action[:, :, 1:],
+        torch.full_like(result.action[:, :, 1:], 5.0),
+    )
 
 
 def test_consistency_rollout_delegates_to_shared_pipeline() -> None:

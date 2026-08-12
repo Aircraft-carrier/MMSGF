@@ -1,8 +1,4 @@
 """Distillation configs."""
-from distillation.configs.runtime_dataset import prepare_distillation_dataset_config
-
-prepare_distillation_dataset_config()
-
 from distillation.configs.autoregressive_training import autoregressive_training_cfg
 from distillation.configs.consistency_distillation import consistency_distillation_cfg
 from distillation.configs.self_gradient_forcing_dmd import self_gradient_forcing_dmd_cfg

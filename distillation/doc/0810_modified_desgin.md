@@ -82,14 +82,14 @@ t = scheduler.timesteps[k]
 10. 当前 fresh fake-score 常从 stage1 AR export 初始化；参考 DMD 的 real/fake score 都是双向模型。fake-score 应从双向 `va_mot_v1` export 初始化，通常与 real-score 的初始 checkpoint 相同。
 11. 当前 resume 路径可能把 stage3 `resume_from`（其公开 export 是 AR student）当作 fresh fake-score 初始化来源；正确做法是先用双向初始化 checkpoint 构造 fake-score，再由 DCP 覆盖 fake-score 和 optimizer 状态。
 12. `ReplayContext.teacher_batch` / `teacher_clean` 仅服务于即将删除的 replay teacher loss，删除后应移除，避免误以为 DMD real-score 使用 GT future 作为上下文。
-13. 原实现的三个 distillation config 索引不存在的 `VA_CONFIGS["umi_3dwam_train"]`。实现阶段统一改用当前 registry 唯一注册的 `wan22_train`，并由 `apply_distillation_runtime_overrides()` 注入 distillation dataset 路径与统计信息。
+13. 原实现的三个 distillation config 索引不存在的 `VA_CONFIGS["umi_3dwam_train"]`。实现阶段统一改用当前 registry 唯一注册的 `wan22_train`。
 
 ### 1.4 证据映射
 
 ```text
 velocity -> x0
   -> 当前：model conversion 局部实现，仅覆盖 full train forward
-  -> 目标：model/wan_wrapper.py::WanDiffusionWrapper，覆盖 AR student 与双向 score
+  -> 目标：model/common/wan_wrapper.py::WanDiffusionWrapper，覆盖 AR student 与双向 score
 
 x0 -> next x_t rollout
   -> inference 模式：保留 self_rollout/engine.py 的 scheduler.step()
@@ -181,7 +181,6 @@ no-grad autoregressive rollout(mode="sgf_renoise")
 MMSGF/
   distillation/
     configs/
-      runtime_dataset.py                  [MODIFY][CONFIG] 向 wan22 base 注入 distillation dataset 路径/统计
       self_gradient_forcing_dmd.py       [MODIFY][CONFIG] 显式 V/A denoisy lists，删除旧 score/rollout step 配置
     doc/
       0810_modified_desgin.md             [MODIFY][DOC] 本设计
@@ -217,7 +216,7 @@ MMSGF/
 
 ## 4. 文件级设计
 
-### 4.1 `distillation/model/wan_wrapper.py` `[ADD]`
+### 4.1 `distillation/model/common/wan_wrapper.py` `[ADD]`
 
 **总体职责**：为同一 V/A flow-matching 参数化提供唯一的 `velocity -> x0`、模型调用和输出规范化边界。
 
@@ -424,10 +423,6 @@ distill.denoisy_step_list = EasyDict(
 
 默认两套线性列表均为 `[1000,500]`。由于 `snr_shift=5` / `action_snr_shift=1`，实际网络 timestep 分别约为 video `[1000,833.33]` 与 action `[1000,500]`。实验若选择 `[1000,750,500,250]`，video 实际值约为 `[1000,937.5,833.33,625]`。
 
-### 4.11a `distillation/configs/runtime_dataset.py` `[MODIFY][CONFIG]`
-
-`wan22_train` 的 dataset 字段默认留空；`apply_distillation_runtime_overrides()` 从准备后的 `MOT_DATASET_ROOT/meta/mot_config.json` 注入 manifest、empty/text embedding cache、action cache 与 normalization statistics，使三个 distillation method 在同一 base config 上获得真实数据路径。
-
 ### 4.12 `distillation/train.py` 与 shell `[MODIFY][CONFIG][SCRIPT]`
 
 **计划内容**：
@@ -456,7 +451,7 @@ distill.denoisy_step_list = EasyDict(
 ```python
 class WanDiffusionWrapper:
     # Status/Location:
-    #   [ADD] distillation/model/wan_wrapper.py
+    #   [ADD] distillation/model/common/wan_wrapper.py
     # Responsibility:
     #   统一调用 Wan V/A diffusion backbone，并把 velocity 输出转为 x0；
     #   不拥有模型参数、optimizer、checkpoint 或 rollout cache。
@@ -924,13 +919,12 @@ def __init__(..., real_score_checkpoint: str, fake_score_init: str):
 
 ```text
 base EasyDict defaults
-  -> apply_distillation_runtime_overrides() 的受支持环境覆盖
   -> method config 的 distill defaults
   -> distillation.train CLI
   -> rank/local_rank/world_size/device runtime fields
 ```
 
-有效 base config 使用当前 registry 注册的 `VA_CONFIGS["wan22_train"]`；distillation runtime override 再从 `MOT_DATASET_ROOT/meta/mot_config.json` 注入数据路径、embedding cache 与 normalization statistics。
+有效 base config 使用当前 registry 注册的 `VA_CONFIGS["wan22_train"]`。
 
 ```python
 top_level_config = {
@@ -1359,10 +1353,6 @@ pytest -q \
 硬件/数据前提：至少一张能同时容纳 AR student、双向 real-score 与双向 fake-score shard 的 CUDA GPU；若单卡不足，使用仓库现有 4-GPU launcher，不降低模型数量来伪造 smoke pass。
 
 ## 12. 风险与开放项
-
-### 12.1 Base config 与 dataset runtime override
-
-实现统一采用已注册的 `wan22_train`，同时从 distillation-owned `MOT_DATASET_ROOT` 覆盖 dataset manifest、text embedding cache、empty embedding、action cache 与 normalization statistics。启动 smoke test 必须确认这些路径均非空且存在。
 
 ### 12.2 两套 denoisy list 的最终实验值
 

@@ -7,7 +7,7 @@ import json
 
 import torch
 
-from distillation.model.utils import freeze_model, set_trainable
+from distillation.model.common.utils import freeze_model, set_trainable
 from distillation.model.autoregressive_mot import (
     AutoregressiveVAMOTTransformer3DModel,
 )

@@ -47,7 +47,7 @@ trainer 已负责 FSDP/activation checkpoint 包装、冻结、train/eval 状态
 - 缺少通过 model/pipeline 的 rollout 公共入口；
 - 当前通用 trainer checkpoint 只写 `model.pt`，没有跨阶段必须的 `transformer/` export 和 metadata；consistency 的 optimizer/EMA state 也没有写入，resume 不能保持训练语义。
 
-### 2.3 `distillation/model/wan_wrapper.py`
+### 2.3 `distillation/model/common/wan_wrapper.py`
 
 当前 wrapper 已拥有 WAN checkpoint 加载、video/action scheduler、joint forward、flow-to-x0、AR predict/commit，是目标职责的主要基础。
 
@@ -199,7 +199,7 @@ distill.rollout_horizon_frames
 
 ## 6. 文件级改动计划
 
-- `distillation/model/wan_wrapper.py`
+- `distillation/model/common/wan_wrapper.py`
   - 支持包装 caller 提供的 module；现有 checkpoint load 和 conversion 不变。
 - `distillation/model/consistency.py`
   - 三个角色改用 wrapper；删除自行创建 scheduler；teacher/student/EMA forward 统一经 wrapper；增加共享 pipeline rollout 委托；保持 loss 逐行等价。

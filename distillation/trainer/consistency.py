@@ -11,7 +11,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from distillation.configs import CONSISTENCY_DISTILLATION
-from distillation.model.utils import freeze_model, set_trainable
+from distillation.model.common.utils import freeze_model, set_trainable
 from distillation.trainer.base import DistillationTrainerBase, OptimizationTarget
 from wan_va.train_mot import (
     apply_ac_mot,
