@@ -9,8 +9,7 @@ import torch.nn.functional as F
 
 from distillation.model.dmd import update_ema
 from distillation.model.utils import (
-    add_noise,
-    apply_va_mask,
+    add_noise_to_va,
     broadcast_frame_values,
     randn_like_va,
     replace_text_condition,
@@ -175,6 +174,37 @@ class ConsistencyBaseModel:
             dtype=text_emb.dtype,
         ).expand_as(text_emb)
 
+    def sample_timesteps(
+        self,
+        masks: VAMasks,
+    ) -> tuple[VATimesteps, VATimesteps]:
+        """Sample current and next consistency timesteps for both V/A streams."""
+        shape = masks.video.shape
+        video_timesteps, next_video_timesteps = sample_consistency_timesteps(
+            self.train_scheduler_latent,
+            self.video_num_steps,
+            shape,
+            self.device,
+            masks.video,
+        )
+        action_mask = masks.action.any(dim=(1, 3, 4))
+        action_timesteps, next_action_timesteps = sample_consistency_timesteps(
+            self.train_scheduler_action,
+            self.action_num_steps,
+            shape,
+            self.device,
+            action_mask,
+        )
+        timesteps = VATimesteps(
+            video=video_timesteps,
+            action=action_timesteps,
+        )
+        next_timesteps = VATimesteps(
+            video=next_video_timesteps,
+            action=next_action_timesteps,
+        )
+        return timesteps, next_timesteps
+
 
 class ConsistencyTrainingModel(ConsistencyBaseModel):
     """Build one teacher trajectory and compute the student consistency loss."""
@@ -246,49 +276,16 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
             ),
             action=base_input["action_dict"]["action_loss_mask"],
         )
-        shape = masks.video.shape
-        video_timesteps, next_video_timesteps = sample_consistency_timesteps(
-            self.train_scheduler_latent,
-            self.video_num_steps,
-            shape,
-            self.device,
-            masks.video,
-        )
-        action_mask = masks.action.any(dim=(1, 3, 4))
-        action_timesteps, next_action_timesteps = sample_consistency_timesteps(
-            self.train_scheduler_action,
-            self.action_num_steps,
-            shape,
-            self.device,
-            action_mask,
-        )
-        timesteps = VATimesteps(
-            video=video_timesteps,
-            action=action_timesteps,
-        )
-        next_timesteps = VATimesteps(
-            video=next_video_timesteps,
-            action=next_action_timesteps,
-        )
+        timesteps, next_timesteps = self.sample_timesteps(masks)
 
         clean = VAPair(batch["latents"], batch["actions"])
         noise = randn_like_va(clean)
-
-        noisy_video = add_noise(
-            clean.video,
-            noise.video,
-            timesteps.video,
+        noisy = add_noise_to_va(
+            clean,
+            noise,
+            timesteps,
             self.train_scheduler_latent,
-        )
-        noisy_action = add_noise(
-            clean.action,
-            noise.action,
-            timesteps.action,
             self.train_scheduler_action,
-        )
-
-        noisy = apply_va_mask(
-            VAPair(video=noisy_video, action=noisy_action),
             clean,
             masks,
         )
@@ -312,20 +309,12 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
                 if self.reuse_teacher_noise
                 else randn_like_va(clean)
             )
-            next_noisy_video = add_noise(
-                teacher_x0.video,
-                transition_noise.video,
-                next_timesteps.video,
+            next_noisy = add_noise_to_va(
+                teacher_x0,
+                transition_noise,
+                next_timesteps,
                 self.train_scheduler_latent,
-            )
-            next_noisy_action = add_noise(
-                teacher_x0.action,
-                transition_noise.action,
-                next_timesteps.action,
                 self.train_scheduler_action,
-            )
-            next_noisy = apply_va_mask(
-                VAPair(video=next_noisy_video, action=next_noisy_action),
                 clean,
                 masks,
             )

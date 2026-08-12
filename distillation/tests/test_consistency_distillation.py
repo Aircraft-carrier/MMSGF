@@ -179,12 +179,20 @@ def test_consistency_teacher_renoise_can_reuse_or_resample_noise(
         )
         noises = []
 
-        def track_noise(clean, noise, timesteps, scheduler, *, t_dim=2):
-            del clean, timesteps, scheduler, t_dim
-            noises.append(noise)
+        def track_noise(
+            x0,
+            noise,
+            timesteps,
+            video_scheduler,
+            action_scheduler,
+            clean,
+            masks,
+        ):
+            del x0, timesteps, video_scheduler, action_scheduler, clean, masks
+            noises.extend((noise.video, noise.action))
             return noise
 
-        monkeypatch.setattr(consistency_module, "add_noise", track_noise)
+        monkeypatch.setattr(consistency_module, "add_noise_to_va", track_noise)
         batch, base_input = _batch_and_input()
         model.compute_step(
             batch,

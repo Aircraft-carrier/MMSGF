@@ -353,6 +353,38 @@ def apply_va_mask(
     )
 
 
+def add_noise_to_va(
+    x0: VAPair,
+    noise: VAPair,
+    timesteps: VATimesteps,
+    video_scheduler: FlowMatchScheduler,
+    action_scheduler: FlowMatchScheduler,
+    clean: VAPair,
+    masks: VAMasks,
+) -> VAPair:
+    """Noise both V/A streams and restore clean values outside their masks.
+
+    ``x0`` is the value being noised and may be either ground truth or a model
+    prediction. ``clean`` is used only as the fallback for condition and padding
+    positions. Video and action use their own scheduler and timestep tensors.
+    """
+    noisy = VAPair(
+        video=add_noise(
+            x0.video,
+            noise.video,
+            timesteps.video,
+            video_scheduler,
+        ),
+        action=add_noise(
+            x0.action,
+            noise.action,
+            timesteps.action,
+            action_scheduler,
+        ),
+    )
+    return apply_va_mask(noisy, clean, masks)
+
+
 def replace_va_streams(
     base_input: dict,
     noisy: VAPair,

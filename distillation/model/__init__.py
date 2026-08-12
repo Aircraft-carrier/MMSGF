@@ -39,6 +39,7 @@ def __getattr__(name: str):
         return getattr(dmd, name)
     if name in {
         "add_noise",
+        "add_noise_to_va",
         "apply_va_mask",
         "broadcast_frame_values",
         "freeze_model",
@@ -72,6 +73,7 @@ __all__ = [
     "SelfGradientForcingModel",
     "action_aware_loss",
     "add_noise",
+    "add_noise_to_va",
     "apply_va_mask",
     "broadcast_frame_values",
     "build_frozen_transformer",
