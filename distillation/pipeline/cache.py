@@ -37,10 +37,6 @@ class KVCache:
         self._next_transaction_id += 1
         return transaction_id
 
-    @property
-    def layer_ids(self) -> tuple[int, ...]:
-        return tuple(sorted(set(self._committed) | set(self._transactions)))
-
     def append(
         self,
         layer_id: int,

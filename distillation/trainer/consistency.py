@@ -28,7 +28,7 @@ class ConsistencyTrainer(DistillationTrainerBase):
 
     def __init__(self, config: Any):
         super().__init__(config)
-        self.optimizer = self._build_optimizer(config, self.model.student)
+        self.optimizer = self._build_optimizer(config, self.model.generate.model)
         self.lr_scheduler = self._build_lr_scheduler(config, self.optimizer)
         if self._resume_from is not None:
             self.load_checkpoint(self._resume_from)
@@ -51,23 +51,22 @@ class ConsistencyTrainer(DistillationTrainerBase):
             device=self.device,
             student_init=str(student_init),
             teacher_checkpoint=str(teacher_checkpoint),
-            resume_from=self._resume_from,
         )
 
     def _wrap_method_models(self) -> None:
-        student = set_trainable(self.model.student)
-        apply_mot_parameter_ownership(student)
-        apply_ac_mot(student)
-        student = _configure_model(
-            model=student,
+        generate = set_trainable(self.model.generate.model)
+        apply_mot_parameter_ownership(generate)
+        apply_ac_mot(generate)
+        generate = _configure_model(
+            model=generate,
             shard_fn=partial(shard_mot_model),
             param_dtype=self.dtype,
             device=self.device,
             eval_mode=False,
         )
-        student.train()
+        generate.train()
 
-        teacher = freeze_model(self.model.teacher)
+        teacher = freeze_model(self.model.teacher.model)
         teacher = _configure_model(
             model=teacher,
             shard_fn=partial(shard_mot_model),
@@ -76,46 +75,46 @@ class ConsistencyTrainer(DistillationTrainerBase):
             eval_mode=True,
         )
 
-        ema_student = freeze_model(self.model.ema_student)
-        ema_student = _configure_model(
-            model=ema_student,
+        target = freeze_model(self.model.target.model)
+        target = _configure_model(
+            model=target,
             shard_fn=partial(shard_mot_model),
             param_dtype=self.dtype,
             device=self.device,
             eval_mode=True,
         )
         self.model.attach_wrapped_models(
-            student=student,
+            generate=generate,
             teacher=teacher,
-            ema_student=ema_student,
+            target=target,
         )
 
     def _trainable_model(self) -> Any:
-        return self.model.student
+        return self.model.generate.model
 
     def _export_model(self) -> Any:
-        return self.model.ema_student
+        return self.model.target.model
 
     def _optimization_target(self) -> OptimizationTarget:
         return OptimizationTarget(
             name="generator",
             optimizer=self.optimizer,
-            model=self.model.student,
+            model=self.model.generate.model,
         )
 
     def _after_optimizer_step(self, target: OptimizationTarget) -> None:
         self.lr_scheduler.step()
-        self.model.after_student_step(self.model.student)
+        self.model.after_student_step(self.model.generate.model)
 
     def _extra_save_state(self, state: dict[str, Any]) -> None:
         state["ema_student"] = get_model_state_dict(
-            self.model.ema_student,
+            self.model.target.model,
             options=self._checkpoint_options(),
         )
 
     def _restore_extra_state(self, state: dict[str, Any]) -> None:
         set_model_state_dict(
-            self.model.ema_student,
+            self.model.target.model,
             state["ema_student"],
             options=self._checkpoint_options(),
         )

@@ -36,12 +36,6 @@ class VAMasks:
     video: torch.Tensor
     action: torch.Tensor
 
-    def frame_mask(self) -> torch.Tensor:
-        # score noise 以 frame 为单位采样：只要 video 或 action 任一 token 在该
-        # frame 受监督，就给它非零 timestep；两者都无效时返回 False。
-        video = self.video.reshape(self.video.shape[0], -1)
-        return video | self.action.any(dim=(1, 3, 4))
-
 
 @dataclass(frozen=True, slots=True)
 class VALossWeights:
@@ -69,19 +63,6 @@ class VADenoisySelection:
 
     video: DenoisyInterval
     action: DenoisyInterval
-
-
-@dataclass(frozen=True, slots=True)
-class CheckpointMetadata:
-    format_version: int
-    checkpoint_type: str
-    model_architecture: str
-    has_full_state: bool
-    distill_method: str
-    exported_model: str
-    step: int
-    optimizer_step: int
-    generation_profile: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)

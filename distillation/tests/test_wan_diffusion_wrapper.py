@@ -1,10 +1,11 @@
+import inspect
 from types import SimpleNamespace
 
 import torch
 import pytest
 from torch import nn
 
-from distillation.model.autoregressive_types import (
+from distillation.model.autoregressive_mot import (
     AutoregressiveModelOutput,
 )
 from distillation.pipeline import KVCache
@@ -256,17 +257,7 @@ def test_wrapper_does_not_register_borrowed_model(monkeypatch) -> None:
     assert not hasattr(wrapper, "state_dict")
 
 
-def test_wrapper_can_borrow_existing_model_without_loading(monkeypatch) -> None:
-    model = _JointModel()
-    monkeypatch.setattr(
-        WanDiffusionWrapper,
-        "_load_model",
-        staticmethod(lambda *args, **kwargs: pytest.fail("must not load")),
-    )
+def test_wrapper_only_accepts_checkpoint_model_initialization() -> None:
+    parameters = inspect.signature(WanDiffusionWrapper).parameters
 
-    wrapper = WanDiffusionWrapper(
-        config=SimpleNamespace(snr_shift=1.0, action_snr_shift=1.0),
-        model=model,
-    )
-
-    assert wrapper.model is model
+    assert "model" not in parameters

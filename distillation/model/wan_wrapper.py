@@ -8,38 +8,14 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from distillation.model.autoregressive_types import AutoregressiveModelRequest
+from distillation.model.autoregressive_mot import AutoregressiveModelRequest
+from distillation.model.utils import broadcast_frame_values, sigmas_for_timesteps
 from distillation.schema import VADiffusionOutput, VAPair, VATimesteps
 from wan_va.utils.scheduler import FlowMatchScheduler
 
 
-def sigmas_for_timesteps(
-    scheduler: FlowMatchScheduler,
-    timesteps: torch.Tensor,
-    *,
-    dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    scheduler_timesteps = scheduler.timesteps.to(timesteps.device).reshape(
-        -1,
-        *([1] * timesteps.ndim),
-    )
-    indices = (scheduler_timesteps - timesteps.unsqueeze(0)).abs().argmin(dim=0)
-    return scheduler.sigmas.to(timesteps.device)[indices].to(dtype=dtype)
-
-
-def broadcast_frame_values(
-    values: torch.Tensor,
-    sample: torch.Tensor,
-) -> torch.Tensor:
-    return values.reshape(
-        values.shape[0],
-        1,
-        values.shape[1],
-        *([1] * (sample.ndim - 3)),
-    )
-    
 class WanDiffusionWrapper:
-    """Load or borrow a Wan model and return its joint flow and x0 predictions.
+    """Load a Wan model and return its joint flow and x0 predictions.
 
     Model placement, trainability, activation checkpointing, and sharding are
     deliberately trainer-owned. The trainer assigns the processed module back
@@ -49,19 +25,14 @@ class WanDiffusionWrapper:
     def __init__(
         self,
         *,
-        config: Any | None = None,
-        checkpoint_path: str | None = None,
+        config: Any,
+        checkpoint_path: str | Path,
         autoregressive: bool = True,
-        model: nn.Module | None = None,
     ) -> None:
-        self.model = (
-            model
-            if model is not None
-            else self._load_model(
-                checkpoint_path,
-                config,
-                autoregressive=autoregressive,
-            )
+        self.model = self._load_model(
+            checkpoint_path,
+            config,
+            autoregressive=autoregressive,
         )
 
         video_scheduler, action_scheduler = self._initialize_schedulers(config)

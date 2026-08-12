@@ -103,11 +103,15 @@ class FlowMatchScheduler():
         if timestep.ndim == 0:
             timestep = timestep[None]
         timestep_id = torch.argmin(
-            (self.timesteps.to(original_samples.device)[:, None] -
-             timestep).abs(),
+            (self.timesteps.to(original_samples.device).reshape(
+                -1, *([1] * timestep.ndim)) - timestep.unsqueeze(0)).abs(),
             dim=0)
         shape = [1] * noise.ndim
-        shape[t_dim] = timestep_id.shape[0]
+        if timestep_id.ndim == 2:
+            shape[0] = timestep_id.shape[0]
+            shape[t_dim] = timestep_id.shape[1]
+        else:
+            shape[t_dim] = timestep_id.shape[0]
         sigma = self.sigmas.to(device=original_samples.device,
                                dtype=original_samples.dtype)[
             timestep_id].view(shape)

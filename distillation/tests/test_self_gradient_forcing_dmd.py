@@ -9,7 +9,6 @@ from easydict import EasyDict
 from torch import nn
 
 from distillation.configs.runtime_dataset import apply_distillation_runtime_overrides
-from distillation.model import objectives
 from distillation.model.consistency import (
     ConsistencyBaseModel,
     ConsistencyModel,
@@ -19,12 +18,12 @@ from distillation.model.dmd import (
     BaseModel,
     SGFDMDModel,
     SelfGradientForcingModel,
+    dmd_surrogate_loss,
     warp_denoisy_progress,
 )
 from distillation.model.wan_wrapper import (
     WanDiffusionWrapper as _RealWrapper,
 )
-from distillation.pipeline import SelfGradientForcingTrainingPipeline
 from distillation.schema import (
     DMDUpdateSchedule,
     DenoisyInterval,
@@ -47,7 +46,7 @@ def test_training_models_keep_behavior_in_model_modules() -> None:
 
     for method in {"_initialize_models", "_prepare_input"}:
         assert method in BaseModel.__dict__
-    for method in {"run_generator", "record", "replay"}:
+    for method in {"record", "replay"}:
         assert method in SelfGradientForcingModel.__dict__
     for method in {
         "_get_timestep",
@@ -215,9 +214,27 @@ def test_linear_progress_warps_through_each_modality_scheduler() -> None:
     )
 
 
+def test_scheduler_add_noise_supports_batch_frame_timesteps() -> None:
+    scheduler = FlowMatchScheduler(
+        shift=1.0,
+        sigma_min=0.0,
+        extra_one_step=True,
+    )
+    scheduler.set_timesteps(2)
+    clean = torch.zeros(2, 1, 2, 1, 1)
+    noise = torch.ones_like(clean)
+    timesteps = torch.tensor([[1000.0, 500.0], [500.0, 1000.0]])
+
+    noisy = scheduler.add_noise(clean, noise, timesteps)
+
+    expected = torch.tensor(
+        [[[[[1.0]], [[0.5]]]], [[[[0.5]], [[1.0]]]]]
+    )
+    torch.testing.assert_close(noisy, expected)
+
+
 def test_dmd_losses_are_explicit() -> None:
-    assert not hasattr(objectives, "replay_target_loss")
-    assert callable(objectives.dmd_surrogate_loss)
+    assert callable(dmd_surrogate_loss)
     assert "_compute_kl_grad" in SGFDMDModel.__dict__
     assert "compute_distribution_matching_loss" in SGFDMDModel.__dict__
 
@@ -236,7 +253,7 @@ def test_dmd_surrogate_loss_is_half_masked_mse() -> None:
         action=torch.ones(1, 1, 1, 1, 1, dtype=torch.bool),
     )
 
-    loss, metrics = objectives.dmd_surrogate_loss(
+    loss, metrics = dmd_surrogate_loss(
         x0,
         target,
         masks,
@@ -543,7 +560,7 @@ def test_dmd_model_does_not_own_resume_loading() -> None:
 
 def test_add_dmd_noise_supports_batch_gt_one(monkeypatch) -> None:
     """Per-sample [B,F] timesteps must broadcast on the frame axis, not crash."""
-    from distillation.model.wan_wrapper import (
+    from distillation.model.utils import (
         broadcast_frame_values,
         sigmas_for_timesteps,
     )

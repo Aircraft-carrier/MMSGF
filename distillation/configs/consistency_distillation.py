@@ -27,6 +27,8 @@ consistency_distillation_cfg.distill = EasyDict(
     # Teacher CFG 只作用于 video flow，action 始终使用 conditional prediction。
     cfg_min=2.0,
     cfg_max=10.0,
+    # False: teacher x0 使用新 noise 重新加噪；True: 复用当前 x_t 的 noise。
+    reuse_teacher_noise=False,
     # Video consistency boundary scaling 的数据尺度；必须 > 0。
     sigma_data=0.5,
     # 额外的 action exact-flow regression 权重。

@@ -7,6 +7,7 @@ from distillation.model.autoregressive_mot import (
     AutoregressiveVAMOTTransformer3DModel,
 )
 from distillation.model.consistency import ConsistencyModel
+from distillation.model.wan_wrapper import WanDiffusionWrapper
 from wan_va.modules.model_va_mot import VAMOTTransformer3DModel
 from wan_va.modules.mot_attention import build_x_metadata
 
@@ -43,6 +44,7 @@ def _config():
             action_num_steps=2,
             cfg_min=2.0,
             cfg_max=2.0,
+            reuse_teacher_noise=False,
             sigma_data=0.5,
             action_aware_weight=0.01,
             generation_shape={"history_frames": 0},
@@ -88,19 +90,39 @@ def _batch_and_input():
     return batch, base_input
 
 
-def test_consistency_step_preserves_forward_and_gradient_boundaries() -> None:
+def test_consistency_step_preserves_forward_and_gradient_boundaries(
+    monkeypatch,
+) -> None:
     student = _TrackingModel(0.1, trainable=True)
     teacher = _TrackingModel(0.2, trainable=False)
     ema = _TrackingModel(0.3, trainable=False)
+    loaded_models = iter([student, teacher, ema])
+    loaded_paths = []
+
+    def fake_load_model(checkpoint_path, config, *, autoregressive):
+        del config, autoregressive
+        loaded_paths.append(checkpoint_path)
+        return next(loaded_models)
+
+    monkeypatch.setattr(
+        WanDiffusionWrapper,
+        "_load_model",
+        staticmethod(fake_load_model),
+    )
     model = ConsistencyModel(
         config=_config(),
         device=torch.device("cpu"),
-        student_init=None,
-        teacher_checkpoint=None,
-        student=student,
-        teacher=teacher,
-        ema_student=ema,
+        student_init="student-checkpoint",
+        teacher_checkpoint="teacher-checkpoint",
     )
+    assert loaded_paths == [
+        "student-checkpoint",
+        "teacher-checkpoint",
+        "student-checkpoint",
+    ]
+    assert model.generate.model is student
+    assert model.teacher.model is teacher
+    assert model.target.model is ema
     batch, base_input = _batch_and_input()
 
     torch.manual_seed(7)
@@ -130,6 +152,48 @@ def test_consistency_step_preserves_forward_and_gradient_boundaries() -> None:
         student_input["action_dict"]["noisy_latents"][:, :, :1],
         batch["actions"][:, :, :1],
     )
+
+
+@torch.inference_mode()
+def test_consistency_teacher_renoise_can_reuse_or_resample_noise(
+    monkeypatch,
+) -> None:
+    for reuse_teacher_noise in (False, True):
+        student = _TrackingModel(0.1, trainable=True)
+        teacher = _TrackingModel(0.2, trainable=False)
+        ema = _TrackingModel(0.3, trainable=False)
+        loaded_models = iter([student, teacher, ema])
+        monkeypatch.setattr(
+            WanDiffusionWrapper,
+            "_load_model",
+            staticmethod(lambda *args, **kwargs: next(loaded_models)),
+        )
+        config = _config()
+        config.distill.reuse_teacher_noise = reuse_teacher_noise
+        model = ConsistencyModel(
+            config=config,
+            device=torch.device("cpu"),
+            student_init="student-checkpoint",
+            teacher_checkpoint="teacher-checkpoint",
+        )
+        noises = []
+
+        def track_noise(original_samples, noise, timestep, t_dim=2):
+            del original_samples, timestep, t_dim
+            noises.append(noise)
+            return noise
+
+        model.train_scheduler_latent.add_noise = track_noise
+        model.train_scheduler_action.add_noise = track_noise
+        batch, base_input = _batch_and_input()
+        model.compute_step(
+            batch,
+            base_input=base_input,
+            empty_text_emb=torch.zeros(1, 1, 1),
+        )
+
+        assert (noises[0] is noises[2]) is reuse_teacher_noise
+        assert (noises[1] is noises[3]) is reuse_teacher_noise
 
 
 def test_consistency_rollout_delegates_to_shared_pipeline() -> None:

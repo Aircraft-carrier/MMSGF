@@ -19,23 +19,34 @@ def __getattr__(name: str):
             "AutoregressiveVAMOTBlock": AutoregressiveVAMOTBlock,
         }[name]
     if name in {
+        "action_aware_loss",
         "ConsistencyBaseModel",
         "ConsistencyTrainingModel",
         "ConsistencyModel",
+        "consistency_loss",
     }:
         from distillation.model import consistency
         return getattr(consistency, name)
-    if name in {"BaseModel", "SelfGradientForcingModel", "SGFDMDModel"}:
+    if name in {
+        "BaseModel",
+        "dmd_surrogate_loss",
+        "fake_score_flow_loss",
+        "SelfGradientForcingModel",
+        "SGFDMDModel",
+        "update_ema",
+    }:
         from distillation.model import dmd
         return getattr(dmd, name)
     if name in {
-        "add_noise_to_va",
+        "apply_va_mask",
+        "broadcast_frame_values",
         "freeze_model",
-        "mask_clean_targets",
+        "randn_like_va",
         "replace_text_condition",
         "replace_va_streams",
         "set_trainable",
-        "update_ema",
+        "sigmas_for_timesteps",
+        "va_loss",
     }:
         from distillation.model import utils
         return getattr(utils, name)
@@ -46,14 +57,6 @@ def __getattr__(name: str):
     }:
         from distillation.model import factory
         return getattr(factory, name)
-    if name in {
-        "action_aware_loss",
-        "consistency_loss",
-        "dmd_surrogate_loss",
-        "fake_score_flow_loss",
-    }:
-        from distillation.model import objectives
-        return getattr(objectives, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -67,16 +70,19 @@ __all__ = [
     "SGFDMDModel",
     "SelfGradientForcingModel",
     "action_aware_loss",
-    "add_noise_to_va",
+    "apply_va_mask",
+    "broadcast_frame_values",
     "build_frozen_transformer",
     "build_trainable_transformer",
     "freeze_model",
-    "mask_clean_targets",
+    "randn_like_va",
     "load_transformer_export",
     "set_trainable",
+    "sigmas_for_timesteps",
     "replace_text_condition",
     "replace_va_streams",
     "update_ema",
+    "va_loss",
     "consistency_loss",
     "dmd_surrogate_loss",
     "fake_score_flow_loss",

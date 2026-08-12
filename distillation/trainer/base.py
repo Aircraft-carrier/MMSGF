@@ -23,7 +23,6 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
     get_state_dict,
-    set_model_state_dict,
     set_state_dict,
 )
 from torch.utils.data import DataLoader
@@ -403,17 +402,6 @@ class DistillationTrainerBase:
     def _full_model_state(self, model: torch.nn.Module) -> dict[str, Any]:
         return get_model_state_dict(
             model,
-            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-        )
-
-    def _restore_full_model_state(
-        self,
-        model: torch.nn.Module,
-        state: dict[str, Any],
-    ) -> None:
-        set_model_state_dict(
-            model,
-            state,
             options=StateDictOptions(full_state_dict=True, cpu_offload=True),
         )
 

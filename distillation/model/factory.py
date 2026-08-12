@@ -23,8 +23,8 @@ def load_transformer_export(
     """Load only a published cross-stage ``transformer/`` export.
 
     checkpoint root 必须有 ``_SUCCESS``、MOT-compatible metadata、config 和
-    safetensors。这里不会读取 DCP optimizer state;同方法 resume 由
-    ``DistillationCheckpointIO.load`` 负责，跨方法初始化只消费 export。
+    safetensors。这里不会读取 DCP optimizer state；跨方法初始化只消费
+    export。
     """
     checkpoint_path = Path(checkpoint_path)
     required = (
