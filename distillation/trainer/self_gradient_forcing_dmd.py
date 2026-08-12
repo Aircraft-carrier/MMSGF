@@ -4,6 +4,8 @@ from __future__ import annotations
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+
 from distillation.configs import SELF_GRADIENT_FORCING_DMD
 from distillation.model.utils import freeze_model, set_trainable
 from distillation.schema import TrainingStepResult
@@ -149,20 +151,21 @@ class SelfGradientForcingDMDTrainer(DistillationTrainerBase):
             self.lr_scheduler.step()
 
     def _extra_save_state(self, state: dict[str, Any]) -> None:
-        state["optimizer"] = self.optimizer.state_dict()
-        state["lr_scheduler"] = self.lr_scheduler.state_dict()
-        state["fake_score"] = self._full_model_state(
-            self.model.fake_score.model
+        fake_score, fake_score_optimizer = get_state_dict(
+            self.model.fake_score.model,
+            self.fake_score_optimizer,
+            options=self._checkpoint_options(),
         )
-        state["fake_score_optimizer"] = self.fake_score_optimizer.state_dict()
+        state["fake_score"] = fake_score
+        state["fake_score_optimizer"] = fake_score_optimizer
 
     def _restore_extra_state(self, state: dict[str, Any]) -> None:
-        self.optimizer.load_state_dict(state["optimizer"])
-        self.lr_scheduler.load_state_dict(state["lr_scheduler"])
-        self._restore_full_model_state(
+        set_state_dict(
             self.model.fake_score.model,
-            state["fake_score"],
+            self.fake_score_optimizer,
+            model_state_dict=state["fake_score"],
+            optim_state_dict=state["fake_score_optimizer"],
+            options=self._checkpoint_options(),
         )
-        self.fake_score_optimizer.load_state_dict(state["fake_score_optimizer"])
         _configure_adamw_foreach(self.optimizer)
         _configure_adamw_foreach(self.fake_score_optimizer)

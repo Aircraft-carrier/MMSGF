@@ -135,7 +135,7 @@ class AutoregressiveVAMOTTransformer3DModel(
         )
         metadata.cache_key = None
         metadata.structure_cache_key = None
-        return metadata
+        return metadata, diagnostics
 
     def _text(self, text_emb: torch.Tensor, batch_size: int) -> torch.Tensor:
         if text_emb.shape[0] == 1 and batch_size != 1:

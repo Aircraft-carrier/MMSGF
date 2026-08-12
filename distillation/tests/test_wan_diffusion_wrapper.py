@@ -254,3 +254,19 @@ def test_wrapper_does_not_register_borrowed_model(monkeypatch) -> None:
 
     assert not isinstance(wrapper, nn.Module)
     assert not hasattr(wrapper, "state_dict")
+
+
+def test_wrapper_can_borrow_existing_model_without_loading(monkeypatch) -> None:
+    model = _JointModel()
+    monkeypatch.setattr(
+        WanDiffusionWrapper,
+        "_load_model",
+        staticmethod(lambda *args, **kwargs: pytest.fail("must not load")),
+    )
+
+    wrapper = WanDiffusionWrapper(
+        config=SimpleNamespace(snr_shift=1.0, action_snr_shift=1.0),
+        model=model,
+    )
+
+    assert wrapper.model is model

@@ -33,6 +33,15 @@ consistency_distillation_cfg.distill = EasyDict(
     action_aware_weight=0.01,
     # 仅在成功 student optimizer.step 后更新 EMA。
     ema_decay=0.9999,
+    # consistency 的监控/评估 rollout 复用共享 AR pipeline；这些值不参与
+    # 上面的 consistency timestep stride 或训练 loss。
+    rollout_denoising_step_list=EasyDict(
+        video=[1000, 500],
+        action=[1000, 500],
+    ),
+    rollout_horizon_frames=3,
+    rollout_num_frame_per_block=1,
+    rollout_per_rank_exit_step=True,
     # fresh run: student_init 初始化 raw student 和 EMA；teacher_checkpoint 冻结。
     # resume: DCP 会覆盖 raw student/optimizer/EMA，teacher 仍从来源重建。
     student_init=None,

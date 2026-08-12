@@ -10,18 +10,26 @@ via ``attach_wrapped_models``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
+import random
 from typing import Any, Literal
 
+import numpy as np
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
+    get_state_dict,
     set_model_state_dict,
+    set_state_dict,
 )
 from torch.utils.data import DataLoader
+from safetensors.torch import save_file
 
+from distillation.mask_profile import generation_profile_contract
 from distillation.schema import TrainingStepResult
 from wan_va.dataset.mot_dataset import validate_mot_batch_for_forward
 from wan_va.modules.utils import WanVAEStreamingWrapper, load_vae
@@ -71,6 +79,7 @@ class DistillationTrainerBase:
         self.save_interval = int(config.save_interval)
         self.save_dir = Path(config.save_root) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self._last_checkpoint_step = None
         self.train_vae = None
         self.empty_text_emb = None
 
@@ -371,19 +380,23 @@ class DistillationTrainerBase:
 
     def train(self) -> None:
         total = int(self.config.num_steps)
-        microstep = 0
+        microstep = int(self.step)
         while self.optimizer_step < total:
-            self._train_step(
+            result = self._train_step(
                 self._get_next_batch(),
                 microstep % self.gradient_accumulation_steps,
             )
             microstep += 1
             self.step = microstep
             if (
-                self.optimizer_step > 0
+                result["optimizer_step_event"]
+                and self.optimizer_step > 0
                 and self.optimizer_step % self.save_interval == 0
+                and self._last_checkpoint_step != self.optimizer_step
             ):
                 self.save_checkpoint()
+        if self._last_checkpoint_step != self.optimizer_step:
+            self.save_checkpoint()
 
     # Checkpoint -----------------------------------------------------------
 
@@ -404,6 +417,116 @@ class DistillationTrainerBase:
             options=StateDictOptions(full_state_dict=True, cpu_offload=True),
         )
 
+    @staticmethod
+    def _checkpoint_options() -> StateDictOptions:
+        return StateDictOptions(
+            full_state_dict=False,
+            cpu_offload=True,
+            strict=True,
+        )
+
+    def _checkpoint_state_dict(self) -> dict[str, Any]:
+        model, optimizer = get_state_dict(
+            self._trainable_model(),
+            self.optimizer,
+            options=self._checkpoint_options(),
+        )
+        state = {"generator": model, "optimizer": optimizer}
+        self._extra_save_state(state)
+        return state
+
+    def _restore_checkpoint_state(self, state: dict[str, Any]) -> None:
+        set_state_dict(
+            self._trainable_model(),
+            self.optimizer,
+            model_state_dict=state["generator"],
+            optim_state_dict=state["optimizer"],
+            options=self._checkpoint_options(),
+        )
+        self._restore_extra_state(state)
+        _configure_adamw_foreach(self.optimizer)
+
+    def _export_model(self) -> torch.nn.Module:
+        return self._trainable_model()
+
+    def _write_transformer_export(
+        self,
+        checkpoint_dir: Path,
+        model: torch.nn.Module,
+        state_dict: dict[str, torch.Tensor],
+    ) -> None:
+        transformer_dir = checkpoint_dir / "transformer"
+        transformer_dir.mkdir(parents=True)
+        config_dict = dict(model.config)
+        config_dict.pop("_name_or_path", None)
+        config_dict["generation_shape"] = dict(
+            self.config.distill.generation_shape
+        )
+        (transformer_dir / "config.json").write_text(
+            json.dumps(config_dict, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        save_file(
+            {name: value.contiguous() for name, value in state_dict.items()},
+            transformer_dir / "diffusion_pytorch_model.safetensors",
+        )
+
+    def _write_checkpoint_metadata(self, checkpoint_dir: Path) -> None:
+        metadata = {
+            "format_version": 3,
+            "checkpoint_type": "mot_training",
+            "model_architecture": str(self.config.distill.model_architecture),
+            "has_full_state": True,
+            "distill_method": self.method,
+            "exported_model": (
+                "ema_student"
+                if self.method == "consistency_distillation"
+                else "student"
+            ),
+            "step": int(self.step),
+            "optimizer_step": int(self.optimizer_step),
+            "generation_profile": generation_profile_contract(
+                self.config.distill.generation_shape
+            ),
+        }
+        (checkpoint_dir / "checkpoint_metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def _capture_rng_state(self) -> dict[str, Any]:
+        cuda_state = None
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            cuda_state = torch.cuda.get_rng_state(self.device)
+        return {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": cuda_state,
+        }
+
+    def _collect_rng_states(self) -> list[dict[str, Any]]:
+        local_state = self._capture_rng_state()
+        if not (dist.is_available() and dist.is_initialized()):
+            return [local_state]
+        states = [None] * dist.get_world_size()
+        dist.all_gather_object(states, local_state)
+        return states
+
+    def _restore_rng_state(self, state: dict[str, Any]) -> None:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch_cpu"])
+        if state["torch_cuda"] is not None:
+            torch.cuda.set_rng_state(state["torch_cuda"], self.device)
+
+    def _set_sampler_resume_offset(self) -> None:
+        loader = getattr(self, "train_loader", None)
+        sampler = getattr(loader, "batch_sampler", None)
+        if hasattr(sampler, "set_start_step"):
+            sampler.set_start_step(self.step)
+            self.train_loader_iter = iter(loader)
+
     def _extra_save_state(self, state: dict[str, Any]) -> None:
         """Subclass hook for extra state (e.g. fake-score + its optimizer)."""
 
@@ -412,33 +535,78 @@ class DistillationTrainerBase:
 
     def save_checkpoint(self) -> Path:
         checkpoint_dir = self.save_dir / f"checkpoint_step_{self.optimizer_step:08d}"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        state = {
+        export_model = self._export_model()
+        dcp_state = self._checkpoint_state_dict()
+        temp_dir = self.save_dir / f".{checkpoint_dir.name}.tmp"
+        if int(getattr(self.config, "rank", 0)) == 0:
+            if checkpoint_dir.exists():
+                raise FileExistsError(checkpoint_dir)
+            if temp_dir.exists():
+                raise FileExistsError(temp_dir)
+            temp_dir.mkdir(parents=True)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        dcp.save(
+            dcp_state,
+            checkpoint_id=temp_dir / "distributed_state",
+        )
+        export_state = self._full_model_state(export_model)
+        training_state = {
             "step": self.step,
             "optimizer_step": self.optimizer_step,
-            "generator": self._full_model_state(self._trainable_model()),
+            "lr_scheduler": self.lr_scheduler.state_dict(),
+            "rng_states_by_rank": self._collect_rng_states(),
             "method_state_dict": self.get_method_state_dict(),
         }
-        self._extra_save_state(state)
-        torch.save(state, checkpoint_dir / "model.pt")
-        (checkpoint_dir / "_SUCCESS").write_text("", encoding="utf-8")
+        if int(getattr(self.config, "rank", 0)) == 0:
+            torch.save(training_state, temp_dir / "training_state.pt")
+            self._write_transformer_export(temp_dir, export_model, export_state)
+            self._write_checkpoint_metadata(temp_dir)
+            (temp_dir / "_SUCCESS").write_text("", encoding="utf-8")
+            temp_dir.replace(checkpoint_dir)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        self._last_checkpoint_step = self.optimizer_step
         return checkpoint_dir
 
     def load_checkpoint(self, checkpoint_root: str | Path) -> None:
         checkpoint_root = Path(checkpoint_root)
-        state = torch.load(
-            checkpoint_root / "model.pt",
+        metadata = json.loads(
+            (checkpoint_root / "checkpoint_metadata.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        if metadata.get("distill_method") != self.method:
+            raise ValueError(
+                f"Checkpoint method {metadata.get('distill_method')} does not "
+                f"match current method {self.method}"
+            )
+        expected_profile = generation_profile_contract(
+            self.config.distill.generation_shape
+        )
+        if metadata.get("generation_profile") != expected_profile:
+            raise ValueError(
+                "Checkpoint generation profile does not match current config"
+            )
+        training_state = torch.load(
+            checkpoint_root / "training_state.pt",
             map_location="cpu",
             weights_only=False,
         )
-        self._restore_full_model_state(
-            self._trainable_model(),
-            state["generator"],
+        dcp_state = self._checkpoint_state_dict()
+        dcp.load(
+            dcp_state,
+            checkpoint_id=checkpoint_root / "distributed_state",
         )
-        self.step = int(state["step"])
-        self.optimizer_step = int(state["optimizer_step"])
-        self.load_method_state_dict(state["method_state_dict"])
-        self._restore_extra_state(state)
+        self._restore_checkpoint_state(dcp_state)
+        self.step = int(training_state["step"])
+        self.optimizer_step = int(training_state["optimizer_step"])
+        self.lr_scheduler.load_state_dict(training_state["lr_scheduler"])
+        self.load_method_state_dict(training_state["method_state_dict"])
+        rank = int(getattr(self.config, "rank", 0))
+        self._restore_rng_state(training_state["rng_states_by_rank"][rank])
+        self._set_sampler_resume_offset()
+        self._last_checkpoint_step = self.optimizer_step
 
     def get_method_state_dict(self) -> dict[str, Any]:
         return {

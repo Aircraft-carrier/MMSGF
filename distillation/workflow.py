@@ -232,7 +232,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pipeline-root", required=True, type=str,
                         help="Root directory for the full pipeline run.")
     parser.add_argument("--student-init", required=True, type=str,
-                        help="Initial transformer checkpoint for autoregressive training")
+                        help=(
+                            "Bidirectional va_mot_v1 base-training checkpoint; "
+                            "used to initialize AR training and both SGF score models."
+                        ))
     parser.add_argument("--ngpu", default=4, type=int,
                         help="Number of GPUs per training job.")
     parser.add_argument("--master-port", default=29561, type=int,

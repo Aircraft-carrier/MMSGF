@@ -52,11 +52,16 @@ class WanDiffusionWrapper:
         config: Any | None = None,
         checkpoint_path: str | None = None,
         autoregressive: bool = True,
+        model: nn.Module | None = None,
     ) -> None:
-        self.model = self._load_model(
-            checkpoint_path,
-            config,
-            autoregressive=autoregressive,
+        self.model = (
+            model
+            if model is not None
+            else self._load_model(
+                checkpoint_path,
+                config,
+                autoregressive=autoregressive,
+            )
         )
 
         video_scheduler, action_scheduler = self._initialize_schedulers(config)

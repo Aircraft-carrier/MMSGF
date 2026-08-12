@@ -9,10 +9,8 @@ import torch.nn as nn
 from distillation.diffusion_utils import (
     consistency_prediction,
     flow_step,
-    flow_to_x0,
     sample_consistency_timesteps,
 )
-from distillation.model.factory import load_transformer_export
 from distillation.model.objectives import action_aware_loss, consistency_loss
 from distillation.model.utils import (
     add_noise_to_va,
@@ -20,6 +18,8 @@ from distillation.model.utils import (
     replace_va_streams,
     update_ema,
 )
+from distillation.model.wan_wrapper import WanDiffusionWrapper
+from distillation.pipeline import SelfGradientForcingTrainingPipeline
 from distillation.schema import (
     TrainingStepResult,
     VALossWeights,
@@ -27,7 +27,6 @@ from distillation.schema import (
     VAPair,
     VATimesteps,
 )
-from wan_va.utils.scheduler import FlowMatchScheduler
 
 
 class ConsistencyBaseModel:
@@ -46,27 +45,44 @@ class ConsistencyBaseModel:
         ema_student: nn.Module | None = None,
     ) -> None:
         self.device = device
-        self.resume_from = resume_from
         self.ema_decay = float(config.distill.ema_decay)
-        if student is None:
-            if student_init is None:
-                raise ValueError("student_init path is required")
-            student = load_transformer_export(student_init, config)
-        self.student = student
-        self.teacher = teacher or load_transformer_export(
-            teacher_checkpoint,
-            config,
+        if student is None and student_init is None:
+            raise ValueError("student_init path is required")
+        self.student_wrapper = WanDiffusionWrapper(
+            config=config,
+            checkpoint_path=student_init,
+            autoregressive=True,
+            model=student,
         )
         ema_init = config.distill.student_init or config.distill.resume_from
-        self.ema_student = ema_student or load_transformer_export(
-            ema_init,
-            config,
+        self.teacher_wrapper = WanDiffusionWrapper(
+            config=config,
+            checkpoint_path=teacher_checkpoint,
+            autoregressive=True,
+            model=teacher,
         )
-        self.train_scheduler_latent = self._build_train_scheduler(
-            float(config.snr_shift)
+        self.ema_wrapper = WanDiffusionWrapper(
+            config=config,
+            checkpoint_path=ema_init,
+            autoregressive=True,
+            model=ema_student,
         )
-        self.train_scheduler_action = self._build_train_scheduler(
-            float(config.action_snr_shift)
+        self.student = self.student_wrapper.model
+        self.teacher = self.teacher_wrapper.model
+        self.ema_student = self.ema_wrapper.model
+        self.train_scheduler_latent = self.student_wrapper.video_scheduler
+        self.train_scheduler_action = self.student_wrapper.action_scheduler
+
+        rollout_steps = config.distill.rollout_denoising_step_list
+        self.rollout_history_frames = int(
+            config.distill.generation_shape["history_frames"]
+        )
+        self.rollout_horizon_frames = int(config.distill.rollout_horizon_frames)
+        self.pipeline = SelfGradientForcingTrainingPipeline(
+            rollout_steps,
+            self.ema_wrapper,
+            num_frame_per_block=int(config.distill.rollout_num_frame_per_block),
+            per_rank_exit_step=bool(config.distill.rollout_per_rank_exit_step),
         )
 
         self.video_num_steps = int(config.distill.video_num_steps)
@@ -80,16 +96,6 @@ class ConsistencyBaseModel:
             action=float(config.action_loss_weight),
         )
 
-    @staticmethod
-    def _build_train_scheduler(shift: float) -> FlowMatchScheduler:
-        scheduler = FlowMatchScheduler(
-            shift=shift,
-            sigma_min=0.0,
-            extra_one_step=True,
-        )
-        scheduler.set_timesteps(1000, training=True)
-        return scheduler
-
     def attach_wrapped_models(
         self,
         *,
@@ -100,10 +106,13 @@ class ConsistencyBaseModel:
         """Install trainer-wrapped (FSDP/AC) models back into this model."""
         if student is not None:
             self.student = student
+            self.student_wrapper.model = student
         if teacher is not None:
             self.teacher = teacher
+            self.teacher_wrapper.model = teacher
         if ema_student is not None:
             self.ema_student = ema_student
+            self.ema_wrapper.model = ema_student
 
     def _empty_text_condition(
         self,
@@ -147,27 +156,21 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
 
     def _predict_consistency(
         self,
-        model: nn.Module,
+        wrapper: WanDiffusionWrapper,
         input_dict: dict,
         noisy: VAPair,
         timesteps: VATimesteps,
     ) -> VAPair:
-        out = model(input_dict, mode="train")
-        flow = VAPair(out["latent_pred"], out["action_pred"])
+        output = wrapper(input_dict, noisy, timesteps)
         return VAPair(
             video=consistency_prediction(
-                flow.video,
+                output.velocity.video,
                 noisy.video,
                 timesteps.video,
                 self.train_scheduler_latent,
                 sigma_data=self.sigma_data,
             ),
-            action=flow_to_x0(
-                flow.action,
-                noisy.action,
-                timesteps.action,
-                self.train_scheduler_action,
-            ),
+            action=output.x0.action,
         )
 
     def _teacher_cfg_flow(
@@ -175,25 +178,28 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
         input_dict: dict,
         batch: dict,
         empty_text_emb: torch.Tensor,
+        noisy: VAPair,
+        timesteps: VATimesteps,
     ) -> tuple[VAPair, float]:
-        conditioned = self.teacher(input_dict, mode="train")
+        conditioned = self.teacher_wrapper(input_dict, noisy, timesteps)
         text_emb = input_dict["latent_dict"]["text_emb"]
         empty_text_emb = self._empty_text_condition(
             batch,
             text_emb,
             empty_text_emb,
         )
-        unconditioned = self.teacher(
+        unconditioned = self.teacher_wrapper(
             replace_text_condition(input_dict, empty_text_emb),
-            mode="train",
+            noisy,
+            timesteps,
         )
         cfg_scale = self.cfg_min + torch.rand(()).item() * (
             self.cfg_max - self.cfg_min
         )
-        video = unconditioned["latent_pred"] + cfg_scale * (
-            conditioned["latent_pred"] - unconditioned["latent_pred"]
+        video = unconditioned.velocity.video + cfg_scale * (
+            conditioned.velocity.video - unconditioned.velocity.video
         )
-        return VAPair(video, conditioned["action_pred"]), cfg_scale
+        return VAPair(video, conditioned.velocity.action), cfg_scale
 
     def compute_loss(
         self,
@@ -238,6 +244,8 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
                 teacher_input,
                 batch,
                 empty_text_emb,
+                noisy,
+                timesteps,
             )
             next_noisy = VAPair(
                 flow_step(
@@ -262,18 +270,15 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
                 next_timesteps,
             )
             target_consistency = self._predict_consistency(
-                self.ema_student,
+                self.ema_wrapper,
                 ema_input,
                 next_noisy,
                 next_timesteps,
             )
 
         student_input = replace_va_streams(base_input, noisy, clean, timesteps)
-        student_out = self.student(student_input, mode="train")
-        student_flow = VAPair(
-            student_out["latent_pred"],
-            student_out["action_pred"],
-        )
+        student_out = self.student_wrapper(student_input, noisy, timesteps)
+        student_flow = student_out.velocity
         student_consistency = VAPair(
             video=consistency_prediction(
                 student_flow.video,
@@ -282,12 +287,7 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
                 self.train_scheduler_latent,
                 sigma_data=self.sigma_data,
             ),
-            action=flow_to_x0(
-                student_flow.action,
-                noisy.action,
-                timesteps.action,
-                self.train_scheduler_action,
-            ),
+            action=student_out.x0.action,
         )
 
         consistency, metrics = consistency_loss(
@@ -341,6 +341,23 @@ class ConsistencyModel(ConsistencyTrainingModel):
             empty_text_emb=empty_text_emb,
         )
         return TrainingStepResult(loss=loss, metrics=metrics)
+
+    @torch.no_grad()
+    def rollout(
+        self,
+        batch: dict,
+        *,
+        text_emb: torch.Tensor | None = None,
+    ):
+        rollout_batch = dict(batch)
+        if text_emb is not None:
+            rollout_batch["text_emb"] = text_emb
+        return self.pipeline.generate(
+            rollout_batch,
+            rollout_frames=self.rollout_horizon_frames,
+            history_frames=self.rollout_history_frames,
+            device=self.device,
+        )
 
     @torch.no_grad()
     def after_student_step(self, student: nn.Module) -> None:
