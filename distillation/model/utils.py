@@ -220,6 +220,89 @@ def sigmas_for_timesteps(
     )[indices].to(dtype=dtype)
 
 
+def add_noise(
+    clean: torch.Tensor,
+    noise: torch.Tensor,
+    timesteps: float | int | torch.Tensor,
+    scheduler: FlowMatchScheduler,
+    *,
+    t_dim: int = 2,
+) -> torch.Tensor:
+    # clean and noise must have identical shapes.
+    #
+    # Typical video:  [B,C,F,V,H,W]
+    # Typical action: [B,C,F,N,1]
+    # By default, t_dim=2 identifies the frame axis F.
+
+    # Stage 1/3: Normalize all timestep forms into an FP32 tensor
+    # on the same device as clean.
+    #
+    # Scalar, e.g. 500:
+    #   [] -> [1], so the entire batch and all frames share one timestep.
+    #
+    # One-dimensional tensor [F]:
+    #   one timestep per frame, broadcast along t_dim.
+    #
+    # Two-dimensional tensor [B,F]:
+    #   one timestep for each sample/frame pair.
+    timesteps = torch.as_tensor(
+        timesteps,
+        device=clean.device,
+        dtype=torch.float32,
+    )
+    if timesteps.ndim == 0:
+        timesteps = timesteps[None]
+
+    # Stage 2/3: Look up the closest discrete scheduler sigma.
+    #
+    # sigma preserves the timestep shape:
+    # scalar -> [1]
+    # [F]   -> [F]
+    # [B,F] -> [B,F]
+    #
+    # Casting to clean.dtype avoids promoting FP16/BF16 clean/noise
+    # tensors to FP32 during the interpolation below.
+    sigma = sigmas_for_timesteps(
+        scheduler,
+        timesteps,
+        dtype=clean.dtype,
+    )
+
+    # Build a broadcast shape with the same rank as clean.
+    # All channel/view/spatial/token dimensions initially share sigma.
+    shape = [1] * clean.ndim
+
+    if sigma.ndim == 2:
+        # sigma: [B,F]
+        # Example for clean [B,C,F,V,H,W]:
+        # [1,1,1,1,1,1] -> [B,1,F,1,1,1].
+        #
+        # Each sample/frame pair can therefore use a different noise level,
+        # while all channels, views, and spatial values in that frame share it.
+        shape[0] = sigma.shape[0]
+        shape[t_dim] = sigma.shape[1]
+    else:
+        # sigma: [T], where T is either 1 or F.
+        #
+        # With default t_dim=2:
+        # clean [B,C,F,V,H,W] -> sigma [1,1,F,1,1,1].
+        #
+        # sigma=[1] broadcasts over the entire sample.
+        shape[t_dim] = sigma.shape[0]
+
+    sigma = sigma.reshape(shape)
+
+    # Stage 3/3: Apply the Flow Matching linear interpolation.
+    #
+    # x_t = (1 - sigma) * x0 + sigma * epsilon
+    #
+    # Example: clean=2, noise=6, sigma=0.75:
+    # x_t = 0.25*2 + 0.75*6 = 5.
+    #
+    # sigma=0 returns clean; sigma=1 returns pure noise.
+    return (1 - sigma) * clean + sigma * noise
+
+
 def broadcast_frame_values(
     values: torch.Tensor,
     sample: torch.Tensor,

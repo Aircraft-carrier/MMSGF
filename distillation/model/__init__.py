@@ -38,6 +38,7 @@ def __getattr__(name: str):
         from distillation.model import dmd
         return getattr(dmd, name)
     if name in {
+        "add_noise",
         "apply_va_mask",
         "broadcast_frame_values",
         "freeze_model",
@@ -70,6 +71,7 @@ __all__ = [
     "SGFDMDModel",
     "SelfGradientForcingModel",
     "action_aware_loss",
+    "add_noise",
     "apply_va_mask",
     "broadcast_frame_values",
     "build_frozen_transformer",

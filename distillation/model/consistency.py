@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from distillation.model.dmd import update_ema
 from distillation.model.utils import (
+    add_noise,
     apply_va_mask,
     broadcast_frame_values,
     randn_like_va,
@@ -273,15 +274,17 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
         clean = VAPair(batch["latents"], batch["actions"])
         noise = randn_like_va(clean)
 
-        noisy_video = self.train_scheduler_latent.add_noise(
+        noisy_video = add_noise(
             clean.video,
             noise.video,
             timesteps.video,
+            self.train_scheduler_latent,
         )
-        noisy_action = self.train_scheduler_action.add_noise(
+        noisy_action = add_noise(
             clean.action,
             noise.action,
             timesteps.action,
+            self.train_scheduler_action,
         )
 
         noisy = apply_va_mask(
@@ -309,15 +312,17 @@ class ConsistencyTrainingModel(ConsistencyBaseModel):
                 if self.reuse_teacher_noise
                 else randn_like_va(clean)
             )
-            next_noisy_video = self.train_scheduler_latent.add_noise(
+            next_noisy_video = add_noise(
                 teacher_x0.video,
                 transition_noise.video,
                 next_timesteps.video,
+                self.train_scheduler_latent,
             )
-            next_noisy_action = self.train_scheduler_action.add_noise(
+            next_noisy_action = add_noise(
                 teacher_x0.action,
                 transition_noise.action,
                 next_timesteps.action,
+                self.train_scheduler_action,
             )
             next_noisy = apply_va_mask(
                 VAPair(video=next_noisy_video, action=next_noisy_action),

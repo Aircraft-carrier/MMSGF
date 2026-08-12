@@ -21,6 +21,7 @@ from distillation.model.dmd import (
     dmd_surrogate_loss,
     warp_denoisy_progress,
 )
+from distillation.model.utils import add_noise
 from distillation.model.wan_wrapper import (
     WanDiffusionWrapper as _RealWrapper,
 )
@@ -214,7 +215,7 @@ def test_linear_progress_warps_through_each_modality_scheduler() -> None:
     )
 
 
-def test_scheduler_add_noise_supports_batch_frame_timesteps() -> None:
+def test_add_noise_supports_batch_frame_timesteps() -> None:
     scheduler = FlowMatchScheduler(
         shift=1.0,
         sigma_min=0.0,
@@ -225,7 +226,7 @@ def test_scheduler_add_noise_supports_batch_frame_timesteps() -> None:
     noise = torch.ones_like(clean)
     timesteps = torch.tensor([[1000.0, 500.0], [500.0, 1000.0]])
 
-    noisy = scheduler.add_noise(clean, noise, timesteps)
+    noisy = add_noise(clean, noise, timesteps, scheduler)
 
     expected = torch.tensor(
         [[[[[1.0]], [[0.5]]]], [[[[0.5]], [[1.0]]]]]

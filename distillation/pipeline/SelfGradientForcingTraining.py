@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence
 import torch
 import torch.distributed as dist
 
+from distillation.model.utils import add_noise
 from distillation.schema import DenoisyInterval, VAPair
 
 from .base_pipeline import BasePipeline
@@ -217,10 +218,11 @@ class SelfGradientForcingTrainingPipeline(BasePipeline):
             if step_index + 1 == len(steps):
                 sample = x0
             else:
-                sample = self.scheduler.add_noise(
+                sample = add_noise(
                     x0,
                     torch.randn_like(x0),
                     steps[step_index + 1],
+                    self.scheduler,
                 )
         return sample
 
@@ -265,10 +267,11 @@ class SelfGradientForcingTrainingPipeline(BasePipeline):
             if step_index + 1 == len(steps):
                 sample = x0
             else:
-                sample = self.generator.action_scheduler.add_noise(
+                sample = add_noise(
                     x0,
                     torch.randn_like(x0),
                     steps[step_index + 1],
+                    self.generator.action_scheduler,
                 )
             if valid_mask is not None:
                 sample = sample * valid_mask[:, :, start : start + len(frame_ids)].to(

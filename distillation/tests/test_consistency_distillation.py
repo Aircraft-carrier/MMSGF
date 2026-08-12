@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+import distillation.model.consistency as consistency_module
 from distillation.model.autoregressive_mot import (
     AutoregressiveVAMOTTransformer3DModel,
 )
@@ -178,13 +179,12 @@ def test_consistency_teacher_renoise_can_reuse_or_resample_noise(
         )
         noises = []
 
-        def track_noise(original_samples, noise, timestep, t_dim=2):
-            del original_samples, timestep, t_dim
+        def track_noise(clean, noise, timesteps, scheduler, *, t_dim=2):
+            del clean, timesteps, scheduler, t_dim
             noises.append(noise)
             return noise
 
-        model.train_scheduler_latent.add_noise = track_noise
-        model.train_scheduler_action.add_noise = track_noise
+        monkeypatch.setattr(consistency_module, "add_noise", track_noise)
         batch, base_input = _batch_and_input()
         model.compute_step(
             batch,

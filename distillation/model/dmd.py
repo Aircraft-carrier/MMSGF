@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from distillation.model.utils import (
+    add_noise,
     apply_va_mask,
     randn_like_va,
     replace_text_condition,
@@ -590,15 +591,17 @@ class SGFDMDModel(SelfGradientForcingModel):
         """
         noise = randn_like_va(clean)
 
-        noisy_video = self.generator.video_scheduler.add_noise(
+        noisy_video = add_noise(
             clean.video,
             noise.video,
             timesteps.video,
+            self.generator.video_scheduler,
         )
-        noisy_action = self.generator.action_scheduler.add_noise(
+        noisy_action = add_noise(
             clean.action,
             noise.action,
             timesteps.action,
+            self.generator.action_scheduler,
         )
 
         noisy = apply_va_mask(
