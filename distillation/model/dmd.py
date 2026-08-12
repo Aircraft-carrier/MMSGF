@@ -405,17 +405,22 @@ class SelfGradientForcingModel(BaseModel):
         return replay_context
 
     @torch.no_grad()
-    def _run_generator(self, batch: dict) -> ReplayContext:
-        """Run the complete final-clean SGF rollout and record independent exits."""
+    def rollout(self, batch: dict):
+        """Run the existing SGF pipeline and return its generated V/A streams."""
         from wan_va.mot_spec import mot_spec_from_config
 
         spec = mot_spec_from_config(self.config)
-        rollout = self.pipeline.generate(
+        return self.pipeline.generate(
             batch,
             rollout_frames=self.rollout_horizon_frames,
             history_frames=int(spec.history_latent_frames),
             device=self.device,
         )
+
+    @torch.no_grad()
+    def _run_generator(self, batch: dict) -> ReplayContext:
+        """Run the complete final-clean SGF rollout and record independent exits."""
+        rollout = self.rollout(batch)
         return self.record(batch, rollout)
 
     @staticmethod

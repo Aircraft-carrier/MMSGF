@@ -4,6 +4,7 @@ from __future__ import annotations
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
+import torch
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 
 from distillation.configs import SELF_GRADIENT_FORCING_DMD
@@ -149,6 +150,11 @@ class SelfGradientForcingDMDTrainer(DistillationTrainerBase):
     def _after_optimizer_step(self, target: OptimizationTarget) -> None:
         if target.name == "generator":
             self.lr_scheduler.step()
+
+    @torch.no_grad()
+    def rollout(self, batch: dict):
+        """Run SGF visualization with the original, non-dropped text condition."""
+        return self.model.rollout(batch)
 
     def _extra_save_state(self, state: dict[str, Any]) -> None:
         fake_score, fake_score_optimizer = get_state_dict(

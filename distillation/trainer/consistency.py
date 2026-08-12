@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.distributed.checkpoint.state_dict import (
@@ -20,11 +20,15 @@ from wan_va.train_mot import (
 )
 from wan_va.distributed.util import _configure_model
 
+if TYPE_CHECKING:
+    from distillation.model.consistency import ConsistencyModel
+
 
 class ConsistencyTrainer(DistillationTrainerBase):
     """Load the consistency model from paths, wrap it, and run EMA updates."""
 
     method = CONSISTENCY_DISTILLATION
+    model: "ConsistencyModel"
 
     def __init__(self, config: Any):
         super().__init__(config)
@@ -33,7 +37,7 @@ class ConsistencyTrainer(DistillationTrainerBase):
         if self._resume_from is not None:
             self.load_checkpoint(self._resume_from)
 
-    def _build_method_model(self, config: Any):
+    def _build_method_model(self, config: Any) -> "ConsistencyModel":
         from distillation.model.consistency import ConsistencyModel
 
         student_init = getattr(config.distill, "student_init", None)
@@ -95,6 +99,9 @@ class ConsistencyTrainer(DistillationTrainerBase):
     def _export_model(self) -> Any:
         return self.model.target.model
 
+    def _rollout_model(self) -> Any:
+        return self.model.target.model
+
     def _optimization_target(self) -> OptimizationTarget:
         return OptimizationTarget(
             name="generator",
@@ -122,10 +129,7 @@ class ConsistencyTrainer(DistillationTrainerBase):
     @torch.no_grad()
     def rollout(self, batch: dict):
         """Run consistency-stage EMA inference through the shared AR pipeline."""
-        batch = self.convert_input_format(batch)
-        batch = self._materialize_batch_latents(batch)
-        base_input = self._prepare_joint_input_dict(batch, add_noise=False)
         return self.model.rollout(
             batch,
-            text_emb=base_input["latent_dict"]["text_emb"],
+            text_emb=batch["text_emb"],
         )

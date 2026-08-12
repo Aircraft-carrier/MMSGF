@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 from safetensors.torch import save_file
 
 from distillation.mask_profile import generation_profile_contract
+from distillation.rollout_visualization import RolloutVisualizer
 from distillation.schema import TrainingStepResult
 from wan_va.dataset.mot_dataset import validate_mot_batch_for_forward
 from wan_va.modules.utils import WanVAEStreamingWrapper, load_vae
@@ -87,6 +88,13 @@ class DistillationTrainerBase:
 
         self.model = self._build_method_model(config)
         self._wrap_method_models()
+        self.rollout_visualizer = RolloutVisualizer(
+            config=config,
+            device=self.device,
+            rollout=self.rollout,
+            rollout_model=self._rollout_model,
+            get_vae=self._get_train_vae,
+        )
 
     # Data loading ---------------------------------------------------------
 
@@ -136,6 +144,12 @@ class DistillationTrainerBase:
 
     def _after_optimizer_step(self, target: OptimizationTarget) -> None:
         return None
+
+    def rollout(self, batch: dict):
+        raise NotImplementedError
+
+    def _rollout_model(self) -> torch.nn.Module:
+        return self.model.generator.model
 
     # Optimizer ------------------------------------------------------------
 
@@ -354,6 +368,7 @@ class DistillationTrainerBase:
         out = {
             "loss": loss,
             **metrics,
+            "batch": batch,
             "optimizer_step_event": False,
             "skipped_step": False,
             "should_log": True,
@@ -381,12 +396,18 @@ class DistillationTrainerBase:
         total = int(self.config.num_steps)
         microstep = int(self.step)
         while self.optimizer_step < total:
+            batch = self._get_next_batch()
             result = self._train_step(
-                self._get_next_batch(),
+                batch,
                 microstep % self.gradient_accumulation_steps,
             )
             microstep += 1
             self.step = microstep
+            if result["optimizer_step_event"]:
+                self.rollout_visualizer.maybe_run(
+                    self.optimizer_step,
+                    result["batch"],
+                )
             if (
                 result["optimizer_step_event"]
                 and self.optimizer_step > 0

@@ -676,6 +676,14 @@ class MotTrainData(Dataset):
         out = {
             "vae_rgb_history": vae_rgb_history,
             "vae_rgb_target": vae_rgb_target,
+            "text": text,
+            "frame_ids": torch.tensor(padded_frame_ids, dtype=torch.long),
+            "requested_frame_ids": torch.tensor(frame_ids, dtype=torch.long),
+            "fps": torch.tensor(float(row["fps"]), dtype=torch.float32),
+            "view_names": [
+                str(view.get("video_key", f"stream_{_stream_id_for_view(view)}"))
+                for view in row["views"]
+            ],
             "stream_ids": torch.tensor([_stream_id_for_view(view) for view in row["views"]], dtype=torch.long),
             "video_latent_loss_mask": video_latent_loss_mask,
             "video_latent_valid_mask": video_latent_valid_mask,

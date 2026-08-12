@@ -8,6 +8,7 @@ from wan_va.configs import VA_CONFIGS
 self_gradient_forcing_dmd_cfg = EasyDict(copy.deepcopy(VA_CONFIGS["wan22_train"]))
 self_gradient_forcing_dmd_cfg.distill = EasyDict(
     method="self_gradient_forcing_dmd",
+    rollout_visualization_interval=500,
     model_architecture="autoregressive_va_mot_v1",
     generation_shape={
         "profile_name": "segmented_history_va_v1",

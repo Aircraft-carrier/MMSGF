@@ -20,6 +20,7 @@ dependencies = [
     "tokenizers>=0.21.4",
     "tqdm",
     "imageio",
+    "plotly",
     "easydict",
     "flash_attn",
     "numpy>=1.26.4,<2"
@@ -56,4 +57,3 @@ profile = "black"
 
 [tool.mypy]
 strict = true
-
