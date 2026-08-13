@@ -287,6 +287,7 @@ class WanDiffusionWrapper:
         *,
         cache,
         text_emb: torch.Tensor,
+        token_valid_mask: torch.Tensor | None = None,
     ) -> None:
         """Commit clean video K/V into the incremental cache."""
         request = AutoregressiveModelRequest(
@@ -297,6 +298,7 @@ class WanDiffusionWrapper:
                 "stream_ids": stream_ids,
                 "cache": cache,
                 "text_emb": text_emb,
+                "token_valid_mask": token_valid_mask,
             },
         )
         self.model(request, mode="self_rollout")
@@ -308,6 +310,7 @@ class WanDiffusionWrapper:
         *,
         cache,
         text_emb: torch.Tensor,
+        token_valid_mask: torch.Tensor | None = None,
     ) -> None:
         """Commit clean action K/V into the incremental cache."""
         request = AutoregressiveModelRequest(
@@ -317,6 +320,7 @@ class WanDiffusionWrapper:
                 "frame_ids": frame_ids,
                 "cache": cache,
                 "text_emb": text_emb,
+                "token_valid_mask": token_valid_mask,
             },
         )
         self.model(request, mode="self_rollout")

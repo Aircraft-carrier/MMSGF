@@ -11,6 +11,7 @@ from collections.abc import Mapping, Iterator
 
 _CONFIG_MODULES = {
     "wan22_train": ("va_wan22_train_cfg", "va_wan22_train_cfg"),
+    "robotwin_mot_train": ("robotwin_mot_train_cfg", "robotwin_mot_train_cfg"),
 }
 
 _EXPORTED_CONFIGS = {attr: module for module, attr in _CONFIG_MODULES.values()}

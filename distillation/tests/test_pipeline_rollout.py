@@ -21,23 +21,36 @@ class _FakeGenerator:
         self.predict_video_calls = 0
         self.predict_action_calls = 0
         self.commits = []
+        self.token_valid_masks = []
 
-    def generate_video(self, noisy, timestep, frame_ids, stream_ids, *, cache, text_emb):
+    def generate_video(
+        self, noisy, timestep, frame_ids, stream_ids, *, cache, text_emb,
+    ):
         del timestep, stream_ids, cache, text_emb
         self.predict_video_calls += 1
         return noisy * 0.5
 
-    def generate_action(self, noisy, timestep, frame_ids, *, cache, text_emb):
+    def generate_action(
+        self, noisy, timestep, frame_ids, *, cache, text_emb,
+    ):
         del timestep, cache, text_emb
         self.predict_action_calls += 1
         return noisy * 0.5
 
-    def commit_video(self, latents, frame_ids, stream_ids, *, cache, text_emb):
+    def commit_video(
+        self, latents, frame_ids, stream_ids, *, cache, text_emb,
+        token_valid_mask=None,
+    ):
         del stream_ids, cache, text_emb
+        self.token_valid_masks.append(("commit_video", token_valid_mask))
         self.commits.append(("video", tuple(frame_ids), tuple(latents.shape)))
 
-    def commit_action(self, actions, frame_ids, *, cache, text_emb):
+    def commit_action(
+        self, actions, frame_ids, *, cache, text_emb,
+        token_valid_mask=None,
+    ):
         del cache, text_emb
+        self.token_valid_masks.append(("commit_action", token_valid_mask))
         self.commits.append(("action", tuple(frame_ids), tuple(actions.shape)))
 
 
@@ -126,3 +139,35 @@ def test_pipeline_rollout_commits_blocks_and_records_exit() -> None:
     assert result.video_denoised_timestep_to == expected_video_to
     assert result.action_denoised_timestep_from == expected_action_from
     assert result.action_denoised_timestep_to == expected_action_to
+
+
+def test_history_cache_forwards_video_and_action_validity() -> None:
+    generator = _FakeGenerator()
+    pipeline = SelfGradientForcingTrainingPipeline(
+        denoising_step_list={"video": [1000], "action": [1000]},
+        generator=generator,
+    )
+    batch = {
+        "latents": torch.zeros(1, 1, 3, 1, 1, 1),
+        "actions": torch.zeros(1, 1, 3, 2, 1),
+        "video_latent_valid_mask": torch.tensor([[False, True, True]]),
+        "action_valid_mask": torch.tensor(
+            [[[[[False], [True]], [[True], [False]], [[True], [True]]]]]
+        ),
+        "stream_ids": torch.zeros(1, 1, dtype=torch.long),
+        "text_emb": torch.zeros(1, 1, 1),
+    }
+
+    pipeline.build_history_cache(
+        batch,
+        history_frames=2,
+        device=torch.device("cpu"),
+    )
+
+    forwarded = generator.token_valid_masks
+    torch.testing.assert_close(forwarded[0][1], torch.tensor([[False, True]]))
+    torch.testing.assert_close(
+        forwarded[1][1], batch["action_valid_mask"][:, :, :2]
+    )
+    assert forwarded[2][1] is None
+    assert forwarded[3][1] is None

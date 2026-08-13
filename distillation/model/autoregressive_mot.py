@@ -279,6 +279,7 @@ class AutoregressiveVAMOTTransformer3DModel(
         frame_ids: torch.Tensor,
         timesteps: torch.Tensor,
         stream_ids: torch.Tensor,
+        token_valid_mask: torch.Tensor | None = None,
     ) -> tuple[AutoregressiveStreamInput, tuple[int, ...]]:
         hidden, shape = self._embed_video(latents, stream_ids)
         batch_size, frames, views, _height, _width, h_tokens, w_tokens = shape
@@ -289,20 +290,31 @@ class AutoregressiveVAMOTTransformer3DModel(
             hidden.dtype,
             action=False,
         )
-        return (
-            AutoregressiveStreamInput(
-                hidden=hidden,
-                conditioning=conditioning,
-                rotary=self._video_rotary(
-                    frame_ids,
-                    views=views,
-                    h_tokens=h_tokens,
-                    w_tokens=w_tokens,
-                ),
-                block_kind="video",
+        stream = AutoregressiveStreamInput(
+            hidden=hidden,
+            conditioning=conditioning,
+            rotary=self._video_rotary(
+                frame_ids,
+                views=views,
+                h_tokens=h_tokens,
+                w_tokens=w_tokens,
             ),
-            shape,
+            block_kind="video",
         )
+        if token_valid_mask is not None:
+            valid = token_valid_mask.to(device=hidden.device, dtype=torch.bool)
+            if tuple(valid.shape) != (batch_size, frames):
+                raise ValueError(
+                    f"video token_valid_mask must be [{batch_size},{frames}], "
+                    f"got {tuple(valid.shape)}"
+                )
+            valid = (
+                valid[:, :, None]
+                .expand(-1, -1, tokens_per_frame)
+                .reshape(batch_size, -1)
+            )
+            stream = self._compact_stream(stream, valid)
+        return stream, shape
 
     def _action_input(
         self,
@@ -310,6 +322,7 @@ class AutoregressiveVAMOTTransformer3DModel(
         *,
         frame_ids: torch.Tensor,
         timesteps: torch.Tensor,
+        token_valid_mask: torch.Tensor | None = None,
     ) -> AutoregressiveStreamInput:
         hidden = self._embed_action(actions)
         _batch_size, _channels, _frames, action_per_frame, width = actions.shape
@@ -320,7 +333,7 @@ class AutoregressiveVAMOTTransformer3DModel(
             hidden.dtype,
             action=True,
         )
-        return AutoregressiveStreamInput(
+        stream = AutoregressiveStreamInput(
             hidden=hidden,
             conditioning=conditioning,
             rotary=self._action_rotary(
@@ -328,6 +341,41 @@ class AutoregressiveVAMOTTransformer3DModel(
                 tokens_per_frame=tokens_per_frame,
             ),
             block_kind="action",
+        )
+        if token_valid_mask is not None:
+            valid = token_valid_mask.to(device=hidden.device, dtype=torch.bool)
+            if tuple(valid.shape) != tuple(actions.shape):
+                raise ValueError(
+                    "action token_valid_mask must match actions, "
+                    f"got {tuple(valid.shape)} and {tuple(actions.shape)}"
+                )
+            valid = valid.any(dim=1).reshape(actions.shape[0], -1)
+            stream = self._compact_stream(stream, valid)
+        return stream
+
+    @staticmethod
+    def _compact_stream(
+        stream: AutoregressiveStreamInput,
+        token_valid: torch.Tensor,
+    ) -> AutoregressiveStreamInput:
+        """Physically remove invalid attention tokens for the B=1 rollout."""
+        if bool(token_valid.all().item()):
+            return stream
+        if stream.hidden.shape[0] != 1:
+            raise ValueError(
+                "rollout token compaction currently requires batch_size=1"
+            )
+        keep = token_valid[0].nonzero(as_tuple=False).squeeze(1)
+        rotary = (
+            None
+            if stream.rotary is None
+            else stream.rotary.index_select(1, keep)
+        )
+        return AutoregressiveStreamInput(
+            hidden=stream.hidden.index_select(1, keep),
+            conditioning=stream.conditioning.index_select(1, keep),
+            rotary=rotary,
+            block_kind=stream.block_kind,
         )
 
     def _run_stream(
@@ -444,6 +492,7 @@ class AutoregressiveVAMOTTransformer3DModel(
         stream_ids: torch.Tensor,
         text_emb: torch.Tensor,
         cache,
+        token_valid_mask: torch.Tensor | None = None,
     ) -> None:
         frame_ids, zeros = self._stream_axes(
             latents,
@@ -456,7 +505,10 @@ class AutoregressiveVAMOTTransformer3DModel(
             frame_ids=frame_ids,
             timesteps=zeros,
             stream_ids=stream_ids,
+            token_valid_mask=token_valid_mask,
         )
+        if clean.hidden.shape[1] == 0:
+            return
         self._run_transaction(
             clean,
             text_emb=text_emb,
@@ -472,6 +524,7 @@ class AutoregressiveVAMOTTransformer3DModel(
         frame_ids: Iterable[int] | torch.Tensor,
         text_emb: torch.Tensor,
         cache,
+        token_valid_mask: torch.Tensor | None = None,
     ) -> None:
         frame_ids, zeros = self._stream_axes(
             actions,
@@ -483,7 +536,10 @@ class AutoregressiveVAMOTTransformer3DModel(
             actions,
             frame_ids=frame_ids,
             timesteps=zeros,
+            token_valid_mask=token_valid_mask,
         )
+        if clean.hidden.shape[1] == 0:
+            return
         self._run_transaction(
             clean,
             text_emb=text_emb,

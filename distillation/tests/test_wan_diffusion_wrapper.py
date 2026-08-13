@@ -7,6 +7,8 @@ from torch import nn
 
 from distillation.model.autoregressive_mot import (
     AutoregressiveModelOutput,
+    AutoregressiveStreamInput,
+    AutoregressiveVAMOTTransformer3DModel,
 )
 from distillation.pipeline import KVCache
 from distillation.model.common.wan_wrapper import (
@@ -36,8 +38,13 @@ class _JointModel(nn.Module):
 
 
 class _ARModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests = []
+
     def forward(self, request, *, mode):
         assert mode == "self_rollout"
+        self.requests.append(request)
         if request.operation in {"predict_video", "predict_action"}:
             return AutoregressiveModelOutput(prediction=request.payload["sample"])
         return AutoregressiveModelOutput()
@@ -89,6 +96,28 @@ def test_wrapper_ar_generation_returns_clean_x0(monkeypatch) -> None:
     torch.testing.assert_close(x0_action, torch.zeros_like(x0_action), atol=1e-5, rtol=1e-5)
     wrapper.commit_video(noisy, frame_ids=[0], stream_ids=stream_ids, cache=cache, text_emb=text_emb)
     wrapper.commit_action(actions, frame_ids=[0], cache=cache, text_emb=text_emb)
+
+
+def test_b1_history_compaction_keeps_hidden_conditioning_and_rope_aligned() -> None:
+    hidden = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
+    conditioning = torch.arange(48, dtype=torch.float32).reshape(1, 4, 4, 3)
+    rotary = torch.arange(8, dtype=torch.float32).reshape(1, 4, 1, 2)
+    stream = AutoregressiveStreamInput(
+        hidden=hidden,
+        conditioning=conditioning,
+        rotary=rotary,
+        block_kind="action",
+    )
+
+    compact = AutoregressiveVAMOTTransformer3DModel._compact_stream(
+        stream,
+        torch.tensor([[False, True, False, True]]),
+    )
+
+    assert compact.hidden.shape == (1, 2, 3)
+    torch.testing.assert_close(compact.hidden, hidden[:, [1, 3]])
+    torch.testing.assert_close(compact.conditioning, conditioning[:, [1, 3]])
+    torch.testing.assert_close(compact.rotary, rotary[:, [1, 3]])
 
 
 def test_forward_returns_flow_x0_and_preserves_student_gradient(monkeypatch) -> None:

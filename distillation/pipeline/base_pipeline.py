@@ -49,18 +49,32 @@ class BasePipeline:
         text_emb = batch["text_emb"].to(device=device)
         latents = batch["latents"].to(device=device)
         actions = batch["actions"].to(device=device)
+        video_valid = batch.get("video_latent_valid_mask")
+        if video_valid is not None:
+            video_valid = video_valid.to(device=device, dtype=torch.bool)
+        action_valid = batch.get("action_valid_mask")
+        if action_valid is not None:
+            action_valid = action_valid.to(device=device, dtype=torch.bool)
         self.generator.commit_video(
             latents[:, :, :history_frames],
             frame_ids=history_ids,
             stream_ids=stream_ids,
             cache=self.cache,
             text_emb=text_emb,
+            token_valid_mask=(
+                None if video_valid is None else video_valid[:, :history_frames]
+            ),
         )
         self.generator.commit_action(
             actions[:, :, :history_frames],
             frame_ids=history_ids,
             cache=self.cache,
             text_emb=text_emb,
+            token_valid_mask=(
+                None
+                if action_valid is None
+                else action_valid[:, :, :history_frames]
+            ),
         )
         self.generator.commit_video(
             latents[:, :, history_frames : history_frames + 1],
