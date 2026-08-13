@@ -30,8 +30,32 @@ ACTION_CHUNK_SIZE = 48
 VIDEO_DOWNSAMPLE_RATIO = 4
 
 
+def _task_roots(source_root: Path) -> list[Path]:
+    direct = [
+        path
+        for path in sorted(source_root.iterdir())
+        if (path / "meta" / "info.json").is_file()
+    ]
+    if direct:
+        return direct
+
+    containers = [
+        path
+        for path in sorted(source_root.iterdir())
+        if path.is_dir()
+        and any((child / "meta" / "info.json").is_file() for child in path.iterdir())
+    ]
+    if len(containers) == 1:
+        return [
+            path
+            for path in sorted(containers[0].iterdir())
+            if (path / "meta" / "info.json").is_file()
+        ]
+    return []
+
+
 def _episode_rows(source_root: Path, *, task_name: str | None = None):
-    for task_root in sorted(source_root.iterdir()):
+    for task_root in _task_roots(source_root):
         if task_name is not None and task_root.name != task_name:
             continue
         info_path = task_root / "meta" / "info.json"
@@ -141,8 +165,7 @@ def main():
     p.add_argument("--model-root", type=Path, help="Lingbot model root; required unless --no-text-emb is used.")
     p.add_argument(
         "--task",
-        required=True,
-        help="Exact source-root child directory to include. Required to keep a test build to one RoboTwin task.",
+        help="Optional exact task directory name; omit to prepare every RoboTwin task.",
     )
     p.add_argument("--device", default="cpu")
     p.add_argument("--no-action-cache", action="store_true")
