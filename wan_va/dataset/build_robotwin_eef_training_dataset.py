@@ -54,9 +54,9 @@ def _task_roots(source_root: Path) -> list[Path]:
     return []
 
 
-def _episode_rows(source_root: Path, *, task_name: str | None = None):
+def _episode_rows(source_root: Path, *, task_names: set[str] | None = None):
     for task_root in _task_roots(source_root):
-        if task_name is not None and task_root.name != task_name:
+        if task_names is not None and task_root.name not in task_names:
             continue
         info_path = task_root / "meta" / "info.json"
         episodes_path = task_root / "meta" / "episodes.jsonl"
@@ -107,15 +107,20 @@ def build(
     *,
     device: str,
     action_cache: bool,
-    task_name: str | None = None,
+    task_names: set[str] | None = None,
     text_embeddings: bool = True,
 ):
     source_root, output_root = source_root.resolve(), output_root.resolve()
     grouped = {}
-    for item in _episode_rows(source_root, task_name=task_name):
+    for item in _episode_rows(source_root, task_names=task_names):
         grouped.setdefault(item[0], []).append(item)
+    missing_tasks = set() if task_names is None else task_names - grouped.keys()
+    if missing_tasks:
+        raise ValueError(
+            f"no complete EEF episodes for tasks {sorted(missing_tasks)!r} under {source_root}"
+        )
     if not grouped:
-        suffix = f" for task {task_name!r}" if task_name is not None else ""
+        suffix = f" for tasks {sorted(task_names)!r}" if task_names is not None else ""
         raise ValueError(f"no complete EEF episodes under {source_root}{suffix}")
     rows, norms, texts = [], {}, []
     for task, episodes in grouped.items():
@@ -162,10 +167,12 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--source-root", type=Path, required=True)
     p.add_argument("--output-root", type=Path, required=True)
-    p.add_argument("--model-root", type=Path, help="Lingbot model root; required unless --no-text-emb is used.")
+    p.add_argument("--model-root", type=Path, help="Model root containing tokenizer/ and text_encoder/; required unless --no-text-emb is used.")
     p.add_argument(
         "--task",
-        help="Optional exact task directory name; omit to prepare every RoboTwin task.",
+        action="append",
+        dest="tasks",
+        help="Exact task directory name. Repeat to select multiple tasks; omit to prepare every task.",
     )
     p.add_argument("--device", default="cpu")
     p.add_argument("--no-action-cache", action="store_true")
@@ -177,9 +184,9 @@ def main():
         a.model_root,
         device=a.device,
         action_cache=not a.no_action_cache,
-        task_name=a.task,
+        task_names=set(a.tasks) if a.tasks else None,
         text_embeddings=not a.no_text_emb,
-    ), "task": a.task}, indent=2))
+    ), "tasks": a.tasks}, indent=2))
 
 
 if __name__ == "__main__":
