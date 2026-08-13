@@ -12,6 +12,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image, ImageDraw, ImageFont
+from plotly import graph_objects as go
+from plotly.subplots import make_subplots
 
 from wan_va.dataset.mot_dataset import (
     quaternion_xyzw_to_matrix,
@@ -152,6 +154,7 @@ def absolute_action_trajectories(
         reference_values,
         denormalize(pred),
     )
+    
     packed_indices = torch.arange(valid_tokens.numel()).reshape(valid_tokens.shape)
     valid_times = np.arange(int(valid_tokens.sum().item()), dtype=np.float32)
     generated_mask = torch.zeros_like(valid_tokens)
@@ -165,7 +168,6 @@ def absolute_action_trajectories(
         )
     return gt_absolute, pred_absolute, valid_times, prediction_start
 
-
 def write_action_plot(
     path: str | Path,
     gt_absolute: np.ndarray,
@@ -176,144 +178,105 @@ def write_action_plot(
     prediction_start: int,
     step: int,
 ) -> None:
-    """Save an interactive Plotly trajectory as a self-contained HTML file."""
-    import plotly.graph_objects as go
-
-    seconds = token_times / float(fps)
-    figure = go.Figure()
+    """Write GT and prediction as separate side-by-side 3D plots in one HTML."""
+    seconds = np.asarray(token_times) / float(fps)
+    pred_start = max(int(prediction_start) - 1, 0)
     all_positions = np.concatenate(
         (
             gt_absolute[:, 0:3],
             gt_absolute[:, 8:11],
-            pred_absolute[:, 0:3],
-            pred_absolute[:, 8:11],
+            pred_absolute[pred_start:, 0:3],
+            pred_absolute[pred_start:, 8:11],
         ),
         axis=0,
     )
-    orientation_scale = max(float(np.ptp(all_positions, axis=0).max()) * 0.03, 1e-3)
+    axis_length = max(float(np.ptp(all_positions, axis=0).max()) * 0.075, 1e-3)
+    figure = make_subplots(
+        rows=1,
+        cols=2,
+        specs=[[{"type": "scene"}, {"type": "scene"}]],
+        subplot_titles=("Ground Truth", "Prediction"),
+        horizontal_spacing=0.04,
+    )
+
     axis_specs = (
-        ("X", "#f43f5e"),
-        ("Y", "#10b981"),
-        ("Z", "#2563eb"),
+        ("EEF X", 0, "#e76ba7"),
+        ("EEF Y", 1, "#f37b39"),
+        ("EEF Z", 2, "#4ec576"),
     )
-    trajectory_specs = (
-        (
-            "GT",
-            gt_absolute,
-            [
-                [0.0, "#cffafe"],
-                [0.25, "#22d3ee"],
-                [0.5, "#3b82f6"],
-                [0.75, "#4338ca"],
-                [1.0, "#172554"],
-            ],
-            0,
-        ),
-        (
-            "Prediction",
-            pred_absolute,
-            [
-                [0.0, "#fef3c7"],
-                [0.25, "#fbbf24"],
-                [0.5, "#f97316"],
-                [0.75, "#e11d48"],
-                [1.0, "#881337"],
-            ],
-            max(int(prediction_start) - 1, 0),
-        ),
+    arm_specs = (
+        ("Left", 0, "#52c3ef", "#315fe5"),
+        ("Right", 8, "#f49b45", "#e5508d"),
     )
-    orientation_stride = 4
-    for series_index, (
-        name,
-        actions,
-        colorscale,
-        series_start,
-    ) in enumerate(trajectory_specs):
-        series_times = seconds[series_start:]
-        for arm, offset, line_width in (
-            ("Left", 0, 9),
-            ("Right", 8, 7),
-        ):
-            position = actions[series_start:, offset : offset + 3]
-            colorbar = {
-                "title": {"text": f"{name} time (s)", "side": "top"},
-                "orientation": "h",
-                "x": 0.22 if series_index == 0 else 0.62,
-                "xanchor": "center",
-                "y": -0.14,
-                "yanchor": "top",
-                "len": 0.3,
-                "thickness": 13,
-                "outlinewidth": 0,
-                "bgcolor": "rgba(0,0,0,0)",
-                "tickfont": {"size": 11},
-            }
+
+    def add_plot(actions: np.ndarray, start: int, column: int, label: str) -> None:
+        plot_times = seconds[start:]
+        frame_step = max(1, int(np.ceil((len(actions) - start) / 10)))
+        frame_ids = np.arange(0, len(actions) - start, frame_step)
+        if frame_ids[-1] != len(actions) - start - 1:
+            frame_ids = np.append(frame_ids, len(actions) - start - 1)
+
+        for arm_name, offset, start_color, end_color in arm_specs:
+            positions = actions[start:, offset : offset + 3]
+            rotations = quaternion_xyzw_to_matrix(
+                actions[start:, offset + 3 : offset + 7]
+            )
+            colorscale = [[0.0, start_color], [1.0, end_color]]
             figure.add_trace(
                 go.Scatter3d(
-                    x=position[:, 0],
-                    y=position[:, 1],
-                    z=position[:, 2],
+                    x=positions[:, 0],
+                    y=positions[:, 1],
+                    z=positions[:, 2],
                     mode="lines",
-                    name=f"{name} {arm} trajectory",
-                    legendgroup=f"{name} {arm}",
+                    name=f"{label} {arm_name} trajectory",
+                    legendgroup=f"{label} {arm_name}",
                     line={
-                        "width": line_width,
-                        "color": series_times,
+                        "color": plot_times,
                         "colorscale": colorscale,
-                        "cmin": float(series_times.min()),
-                        "cmax": float(series_times.max()),
-                        "dash": "solid",
-                        "showscale": arm == "Left",
-                        "colorbar": colorbar,
+                        "width": 8,
                     },
-                    customdata=series_times[:, None],
-                    hovertemplate=(
-                        f"{name} {arm}<br>"
-                        "t=%{customdata[0]:.2f} s<br>"
-                        "x=%{x:.3f} y=%{y:.3f} z=%{z:.3f}"
-                        "<extra></extra>"
+                    customdata=np.column_stack(
+                        (plot_times, actions[start:, offset + 7])
                     ),
-                    showlegend=True,
-                )
+                    hovertemplate=(
+                        f"{label} {arm_name}<br>"
+                        f"{label} time (s)=%{{customdata[0]:.2f}}<br>"
+                        "gripper=%{customdata[1]:.3f}<br>"
+                        "x=%{x:.3f} y=%{y:.3f} z=%{z:.3f}<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=column,
             )
-            if series_index == 1 and len(position):
-                boundary = actions[prediction_start, offset : offset + 3]
-                figure.add_trace(
-                    go.Scatter3d(
-                        x=[boundary[0]],
-                        y=[boundary[1]],
-                        z=[boundary[2]],
-                        mode="markers+text",
-                        marker={
-                            "size": 9,
-                            "color": "#111827",
-                            "symbol": "diamond",
-                            "line": {"color": "#ffffff", "width": 1.5},
-                        },
-                        text=["Prediction starts" if arm == "Left" else ""],
-                        textposition="top center",
-                        textfont={"color": "#111827", "size": 12},
-                        name=f"{arm} prediction starts",
-                        showlegend=False,
-                    )
-                )
+            figure.add_trace(
+                go.Scatter3d(
+                    x=[positions[0, 0], positions[-1, 0]],
+                    y=[positions[0, 1], positions[-1, 1]],
+                    z=[positions[0, 2], positions[-1, 2]],
+                    mode="markers+text",
+                    text=[f"{arm_name} start", f"{arm_name} goal"],
+                    textposition=["top left", "top right"],
+                    marker={
+                        "size": 7,
+                        "color": [start_color, end_color],
+                        "line": {"color": "white", "width": 2},
+                    },
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=1,
+                col=column,
+            )
 
-            rotations = quaternion_xyzw_to_matrix(
-                actions[series_start:, offset + 3 : offset + 7]
-            )
-            orientation_ids = np.arange(0, len(position), orientation_stride)
-            orientation_positions = position[orientation_ids]
-            orientation_rotations = rotations[orientation_ids]
-            for axis_index, (axis_name, axis_color) in enumerate(axis_specs):
-                axis_end = (
-                    orientation_positions
-                    + orientation_rotations[:, :, axis_index] * orientation_scale
-                )
+            origins = positions[frame_ids]
+            frame_rotations = rotations[frame_ids]
+            for axis_name, axis, axis_color in axis_specs:
+                ends = origins + axis_length * frame_rotations[:, :, axis]
                 coordinates = [[], [], []]
-                for origin, endpoint in zip(orientation_positions, axis_end):
+                for origin, end in zip(origins, ends):
                     for dimension in range(3):
                         coordinates[dimension].extend(
-                            (float(origin[dimension]), float(endpoint[dimension]), None)
+                            (float(origin[dimension]), float(end[dimension]), None)
                         )
                 figure.add_trace(
                     go.Scatter3d(
@@ -321,86 +284,64 @@ def write_action_plot(
                         y=coordinates[1],
                         z=coordinates[2],
                         mode="lines",
-                        line={
-                            "color": axis_color,
-                            "width": 2.2,
-                            "dash": "solid",
-                        },
-                        opacity=0.7,
-                        name=(
-                            f"{name} orientation axes"
-                            if arm == "Left" and axis_index == 0
-                            else f"{name} orientation {axis_name}"
-                        ),
-                        legendgroup=f"{name} orientation axes",
-                        showlegend=arm == "Left" and axis_index == 0,
+                        name=f"{label} {axis_name}",
+                        legendgroup=f"{label} EEF axes",
+                        showlegend=offset == 0,
+                        opacity=0.58,
+                        line={"color": axis_color, "width": 4},
                         hoverinfo="skip",
-                    )
+                    ),
+                    row=1,
+                    col=column,
                 )
+
+        if label == "Prediction" and int(prediction_start) < len(actions):
+            boundary = actions[int(prediction_start)]
+            figure.add_trace(
+                go.Scatter3d(
+                    x=[boundary[0], boundary[8]],
+                    y=[boundary[1], boundary[9]],
+                    z=[boundary[2], boundary[10]],
+                    mode="markers",
+                    name="Prediction starts",
+                    marker={
+                        "size": 10,
+                        "color": ["#318fec", "#e865a6"],
+                        "line": {"color": "white", "width": 3},
+                    },
+                    hoverinfo="skip",
+                ),
+                row=1,
+                col=column,
+            )
+
+    add_plot(gt_absolute, 0, 1, "GT")
+    add_plot(pred_absolute, pred_start, 2, "Prediction")
+
+    scene = {
+        "xaxis": {"title": "X / m", "showbackground": False, "gridcolor": "#e8ecef"},
+        "yaxis": {"title": "Y / m", "showbackground": False, "gridcolor": "#e8ecef"},
+        "zaxis": {"title": "Z / m", "showbackground": False, "gridcolor": "#e8ecef"},
+        "aspectmode": "data",
+        "camera": {"eye": {"x": 1.45, "y": 1.55, "z": 1.05}},
+    }
     figure.update_layout(
         title={
-            "text": (
-                "Absolute End-Effector Trajectories"
-                f"<br><sup>Ground Truth vs. Prediction · Optimizer Step {int(step)}</sup>"
-            ),
-            "x": 0.41,
+            "text": f"Absolute End-Effector Trajectories · Optimizer Step {int(step)}",
+            "x": 0.5,
             "xanchor": "center",
-            "font": {"size": 24, "family": "Arial, sans-serif", "color": "#0f172a"},
         },
-        height=900,
-        width=1500,
-        margin={"l": 70, "r": 250, "t": 105, "b": 180},
-        paper_bgcolor="#ffffff",
-        font={"family": "Arial, sans-serif", "size": 13, "color": "#334155"},
-        hoverlabel={
-            "bgcolor": "#ffffff",
-            "bordercolor": "#cbd5e1",
-            "font": {"family": "Arial, sans-serif", "size": 12, "color": "#0f172a"},
-        },
-        legend={
-            "x": 0.85,
-            "xanchor": "left",
-            "y": 0.95,
-            "yanchor": "top",
-            "bgcolor": "rgba(255, 255, 255, 0.92)",
-            "bordercolor": "#e2e8f0",
-            "borderwidth": 1,
-            "font": {"size": 12, "color": "#334155"},
-        },
-        scene={
-            "xaxis": {
-                "title": "X",
-                "backgroundcolor": "#f8fafc",
-                "gridcolor": "#e2e8f0",
-                "zerolinecolor": "#94a3b8",
-                "linecolor": "#cbd5e1",
-                "showbackground": True,
-            },
-            "yaxis": {
-                "title": "Y",
-                "backgroundcolor": "#f8fafc",
-                "gridcolor": "#e2e8f0",
-                "zerolinecolor": "#94a3b8",
-                "linecolor": "#cbd5e1",
-                "showbackground": True,
-            },
-            "zaxis": {
-                "title": "Z",
-                "backgroundcolor": "#f8fafc",
-                "gridcolor": "#e2e8f0",
-                "zerolinecolor": "#94a3b8",
-                "linecolor": "#cbd5e1",
-                "showbackground": True,
-            },
-            "aspectmode": "data",
-            "domain": {"x": [0.0, 0.82], "y": [0.13, 1.0]},
-            "camera": {
-                "eye": {"x": 1.5, "y": 1.5, "z": 1.05},
-                "up": {"x": 0, "y": 0, "z": 1},
-            },
-        },
+        template="plotly_white",
+        width=1600,
+        height=850,
+        margin={"l": 20, "r": 20, "b": 20, "t": 100},
+        legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.02},
+        scene=scene,
+        scene2=scene,
+        font={"family": "Arial, sans-serif", "color": "#202124", "size": 14},
     )
     html_path = Path(path).with_suffix(".html")
+    html_path.parent.mkdir(parents=True, exist_ok=True)
     figure.write_html(html_path, include_plotlyjs=True, full_html=True)
 
 
