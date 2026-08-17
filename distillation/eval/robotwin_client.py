@@ -263,7 +263,12 @@ def create_task(task_name: str):
     return getattr(module, task_name)()
 
 
-def select_instruction(task_name: str, episode_info: dict[str, Any], instruction_type: str) -> str:
+def select_instruction(
+    task_name: str,
+    episode_info: dict[str, Any],
+    instruction_type: str,
+    seed: int,
+) -> str:
     from generate_episode_instructions import generate_episode_descriptions
 
     descriptions = generate_episode_descriptions(task_name, [episode_info], 100)
@@ -272,7 +277,7 @@ def select_instruction(task_name: str, episode_info: dict[str, Any], instruction
         raise ValueError(
             f"task {task_name!r} generated no {instruction_type!r} instructions"
         )
-    return str(np.random.choice(choices))
+    return str(np.random.default_rng(seed).choice(choices))
 
 
 def start_video(task_env, output_path: Path, width: int, height: int):
@@ -337,7 +342,7 @@ def run_episode(
     output_dir: Path,
     save_predicted_videos: bool,
 ) -> bool:
-    instruction = select_instruction(task_name, episode_info, instruction_type)
+    instruction = select_instruction(task_name, episode_info, instruction_type, seed)
     args["eval_video_save_dir"] = str(output_dir) if args.get("eval_video_log") else None
     task_env.setup_demo(now_ep_num=episode_id, seed=seed, is_test=True, **args)
     task_env.set_instruction(instruction=instruction)

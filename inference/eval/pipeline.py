@@ -247,6 +247,37 @@ class BidirectionalMOTInferencePipeline:
         cache.assert_no_transactions()
         return sample
 
+    # 阶段 1/2：一个训练窗口有 8 个 latent 时间位置
+    #
+    # latent frame:
+    #             0    1    2    3  |  4    5    6    7
+    #             -----history----- | anchor + future target
+    #
+    # 视频：
+    #   0:4 = 4 个历史视频 latent
+    #   4   = 当前时刻 anchor
+    #   5:8 = 3 个未来视频 latent
+    #
+    # 动作：
+    #   1:4 = 有效历史动作
+    #   4   = anchor 对齐位置，不预测动作
+    #   5:8 = 未来动作预测目标
+    # 阶段 2/2：简化到“一帧一个 token”后的可见集合
+    #
+    # 未来 noisy video token NV5 可以看到：
+    # visible_to_NV5 = [
+    #     "NV4", "NV5", "NV6", "NV7",  # 整个 noisy target video chunk
+    #     "CV0", "CV1", "CV2", "CV3",  # 历史 clean video
+    #     "CA1", "CA2", "CA3",         # 历史 clean action
+    # ]
+
+    # # 未来 noisy action token NA5 可以看到：
+    # visible_to_NA5 = [
+    #     "CV0", "CV1", "CV2", "CV3",
+    #     "CV4", "CV5", "CV6", "CV7",  # 完整 clean video
+    #     "NA5", "NA6", "NA7",         # 整个 noisy action chunk
+    #     "CA1", "CA2", "CA3",         # 历史 clean action
+    # ]
     @torch.no_grad()
     def infer(
         self,
