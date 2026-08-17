@@ -565,7 +565,13 @@ class TextEmbedder:
         )
         input_ids = inputs.input_ids.to(self.device)
         mask = inputs.attention_mask.to(self.device)
-        return self.encoder(input_ids, mask).last_hidden_state
+        seq_len = int(mask.gt(0).sum(dim=1)[0].item())
+        embeds = self.encoder(input_ids, mask).last_hidden_state
+        embeds = embeds[:, :seq_len]
+        padding = embeds.new_zeros(
+            embeds.shape[0], 512 - seq_len, embeds.shape[2]
+        )
+        return torch.cat([embeds, padding], dim=1)
 
 
 def load_pipeline(

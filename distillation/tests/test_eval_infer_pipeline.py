@@ -6,6 +6,7 @@ from distillation.eval.infer_pipeline import (
     AutoregressiveMOTInferencePipeline,
     OnlineMOTWindowBuilder,
     StreamingVAECodec,
+    TextEmbedder,
 )
 from distillation.eval.protocol import CAMERA_KEYS, OnlineObservation
 
@@ -94,6 +95,34 @@ def test_online_codec_decodes_generated_video_after_anchor() -> None:
     assert payload["camera_keys"] == list(CAMERA_KEYS)
     assert len(payload["frames"]) == 12
     assert all(len(frame) == 3 for frame in payload["frames"])
+
+
+def test_online_text_embedder_zero_pads_like_training_cache() -> None:
+    class Tokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                input_ids=torch.zeros(1, 512, dtype=torch.long),
+                attention_mask=torch.tensor([[1, 1, 1] + [0] * 509]),
+            )
+
+    class Encoder:
+        def __call__(self, input_ids, attention_mask):
+            del attention_mask
+            hidden = torch.arange(1, 1 + 512 * 2, dtype=torch.float32).reshape(
+                1, 512, 2
+            )
+            return SimpleNamespace(last_hidden_state=hidden)
+
+    embedder = TextEmbedder.__new__(TextEmbedder)
+    embedder.tokenizer = Tokenizer()
+    embedder.encoder = Encoder()
+    embedder.device = torch.device("cpu")
+
+    result = embedder("instruction")
+
+    assert result.shape == (1, 512, 2)
+    assert torch.equal(result[:, :3], torch.arange(1, 7).reshape(1, 3, 2).float())
+    assert torch.count_nonzero(result[:, 3:]) == 0
 
 
 class _Codec:
