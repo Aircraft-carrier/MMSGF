@@ -1707,7 +1707,8 @@ class MOTTrainer:
     def _get_train_vae(self):
         if self.train_vae is None:
             self.train_vae = load_vae(
-                os.path.join(self.config.wan22_pretrained_model_name_or_path, "vae"),
+                getattr(self.config, "wan22_vae_path", None)
+                or os.path.join(self.config.wan22_pretrained_model_name_or_path, "vae"),
                 torch_dtype=self.dtype,
                 torch_device=self.device,
             ).eval()
@@ -3009,6 +3010,8 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.resume_from is not None:
+        config.resume_from = args.resume_from
 
     train_seed = int(getattr(config, "train_seed", 42))
     _seed_mot_training(train_seed)
@@ -3044,6 +3047,12 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Completed full-state checkpoint to resume",
     )
 
     args = parser.parse_args()

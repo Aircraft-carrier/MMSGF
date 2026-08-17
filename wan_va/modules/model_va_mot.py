@@ -1,6 +1,8 @@
 """Video+Action Mixture-of-Transformers model."""
 
+import json
 import math
+from pathlib import Path
 from typing import NamedTuple, Optional
 
 import torch
@@ -11,6 +13,7 @@ from diffusers.models.attention import FeedForward
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from einops import rearrange
+from safetensors.torch import load_file
 from torch import nn
 
 from .model import (
@@ -804,8 +807,16 @@ class VAMOTTransformer3DModel(ModelMixin, ConfigMixin):
                     "Wan2.2 dim must divide evenly across num_heads: "
                     f"dim={dim}, num_heads={num_heads}"
                 )
-            base = DiffusersWanTransformer3DModel.from_pretrained(
-                video_transformer_path,
+            checkpoint_path = Path(video_transformer_path)
+            checkpoint_index = json.loads(
+                (checkpoint_path / "diffusion_pytorch_model.safetensors.index.json").read_text()
+            )
+            checkpoint = {}
+            for shard in sorted(set(checkpoint_index["weight_map"].values())):
+                checkpoint.update(load_file(checkpoint_path / shard, device="cpu"))
+            base = DiffusersWanTransformer3DModel.from_single_file(
+                checkpoint,
+                config=video_transformer_path,
                 torch_dtype=torch.float32,
                 num_attention_heads=num_heads,
                 attention_head_dim=dim // num_heads,
@@ -821,15 +832,21 @@ class VAMOTTransformer3DModel(ModelMixin, ConfigMixin):
             "_class_name",
             "_diffusers_version",
             "added_kv_proj_dim",
+            "dim",
             "image_dim",
+            "in_dim",
+            "model_type",
+            "num_heads",
+            "out_dim",
             "qk_norm",
+            "text_len",
         ):
             config.pop(key, None)
         if config_overrides:
             config.update(config_overrides)
         model = cls(**config)
         report = InitReport(video_source=video_source, video_path=video_transformer_path)
-        for name in ("rope", "condition_embedder", "norm_out", "proj_out"):
+        for name in ("condition_embedder", "norm_out", "proj_out"):
             getattr(model, name).load_state_dict(
                 getattr(base, name).state_dict(), strict=True
             )

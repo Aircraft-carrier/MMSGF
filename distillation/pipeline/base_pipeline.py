@@ -41,7 +41,7 @@ class BasePipeline:
         """Commit history and anchor K/V in causal order.
 
         Order matters for cache attention: video history, then action history,
-        then the clean anchor video, then the anchor action.
+        then the clean anchor video. The anchor has no valid action tokens.
         """
         history_frames = int(history_frames)
         history_ids = list(range(history_frames))
@@ -83,9 +83,5 @@ class BasePipeline:
             cache=self.cache,
             text_emb=text_emb,
         )
-        self.generator.commit_action(
-            actions[:, :, history_frames : history_frames + 1],
-            frame_ids=[history_frames],
-            cache=self.cache,
-            text_emb=text_emb,
-        )
+        # The anchor frame has no valid action tokens in the training packing,
+        # so committing a zero action would expose K/V that the training mask hides.

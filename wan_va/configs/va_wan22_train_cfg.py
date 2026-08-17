@@ -37,6 +37,9 @@ _WAN22_MODEL_ROOT = Path(
 # initializes the action expert locally.
 va_wan22_train_cfg.init_model_from_lingbot = False
 va_wan22_train_cfg.wan22_pretrained_model_name_or_path = str(_WAN22_MODEL_ROOT)
+va_wan22_train_cfg.wan22_vae_path = os.getenv(
+    "WAN22_VAE_PATH", str(_WAN22_MODEL_ROOT / "vae")
+)
 va_wan22_train_cfg.wan22_transformer_path = os.getenv(
     "WAN22_TRANSFORMER_PATH", str(_WAN22_MODEL_ROOT)
 )

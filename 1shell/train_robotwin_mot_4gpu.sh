@@ -7,6 +7,7 @@ cd "${REPO_ROOT}"
 
 export MOT_DATASET_ROOT="${MOT_DATASET_ROOT:-${REPO_ROOT}/data/robotwin_clean_50}"
 export WAN22_PRETRAINED_MODEL_PATH="${WAN22_PRETRAINED_MODEL_PATH:-${REPO_ROOT}/playground/Pretrained_models/Wan2.2-TI2V-5B}"
+export WAN22_VAE_PATH="${WAN22_VAE_PATH:-/zsh/cache/hf_cache/hub/models--robbyant--lingbot-va-base/snapshots/68b7bc1b35da6ddc67ea94c4ceb58d768fbb3f9c/vae}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"

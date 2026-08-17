@@ -128,6 +128,7 @@ def test_infer_commits_each_predicted_chunk_before_the_next() -> None:
         ("video", (6,)),
         ("action", (6,)),
     ]
+    assert ("action", (4,)) not in pipeline.model.commits
     assert len(response["actions"]) == 32
     assert response["predicted_video"] == [["5"], ["6"]]
 

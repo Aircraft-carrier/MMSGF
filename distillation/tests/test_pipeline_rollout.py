@@ -112,13 +112,13 @@ def test_pipeline_rollout_commits_blocks_and_records_exit() -> None:
     assert isinstance(result.video_exit_timestep, float)
     assert isinstance(result.action_exit_timestep, float)
     # Video denoises through 2 steps, action through 3, then clean commits.
+    # The anchor has no action commit because its action tokens are invalid.
     assert generator.predict_video_calls == 2
     assert generator.predict_action_calls == 3
     assert generator.commits == [
         ("video", (0,), (1, 1, 1, 1, 1, 1)),
         ("action", (0,), (1, 1, 1, 1, 1)),
         ("video", (1,), (1, 1, 1, 1, 1, 1)),
-        ("action", (1,), (1, 1, 1, 1, 1)),
         ("video", (2, 3), (1, 1, 2, 1, 1, 1)),
         ("action", (2, 3), (1, 1, 2, 1, 1)),
     ]
@@ -170,4 +170,4 @@ def test_history_cache_forwards_video_and_action_validity() -> None:
         forwarded[1][1], batch["action_valid_mask"][:, :, :2]
     )
     assert forwarded[2][1] is None
-    assert forwarded[3][1] is None
+    assert len(forwarded) == 3

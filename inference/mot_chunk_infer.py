@@ -101,11 +101,15 @@ def _reservoir_sample_manifest(
 
 
 def _select_inference_rows(
-    *, dataset_root: Path, action_chunk_size: int = 48, rng: random.Random
+    *,
+    dataset_root: Path,
+    action_chunk_size: int = 48,
+    rng: random.Random,
+    source_datasets: tuple[str, ...] = EVAL_SOURCE_DATASETS,
 ) -> list[dict[str, Any]]:
     manifest = dataset_root / "meta" / TRAINING_MANIFEST
     rows: list[dict[str, Any]] = []
-    for source_dataset in EVAL_SOURCE_DATASETS:
+    for source_dataset in source_datasets:
         rows.extend(
             _reservoir_sample_manifest(
                 manifest,
@@ -406,6 +410,9 @@ def _run_evaluation_artifacts(checkpoint_root, eval_cfg, output_dir) -> None:
         dataset_root=Path(eval_cfg.dataset_root),
         action_chunk_size=config.action_chunk_size,
         rng=rng,
+        source_datasets=tuple(
+            getattr(eval_cfg, "source_datasets", EVAL_SOURCE_DATASETS)
+        ),
     )
     for row in rows:
         row["inference_start_frame"] = _sample_full_window_start(
@@ -451,6 +458,13 @@ def parse_args(argv=None):
     parser.add_argument("--mode", choices=("video", "full"), default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--source-dataset",
+        dest="source_datasets",
+        action="append",
+        default=None,
+        help="Manifest source_dataset to sample; repeat to select multiple sources",
+    )
     return parser.parse_args(argv)
 
 
@@ -462,6 +476,8 @@ def main():
         config.mode = args.mode
     if args.device is not None:
         config.device = args.device
+    if args.source_datasets is not None:
+        config.source_datasets = tuple(args.source_datasets)
     output = run_checkpoint_evaluation(
         args.checkpoint_root, config, output_dir=args.output_dir
     )

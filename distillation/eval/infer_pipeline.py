@@ -415,14 +415,8 @@ class AutoregressiveMOTInferencePipeline:
             text_emb=text_emb,
             cache=cache,
         )
-        anchor_action = torch.zeros(
-            (1, 20, 1, ACTION_TOKENS_PER_FRAME, 1),
-            device=self.device,
-            dtype=self.dtype,
-        )
-        self.model.commit_action(
-            anchor_action, frame_ids=[4], text_emb=text_emb, cache=cache
-        )
+        # Frame 4 has no valid action tokens in the training packing, so no
+        # anchor action K/V may be committed to the incremental inference cache.
         cache_ms = (time.perf_counter() - cache_started) * 1000
 
         generator = torch.Generator(device=self.device).manual_seed(self.seed + int(request_id))
