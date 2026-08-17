@@ -31,6 +31,9 @@ def _observation(step: int) -> OnlineObservation:
 
 
 class _Codec:
+    def __init__(self):
+        self.decoded_shape = None
+
     def encode_history(self, _rgb):
         return torch.zeros(1, 1, 4, 3, 1, 1)
 
@@ -39,6 +42,14 @@ class _Codec:
 
     def decode_one(self, _latent):
         return ["video"]
+
+    def decode_video(self, latent):
+        self.decoded_shape = tuple(latent.shape)
+        return {
+            "fps": 10,
+            "camera_keys": list(CAMERA_KEYS),
+            "frames": [["video"] * 3],
+        }
 
 
 class _Model(torch.nn.Module):
@@ -73,7 +84,7 @@ class _Model(torch.nn.Module):
         return torch.zeros_like(sample)
 
 
-def _pipeline(model=None, *, video_num_steps=1):
+def _pipeline(model=None, *, video_num_steps=1, execution_action_count=48):
     return BidirectionalMOTInferencePipeline(
         model=model or _Model(),
         codec=_Codec(),
@@ -94,6 +105,7 @@ def _pipeline(model=None, *, video_num_steps=1):
         guidance_scale=1.0,
         video_snr_shift=1.0,
         action_snr_shift=1.0,
+        execution_action_count=execution_action_count,
     )
 
 
@@ -149,6 +161,34 @@ def test_infer_caches_history_then_predicts_whole_target_chunks() -> None:
     assert len({call[2] for call in calls}) == 1
     assert calls[2][3][2] == 4
     assert calls[4][3][2] == 3
+
+
+def test_infer_can_execute_only_the_first_action_frame() -> None:
+    pipeline = _pipeline(execution_action_count=16)
+    pipeline.reset(task_name="task", instruction="do it", seed=7)
+    response = pipeline.infer(
+        observations=[_observation(0)],
+        executed_actions=[],
+        request_id=0,
+        return_video=False,
+    )
+
+    assert len(response["actions"]) == 16
+    assert all(len(action) == 16 for action in response["actions"])
+
+
+def test_infer_returns_the_full_generated_video_chunk_when_requested() -> None:
+    pipeline = _pipeline()
+    pipeline.reset(task_name="task", instruction="do it", seed=7)
+    response = pipeline.infer(
+        observations=[_observation(0)],
+        executed_actions=[],
+        request_id=0,
+        return_video=True,
+    )
+
+    assert response["predicted_video"]["fps"] == 10
+    assert pipeline.codec.decoded_shape == (1, 1, 4, 3, 1, 1)
 
 
 def test_seed_and_request_id_control_target_noise() -> None:

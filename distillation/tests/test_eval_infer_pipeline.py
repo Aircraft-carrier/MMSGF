@@ -1,9 +1,11 @@
 import numpy as np
 import torch
+from types import SimpleNamespace
 
 from distillation.eval.infer_pipeline import (
     AutoregressiveMOTInferencePipeline,
     OnlineMOTWindowBuilder,
+    StreamingVAECodec,
 )
 from distillation.eval.protocol import CAMERA_KEYS, OnlineObservation
 
@@ -63,6 +65,35 @@ def test_online_window_rejects_non_contiguous_steps() -> None:
         assert "expected observation step 1" in str(exc)
     else:
         raise AssertionError("non-contiguous steps were accepted")
+
+
+def test_online_codec_resizes_robotwin_rgb_to_training_resolution() -> None:
+    codec = StreamingVAECodec(
+        SimpleNamespace(dtype=torch.float32),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    video = codec._video(torch.zeros(13, 3, 240, 320))
+    assert video.shape == (1, 3, 13, 480, 640)
+
+
+def test_online_codec_decodes_generated_video_after_anchor() -> None:
+    class VAE:
+        dtype = torch.float32
+        config = SimpleNamespace(latents_mean=[0.0], latents_std=[1.0])
+
+        def decode(self, latent, return_dict=False):
+            assert not return_dict
+            return (torch.zeros(latent.shape[0], 3, 13, 2, 2),)
+
+    codec = StreamingVAECodec(
+        VAE(), device=torch.device("cpu"), dtype=torch.float32
+    )
+    payload = codec.decode_video(torch.zeros(1, 1, 4, 3, 1, 1))
+
+    assert payload["camera_keys"] == list(CAMERA_KEYS)
+    assert len(payload["frames"]) == 12
+    assert all(len(frame) == 3 for frame in payload["frames"])
 
 
 class _Codec:

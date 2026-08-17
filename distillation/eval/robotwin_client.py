@@ -44,6 +44,53 @@ def encode_jpeg(image: np.ndarray, quality: int = 90) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+def decode_jpeg(value: str) -> np.ndarray:
+    with Image.open(io.BytesIO(base64.b64decode(value))) as image:
+        return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+
+def write_predicted_video(payload: dict[str, Any], output_path: Path) -> None:
+    frames = [
+        np.concatenate([decode_jpeg(image) for image in frame], axis=1)
+        for frame in payload["frames"]
+    ]
+    if not frames:
+        raise ValueError("predicted video contains no generated frames")
+    height, width = frames[0].shape[:2]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    process = subprocess.Popen(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "rgb24",
+            "-video_size",
+            f"{width}x{height}",
+            "-framerate",
+            str(int(payload["fps"])),
+            "-i",
+            "-",
+            "-pix_fmt",
+            "yuv420p",
+            "-vcodec",
+            "libx264",
+            "-crf",
+            "23",
+            str(output_path),
+        ],
+        stdin=subprocess.PIPE,
+    )
+    for frame in frames:
+        process.stdin.write(frame.tobytes())
+    process.stdin.close()
+    if process.wait() != 0:
+        raise RuntimeError(f"ffmpeg failed to save predicted video: {output_path}")
+
+
 def encode_observation(observation: dict[str, Any], step: int) -> dict[str, Any]:
     images = {
         wire_name: encode_jpeg(observation["observation"][robotwin_name]["rgb"])
@@ -108,6 +155,7 @@ class PolicyClient:
         request_id: int,
         observations: list[dict[str, Any]],
         executed_actions: list[list[float]],
+        return_video: bool = False,
     ) -> dict[str, Any]:
         return self.post(
             "/v1/actions",
@@ -116,7 +164,7 @@ class PolicyClient:
                 "request_id": request_id,
                 "observations": observations,
                 "executed_actions": executed_actions,
-                "return_video": False,
+                "return_video": bool(return_video),
             },
         )
 
@@ -287,6 +335,7 @@ def run_episode(
     seed: int,
     episode_info: dict[str, Any],
     output_dir: Path,
+    save_predicted_videos: bool,
 ) -> bool:
     instruction = select_instruction(task_name, episode_info, instruction_type)
     args["eval_video_save_dir"] = str(output_dir) if args.get("eval_video_log") else None
@@ -312,8 +361,19 @@ def run_episode(
     try:
         while task_env.take_action_cnt < task_env.step_lim and not task_env.eval_success:
             response = policy.actions(
-                session_id, request_id, pending_observations, pending_actions
+                session_id,
+                request_id,
+                pending_observations,
+                pending_actions,
+                return_video=save_predicted_videos,
             )
+            if save_predicted_videos:
+                write_predicted_video(
+                    response["predicted_video"],
+                    output_dir
+                    / "generated_videos"
+                    / f"episode{episode_id:03d}_request{request_id:04d}.mp4",
+                )
             actions = np.asarray(response["actions"], dtype=np.float32)
             if actions.ndim != 2 or actions.shape[1] != 16:
                 raise ValueError(f"server actions must have shape (N, 16), got {actions.shape}")
@@ -371,6 +431,7 @@ def parse_args(argv=None):
     parser.add_argument("--instruction-type", choices=("seen", "unseen"), default="unseen")
     parser.add_argument("--request-timeout", type=float, default=1800)
     parser.add_argument("--request-retries", type=int, default=2)
+    parser.add_argument("--save-predicted-video", type=parse_bool, default=False)
     return parser.parse_args(argv)
 
 
@@ -419,6 +480,7 @@ def main(argv=None) -> None:
             seed,
             episode_info,
             output_dir,
+            cli.save_predicted_video,
         )
         progress["completed_episodes"] = episode_id + 1
         progress["success_count"] = int(progress["success_count"]) + int(success)

@@ -1743,6 +1743,14 @@ class MOTTrainer:
         spec = _mot_spec_from_config(self.config)
         if frames.shape[0] != spec.vae_input_frame_count:
             raise ValueError(f"MOT VAE input must have {spec.vae_input_frame_count} frames, got {frames.shape[0]}")
+        target_size = (int(self.config.height), int(self.config.width))
+        if tuple(frames.shape[-2:]) != target_size:
+            frames = F.interpolate(
+                frames,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
         vae = self._get_train_vae()
         vae_device = next(vae.parameters()).device
         vae_dtype = next(vae.parameters()).dtype

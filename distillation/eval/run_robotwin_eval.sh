@@ -404,8 +404,10 @@ done
 
 run_shard() {
   local shard=$1 total=$2
-  local size=$(( (${#TASKS[@]} + total - 1) / total ))
-  local begin=$(( shard * size )) end=$(( begin + size ))
+  local size begin end
+  size=$(( (${#TASKS[@]} + total - 1) / total ))
+  begin=$(( shard * size ))
+  end=$(( begin + size ))
   (( begin < ${#TASKS[@]} )) || return 0
   (( end <= ${#TASKS[@]} )) || end=${#TASKS[@]}
   local task task_dir result progress failed attempt status

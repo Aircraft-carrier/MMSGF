@@ -2,28 +2,16 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-PYTHON_BIN="${PYTHON_BIN:-/zsh/miniconda3/envs/linbotva/bin/python}"
-CHECKPOINT_SEARCH_ROOT="${CHECKPOINT_SEARCH_ROOT:-${REPO_ROOT}/train_logs/robotwin_mot}"
+PYTHON_BIN="/zsh/miniconda3/envs/linbotva/bin/python"
+CHECKPOINT_ROOT="${REPO_ROOT}/train_logs/robotwin_mot/0816_robotwin50_4gpu_run5/checkpoints/checkpoint_step_18000"
 MOT_DATASET_ROOT="${MOT_DATASET_ROOT:-${REPO_ROOT}/data/robotwin_clean_50}"
 WAN22_MODEL_ROOT="${WAN22_MODEL_ROOT:-${REPO_ROOT}/playground/Pretrained_models/Wan2.2-TI2V-5B}"
 SOURCE_DATASET="${SOURCE_DATASET:-robotwin_eef_clean_50}"
 MODE="${MODE:-full}"
 GPU_ID="${GPU_ID:-0}"
-
-if [ -z "${CHECKPOINT_ROOT:-}" ]; then
-    CHECKPOINT_ROOT="$({
-        find "${CHECKPOINT_SEARCH_ROOT}" -type f -name _SUCCESS \
-            -path '*/checkpoints/checkpoint_step_*/*' -printf '%T@ %h\n'
-    } | sort -n | tail -n 1 | cut -d' ' -f2-)"
-fi
-
-if [ -z "${CHECKPOINT_ROOT}" ]; then
-    echo "No completed checkpoint found under ${CHECKPOINT_SEARCH_ROOT}" >&2
-    exit 1
-fi
 
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/inference_logs/$(basename "$(dirname "$(dirname "${CHECKPOINT_ROOT}")")")_$(basename "${CHECKPOINT_ROOT}")_${MODE}}"
 

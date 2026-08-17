@@ -34,6 +34,9 @@ def parse_args(argv=None):
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--video-snr-shift", type=float, default=5.0)
     parser.add_argument("--action-snr-shift", type=float, default=1.0)
+    parser.add_argument(
+        "--execution-action-count", type=int, choices=range(1, 49), default=48
+    )
     return parser.parse_args(argv)
 
 
@@ -51,6 +54,7 @@ def main(argv=None) -> None:
         guidance_scale=args.guidance_scale,
         video_snr_shift=args.video_snr_shift,
         action_snr_shift=args.action_snr_shift,
+        execution_action_count=args.execution_action_count,
     )
     service = BidirectionalPolicyService(
         pipeline=pipeline, checkpoint=args.checkpoint_root, ready=True

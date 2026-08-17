@@ -48,6 +48,7 @@ class BidirectionalMOTInferencePipeline:
         guidance_scale: float,
         video_snr_shift: float,
         action_snr_shift: float,
+        execution_action_count: int = 48,
     ) -> None:
         self.model = model
         self.codec = codec
@@ -59,6 +60,9 @@ class BidirectionalMOTInferencePipeline:
         self.dtype = dtype
         self.video_num_steps = int(video_num_steps)
         self.action_num_steps = int(action_num_steps)
+        self.execution_action_count = int(execution_action_count)
+        if not 1 <= self.execution_action_count <= 48:
+            raise ValueError("execution_action_count must be between 1 and 48")
         self.guidance_scale = float(guidance_scale)
         self.video_scheduler = FlowMatchScheduler(
             shift=video_snr_shift, sigma_min=0.0, extra_one_step=True
@@ -294,10 +298,10 @@ class BidirectionalMOTInferencePipeline:
         relative = (normalized + 1.0) * 0.5 * (q99 - q01 + 1e-6) + q01
         references = np.broadcast_to(window.anchor_state, (48, 16))
         absolute = relative_20d_to_absolute_actions(references, relative)
-        decoded = self.codec.decode_one(predicted_video[:, :, 1:]) if return_video else None
+        decoded = self.codec.decode_video(predicted_video) if return_video else None
         response = {
             "observation_step": candidate.last_step,
-            "actions": absolute.astype(np.float32).tolist(),
+            "actions": absolute[: self.execution_action_count].astype(np.float32).tolist(),
             "action_type": "ee",
             "predicted_video": decoded,
             "timings_ms": {
@@ -343,6 +347,7 @@ def load_pipeline(
     guidance_scale: float = 5.0,
     video_snr_shift: float = 5.0,
     action_snr_shift: float = 1.0,
+    execution_action_count: int = 48,
 ) -> BidirectionalMOTInferencePipeline:
     checkpoint_root = Path(checkpoint_root)
     metadata = json.loads(
@@ -395,4 +400,5 @@ def load_pipeline(
         guidance_scale=guidance_scale,
         video_snr_shift=video_snr_shift,
         action_snr_shift=action_snr_shift,
+        execution_action_count=execution_action_count,
     )

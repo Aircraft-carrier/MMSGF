@@ -70,8 +70,8 @@ va_wan22_train_cfg.video_downsample_ratio = 4
 va_wan22_train_cfg.vae_temporal_factor = 4
 va_wan22_train_cfg.sampled_video_frames_per_action_chunk_per_view = 13
 va_wan22_train_cfg.latent_frames_per_action_chunk_per_view = 4
-va_wan22_train_cfg.height = 256
-va_wan22_train_cfg.width = 320
+va_wan22_train_cfg.height = int(os.getenv("MOT_TRAIN_HEIGHT", "256"))
+va_wan22_train_cfg.width = int(os.getenv("MOT_TRAIN_WIDTH", "320"))
 va_wan22_train_cfg.norm_stat = {
     "q01": [
         -0.06172713458538055, -3.6716461181640625e-05, -0.08783501386642456,

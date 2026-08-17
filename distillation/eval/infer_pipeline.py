@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from distillation.model.autoregressive_mot import (
     AutoregressiveVAMOTTransformer3DModel,
@@ -36,6 +37,7 @@ HISTORY_LATENT_FRAMES = 4
 ACTION_TOKENS_PER_FRAME = 16
 ACTION_HISTORY = 48
 STREAM_IDS = torch.tensor([[1, 0, 2]], dtype=torch.long)
+MOT_IMAGE_SIZE = (480, 640)
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +228,13 @@ class StreamingVAECodec:
         return ((mu - mean) / std).to(dtype=self.dtype)
 
     def _video(self, frames: torch.Tensor) -> torch.Tensor:
+        if tuple(frames.shape[-2:]) != MOT_IMAGE_SIZE:
+            frames = F.interpolate(
+                frames,
+                size=MOT_IMAGE_SIZE,
+                mode="bilinear",
+                align_corners=False,
+            )
         return frames.permute(1, 0, 2, 3)[None].to(self.device, self.vae.dtype) * 2 - 1
 
     @torch.no_grad()
@@ -272,6 +281,47 @@ class StreamingVAECodec:
             encode_jpeg((image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
             for image in images
         ]
+
+    @torch.no_grad()
+    def decode_video(self, latent: torch.Tensor) -> dict[str, Any]:
+        batch, channels, frames, views, height, width = latent.shape
+        if batch != 1 or views != len(CAMERA_KEYS):
+            raise ValueError("generated video requires one sample with three views")
+        packed = latent.permute(0, 3, 1, 2, 4, 5).reshape(
+            batch * views, channels, frames, height, width
+        ).to(self.device, self.vae.dtype)
+        mean = torch.tensor(
+            self.vae.config.latents_mean, device=self.device, dtype=packed.dtype
+        ).view(1, -1, 1, 1, 1)
+        std = torch.tensor(
+            self.vae.config.latents_std, device=self.device, dtype=packed.dtype
+        ).view(1, -1, 1, 1, 1)
+        decoded = self.vae.decode(packed * std + mean, return_dict=False)[0]
+        decoded = (decoded.float() * 0.5 + 0.5).clamp(0, 1)
+        raw_frames = decoded.shape[2]
+        decoded_channels = decoded.shape[1]
+        decoded = decoded.permute(0, 2, 1, 3, 4).reshape(
+            batch,
+            views,
+            raw_frames,
+            decoded_channels,
+            decoded.shape[3],
+            decoded.shape[4],
+        ).permute(0, 2, 1, 3, 4, 5)
+        generated = decoded[0, 1:]
+        return {
+            "fps": 10,
+            "camera_keys": list(CAMERA_KEYS),
+            "frames": [
+                [
+                    encode_jpeg(
+                        (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    )
+                    for image in frame
+                ]
+                for frame in generated
+            ],
+        }
 
 
 class AutoregressiveMOTInferencePipeline:
