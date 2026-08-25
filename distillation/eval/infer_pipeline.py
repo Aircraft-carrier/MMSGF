@@ -544,6 +544,11 @@ class AutoregressiveMOTInferencePipeline:
 
 class TextEmbedder:
     def __init__(self, model_root: Path, device: torch.device, dtype: torch.dtype) -> None:
+        # Stage 1/3: Load the tokenizer.
+        # Expected directory structure:
+        # model_root/
+        # ├── tokenizer/
+        # └── text_encoder/
         self.tokenizer = load_tokenizer(str(model_root / "tokenizer"))
         self.encoder = load_text_encoder(
             str(model_root / "text_encoder"), torch_dtype=dtype, torch_device=device
@@ -553,20 +558,57 @@ class TextEmbedder:
     @torch.no_grad()
     def __call__(self, text: str) -> torch.Tensor:
         from diffusers.pipelines.wan.pipeline_wan import prompt_clean
+        # Notation:
+        # B = batch size, fixed at 1 here
+        # T = fixed token length, 512 here
+        # D = hidden dimension of the text encoder, determined by the model
 
+        # Stage 1/3: Clean and tokenize the text.
         inputs = self.tokenizer(
             [prompt_clean(text)],
             padding="max_length",
+            # Pad to max_length=512 regardless of the actual text length.
             max_length=512,
             truncation=True,
+            # Truncate any tokens beyond 512 after tokenization.
+            # Therefore, trailing information in an overlong prompt is permanently lost.
             add_special_tokens=True,
+            # Add special tokens required by the model, such as BOS and EOS.
+            # seq_len also includes these special tokens.
             return_attention_mask=True,
+            # Return the attention mask:
+            # valid token positions are typically 1, while padding positions are 0.
             return_tensors="pt",
+            # Return PyTorch tensors instead of Python lists.
         )
+        # The tokenizer typically runs on the CPU.
+        # input_ids:      [1, 512], generally torch.int64
+        # attention_mask: [1, 512], typically an integer type
+        #
+        # Example, assuming a maximum length of 8:
+        # input_ids      = [[101, 20, 30, 102, 0, 0, 0, 0]]
+        # attention_mask = [[  1,  1,  1,   1, 0, 0, 0, 0]]
         input_ids = inputs.input_ids.to(self.device)
         mask = inputs.attention_mask.to(self.device)
+        # Stage 2/3: Compute the actual sequence length.
+        # mask.gt(0): [1, 512] -> a bool tensor of shape [1, 512]
+        # sum(dim=1): [1, 512] -> [1], counting valid tokens in each text
         seq_len = int(mask.gt(0).sum(dim=1)[0].item())
+        # Stage 3/3: Encode the text.
+        # Pass mask to the encoder as the second positional argument.
+        # This assumes that the encoder's second parameter is attention_mask.
         embeds = self.encoder(input_ids, mask).last_hidden_state
+        # Input:
+        #   input_ids: [1, 512]
+        #   mask:      [1, 512]
+        # Output:
+        #   embeds:    [1, 512, D]
+        #
+        # last_hidden_state contains the contextualized vector produced for each token
+        # by the final layer of the text encoder, rather than one vector for the sentence.
+
+        # Keep only the first seq_len outputs corresponding to valid tokens:
+        # [1, 512, D] -> [1, seq_len, D]
         embeds = embeds[:, :seq_len]
         padding = embeds.new_zeros(
             embeds.shape[0], 512 - seq_len, embeds.shape[2]

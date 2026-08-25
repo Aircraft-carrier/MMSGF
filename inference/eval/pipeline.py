@@ -13,6 +13,7 @@ import torch
 from distillation.eval.infer_pipeline import (
     STREAM_IDS,
     OnlineMOTWindowBuilder,
+    OnlineWindow,
     StreamingVAECodec,
     TextEmbedder,
 )
@@ -23,7 +24,6 @@ from wan_va.dataset.mot_dataset import relative_20d_to_absolute_actions
 from wan_va.modules.utils import load_vae
 from wan_va.mot_spec import MOTWindowSpec, mot_spec_from_config
 from wan_va.utils.scheduler import FlowMatchScheduler
-
 
 CHECKPOINT_ARCHITECTURE = "va_mot_v1"
 TRANSFORMER_WEIGHTS = "diffusion_pytorch_model.safetensors"
@@ -88,7 +88,7 @@ class BidirectionalMOTInferencePipeline:
         self.seed = int(seed)
 
     def _assemble_batch(
-        self, window, history: torch.Tensor, anchor: torch.Tensor
+        self, window: OnlineWindow, history: torch.Tensor, anchor: torch.Tensor
     ) -> dict[str, torch.Tensor]:
         if tuple(history.shape[2:4]) != (4, 3) or tuple(anchor.shape[2:4]) != (1, 3):
             raise ValueError(
