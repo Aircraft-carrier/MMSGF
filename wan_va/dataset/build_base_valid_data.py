@@ -334,7 +334,6 @@ def build_real_mot_base_cache(
                     "task_uid": task_uid,
                     "norm_stats_key": task_uid,
                     "source_dataset": source_dataset,
-                    "has_pointcloud": False,
                     "episode_index": int(episode_index),        # 这里的 episode idx 是该 task 内部的
                     "fps": int(info["fps"]),
                     "timestamp_policy": MOT_TIMESTAMP_POLICY,

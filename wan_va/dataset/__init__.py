@@ -4,9 +4,6 @@
 __all__ = [
     'MOT_ACTION_CHUNKS',
     'MOT_ACTION_SEQUENCE_LENGTH',
-    'MotBalancedMixDataset',
-    'MotGeometryLeRobotData',
-    'MotPureLeRobotData',
     'MotTrainData',
     'build_real_mot_base_cache',
     'build_real_mot_training_selection',
@@ -20,7 +17,6 @@ __all__ = [
     'relative_20d_to_absolute_actions',
     'rotation_matrix_to_rot6d_cols',
     'validate_mot_batch_for_forward',
-    'validate_mot_geometry_batch',
 ]
 
 
@@ -28,9 +24,6 @@ def __getattr__(name):
     if name in {
         'MOT_ACTION_CHUNKS',
         'MOT_ACTION_SEQUENCE_LENGTH',
-        'MotBalancedMixDataset',
-        'MotGeometryLeRobotData',
-        'MotPureLeRobotData',
         'MotTrainData',
         'load_manifest',
         'mot_action_per_frame',
@@ -41,14 +34,10 @@ def __getattr__(name):
         'relative_20d_to_absolute_actions',
         'rotation_matrix_to_rot6d_cols',
         'validate_mot_batch_for_forward',
-        'validate_mot_geometry_batch',
     }:
         from .mot_dataset import (
             MOT_ACTION_CHUNKS,
             MOT_ACTION_SEQUENCE_LENGTH,
-            MotBalancedMixDataset,
-            MotGeometryLeRobotData,
-            MotPureLeRobotData,
             MotTrainData,
             load_manifest,
             mot_action_per_frame,
@@ -59,15 +48,11 @@ def __getattr__(name):
             relative_20d_to_absolute_actions,
             rotation_matrix_to_rot6d_cols,
             validate_mot_batch_for_forward,
-            validate_mot_geometry_batch,
         )
 
         values = {
             'MOT_ACTION_CHUNKS': MOT_ACTION_CHUNKS,
             'MOT_ACTION_SEQUENCE_LENGTH': MOT_ACTION_SEQUENCE_LENGTH,
-            'MotBalancedMixDataset': MotBalancedMixDataset,
-            'MotGeometryLeRobotData': MotGeometryLeRobotData,
-            'MotPureLeRobotData': MotPureLeRobotData,
             'MotTrainData': MotTrainData,
             'load_manifest': load_manifest,
             'mot_action_per_frame': mot_action_per_frame,
@@ -78,7 +63,6 @@ def __getattr__(name):
             'relative_20d_to_absolute_actions': relative_20d_to_absolute_actions,
             'rotation_matrix_to_rot6d_cols': rotation_matrix_to_rot6d_cols,
             'validate_mot_batch_for_forward': validate_mot_batch_for_forward,
-            'validate_mot_geometry_batch': validate_mot_geometry_batch,
         }
         return values[name]
     if name == 'build_real_mot_base_cache':

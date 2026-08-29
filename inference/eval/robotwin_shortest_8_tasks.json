@@ -1,0 +1,50 @@
+[
+  {
+    "task": "click_bell",
+    "mean_frames": 76.26,
+    "mean_duration_seconds": 1.5252,
+    "sample_count": 50
+  },
+  {
+    "task": "click_alarmclock",
+    "mean_frames": 83.8,
+    "mean_duration_seconds": 1.676,
+    "sample_count": 50
+  },
+  {
+    "task": "grab_roller",
+    "mean_frames": 93.14,
+    "mean_duration_seconds": 1.8628,
+    "sample_count": 50
+  },
+  {
+    "task": "turn_switch",
+    "mean_frames": 95.9,
+    "mean_duration_seconds": 1.918,
+    "sample_count": 50
+  },
+  {
+    "task": "lift_pot",
+    "mean_frames": 112.48,
+    "mean_duration_seconds": 2.2496,
+    "sample_count": 50
+  },
+  {
+    "task": "beat_block_hammer",
+    "mean_frames": 114.44,
+    "mean_duration_seconds": 2.2888,
+    "sample_count": 50
+  },
+  {
+    "task": "move_playingcard_away",
+    "mean_frames": 116.28,
+    "mean_duration_seconds": 2.3256,
+    "sample_count": 50
+  },
+  {
+    "task": "press_stapler",
+    "mean_frames": 120.36,
+    "mean_duration_seconds": 2.4072,
+    "sample_count": 50
+  }
+]

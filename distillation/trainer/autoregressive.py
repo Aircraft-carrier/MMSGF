@@ -5,15 +5,28 @@ import json
 from pathlib import Path
 from typing import Any
 
-from distillation.mask_profile import generation_profile_contract, install_order_profile
+from distillation.mask_profile import generation_profile_contract
+from distillation.model.autoregressive_mot import (
+    AutoregressiveVAMOTTransformer3DModel,
+)
 from wan_va.train_mot import MOTTrainer
 
 
 class AutoregressiveTrainer(MOTTrainer):
-    def _load_transformer(self):
-        model = super()._load_transformer()
-        install_order_profile(model, self.config.distill.generation_shape)
-        return model
+    transformer_model_cls = AutoregressiveVAMOTTransformer3DModel
+    checkpoint_model_architecture = "autoregressive_va_mot_v1"
+
+    @classmethod
+    def _validate_transformer_checkpoint_layout(cls, checkpoint_path: Path):
+        """Allow parameter-compatible native VA exports for fresh initialization."""
+
+        try:
+            return super()._validate_transformer_checkpoint_layout(checkpoint_path)
+        except ValueError as autoregressive_error:
+            try:
+                return MOTTrainer._validate_transformer_checkpoint_layout(checkpoint_path)
+            except ValueError:
+                raise autoregressive_error
 
     def __init__(self, config: Any):
         if config.distill.resume_from is not None:
@@ -22,7 +35,6 @@ class AutoregressiveTrainer(MOTTrainer):
         elif config.distill.student_init is not None:
             config.initialize_from = str(config.distill.student_init)
         super().__init__(config)
-        install_order_profile(self.transformer, config.distill.generation_shape)
 
     def _write_checkpoint_metadata(self, checkpoint_dir: Path, *, has_full_state: bool) -> None:
         super()._write_checkpoint_metadata(checkpoint_dir, has_full_state=has_full_state)
@@ -34,6 +46,7 @@ class AutoregressiveTrainer(MOTTrainer):
                 "exported_model": "student",
                 "step": int(self.step),
                 "optimizer_step": int(self.optimizer_step),
+                "model_architecture": self.checkpoint_model_architecture,
                 "generation_profile": generation_profile_contract(
                     self.config.distill.generation_shape
                 ),

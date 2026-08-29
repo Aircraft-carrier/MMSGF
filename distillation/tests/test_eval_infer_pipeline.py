@@ -1,0 +1,214 @@
+import numpy as np
+import torch
+from types import SimpleNamespace
+
+from distillation.eval.infer_pipeline import (
+    AutoregressiveMOTInferencePipeline,
+    OnlineMOTWindowBuilder,
+    StreamingVAECodec,
+    TextEmbedder,
+)
+from distillation.eval.protocol import CAMERA_KEYS, OnlineObservation
+
+
+def _observation(step: int) -> OnlineObservation:
+    image = np.full((4, 5, 3), step, dtype=np.uint8)
+    return OnlineObservation(
+        step=step,
+        images={key: image.copy() for key in CAMERA_KEYS},
+        state=np.array(
+            [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0],
+            dtype=np.float32,
+        ),
+    )
+
+
+def _stats():
+    return {"q01": [-1.0] * 20, "q99": [1.0] * 20}
+
+
+def test_online_window_matches_early_episode_video_and_action_layout() -> None:
+    builder = OnlineMOTWindowBuilder(_stats())
+    builder.append([_observation(0)], [])
+    first = builder.build()
+    assert first.video_valid.tolist() == [[False, False, False, False]]
+    assert not bool(first.action_valid.any())
+
+    observations = [_observation(step) for step in range(1, 17)]
+    actions = [observation.state.copy() for observation in observations]
+    builder.append(observations, actions)
+    window = builder.build()
+
+    assert window.video_valid.tolist() == [[False, False, False, True]]
+    assert window.history_rgb.shape == (13, 3, 3, 4, 5)
+    assert window.anchor_rgb.shape == (1, 3, 3, 4, 5)
+    assert window.history_actions.shape == (1, 20, 4, 16, 1)
+    assert window.action_valid[:, :, 3].all()
+    assert not window.action_valid[:, :, :3].any()
+    torch.testing.assert_close(window.history_actions[:, :, :3], torch.zeros_like(window.history_actions[:, :, :3]))
+
+
+def test_online_window_clone_only_commits_after_success() -> None:
+    builder = OnlineMOTWindowBuilder(_stats())
+    builder.append([_observation(0)], [])
+    candidate = builder.clone()
+    candidate.append([_observation(1)], [_observation(1).state])
+    assert builder.last_step == 0
+    assert candidate.last_step == 1
+
+
+def test_online_window_rejects_non_contiguous_steps() -> None:
+    builder = OnlineMOTWindowBuilder(_stats())
+    builder.append([_observation(0)], [])
+    try:
+        builder.append([_observation(2)], [_observation(2).state])
+    except ValueError as exc:
+        assert "expected observation step 1" in str(exc)
+    else:
+        raise AssertionError("non-contiguous steps were accepted")
+
+
+def test_online_codec_resizes_robotwin_rgb_to_training_resolution() -> None:
+    codec = StreamingVAECodec(
+        SimpleNamespace(dtype=torch.float32),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    video = codec._video(torch.zeros(13, 3, 240, 320))
+    assert video.shape == (1, 3, 13, 480, 640)
+
+
+def test_online_codec_decodes_generated_video_after_anchor() -> None:
+    class VAE:
+        dtype = torch.float32
+        config = SimpleNamespace(latents_mean=[0.0], latents_std=[1.0])
+
+        def decode(self, latent, return_dict=False):
+            assert not return_dict
+            return (torch.zeros(latent.shape[0], 3, 13, 2, 2),)
+
+    codec = StreamingVAECodec(
+        VAE(), device=torch.device("cpu"), dtype=torch.float32
+    )
+    payload = codec.decode_video(torch.zeros(1, 1, 4, 3, 1, 1))
+
+    assert payload["camera_keys"] == list(CAMERA_KEYS)
+    assert len(payload["frames"]) == 12
+    assert all(len(frame) == 3 for frame in payload["frames"])
+
+
+def test_online_text_embedder_zero_pads_like_training_cache() -> None:
+    class Tokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                input_ids=torch.zeros(1, 512, dtype=torch.long),
+                attention_mask=torch.tensor([[1, 1, 1] + [0] * 509]),
+            )
+
+    class Encoder:
+        def __call__(self, input_ids, attention_mask):
+            del attention_mask
+            hidden = torch.arange(1, 1 + 512 * 2, dtype=torch.float32).reshape(
+                1, 512, 2
+            )
+            return SimpleNamespace(last_hidden_state=hidden)
+
+    embedder = TextEmbedder.__new__(TextEmbedder)
+    embedder.tokenizer = Tokenizer()
+    embedder.encoder = Encoder()
+    embedder.device = torch.device("cpu")
+
+    result = embedder("instruction")
+
+    assert result.shape == (1, 512, 2)
+    assert torch.equal(result[:, :3], torch.arange(1, 7).reshape(1, 3, 2).float())
+    assert torch.count_nonzero(result[:, 3:]) == 0
+
+
+class _Codec:
+    def encode_history(self, rgb):
+        return torch.zeros(1, 1, 4, 3, 1, 1)
+
+    def encode_anchor(self, rgb):
+        return torch.zeros(1, 1, 1, 3, 1, 1)
+
+    def decode_one(self, latent):
+        return [str(int(latent[0, 0, 0, 0, 0, 0]))]
+
+
+class _Model:
+    def __init__(self):
+        self.commits = []
+
+    def commit_video(self, latent, *, frame_ids, **kwargs):
+        self.commits.append(("video", tuple(frame_ids)))
+
+    def commit_action(self, action, *, frame_ids, **kwargs):
+        self.commits.append(("action", tuple(frame_ids)))
+
+
+class _Pipeline(AutoregressiveMOTInferencePipeline):
+    def _euler_video(self, cache, text_emb, generator, frame_id):
+        return torch.full(self._target_video_shape, frame_id, dtype=self.dtype)
+
+    def _euler_action(self, cache, text_emb, generator, frame_id):
+        return torch.zeros(1, 20, 1, 16, 1, dtype=self.dtype)
+
+
+def _pipeline(prediction_chunks=1):
+    return _Pipeline(
+        model=_Model(),
+        codec=_Codec(),
+        text_embedder=lambda instruction: torch.zeros(1, 1, 1),
+        norm_stats_by_task={"task": _stats()},
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        video_num_steps=1,
+        action_num_steps=1,
+        video_snr_shift=1.0,
+        action_snr_shift=1.0,
+        prediction_chunks=prediction_chunks,
+    )
+
+
+def test_infer_commits_each_predicted_chunk_before_the_next() -> None:
+    pipeline = _pipeline(prediction_chunks=2)
+    pipeline.reset(task_name="task", instruction="do it", seed=0)
+
+    response = pipeline.infer(
+        observations=[_observation(0)],
+        executed_actions=[],
+        request_id=0,
+        return_video=True,
+    )
+
+    assert pipeline.model.commits[-4:] == [
+        ("video", (5,)),
+        ("action", (5,)),
+        ("video", (6,)),
+        ("action", (6,)),
+    ]
+    assert ("action", (4,)) not in pipeline.model.commits
+    assert len(response["actions"]) == 32
+    assert response["predicted_video"] == [["5"], ["6"]]
+
+
+def test_prediction_chunks_defaults_to_one_and_rejects_values_outside_one_to_three() -> None:
+    pipeline = _pipeline()
+    pipeline.reset(task_name="task", instruction="do it", seed=0)
+    response = pipeline.infer(
+        observations=[_observation(0)],
+        executed_actions=[],
+        request_id=0,
+        return_video=True,
+    )
+    assert len(response["actions"]) == 16
+    assert response["predicted_video"] == ["5"]
+
+    for prediction_chunks in (0, 4):
+        try:
+            _pipeline(prediction_chunks)
+        except ValueError as exc:
+            assert "between 1 and 3" in str(exc)
+        else:
+            raise AssertionError(f"prediction_chunks={prediction_chunks} was accepted")

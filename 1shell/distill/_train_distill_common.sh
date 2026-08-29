@@ -83,6 +83,12 @@ fi
 if [ -n "${DISTILL_ROLLOUT_ACTION_NUM_STEPS:-}" ]; then
     train_args+=(--rollout-action-num-steps "${DISTILL_ROLLOUT_ACTION_NUM_STEPS}")
 fi
+if [ -n "${DISTILL_VIDEO_DENOISY_STEP_LIST:-}" ]; then
+    train_args+=(--video-denoisy-step-list "${DISTILL_VIDEO_DENOISY_STEP_LIST}")
+fi
+if [ -n "${DISTILL_ACTION_DENOISY_STEP_LIST:-}" ]; then
+    train_args+=(--action-denoisy-step-list "${DISTILL_ACTION_DENOISY_STEP_LIST}")
+fi
 if [ -n "${DISTILL_ROLLOUT_HORIZON_FRAMES:-}" ]; then
     train_args+=(--rollout-horizon-frames "${DISTILL_ROLLOUT_HORIZON_FRAMES}")
 fi

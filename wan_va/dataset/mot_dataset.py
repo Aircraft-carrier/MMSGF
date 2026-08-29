@@ -13,12 +13,10 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset, get_worker_info
 from torchcodec.decoders import VideoDecoder
 
 from .action_cache import _cache_index_key, load_action_cache_index
-from .pointcloud_store import PointStore
 
 
 DEFAULT_UMI_DATA_ROOT = Path("/team_data/umi_data")
@@ -32,14 +30,12 @@ MOT_DEFAULT_ACTION_CHUNK_SIZE = 48
 MOT_DEFAULT_VIDEO_DOWNSAMPLE_RATIO = 4
 MOT_MAX_RIGHT_PADDING_RAW_STEPS = 16
 MOT_ACTION_CHUNKS = MOT_HISTORY_CHUNKS + MOT_TARGET_CHUNKS
-MOT_GEOMETRY_GROUP_SIZE = 4
 MOT_DEFAULT_VIDEO_DECODER_CACHE_SIZE = 256
-MOT_DEFAULT_POINT_STORE_CACHE_SIZE = 16
 MOT_DEFAULT_ACTION_CACHE_SIZE = 512
 MOT_SUPPORTED_VIEW_COUNTS = (2, 3)
 MOT_RUNTIME_CACHE_STAT_FIELDS = ("worker_id", "worker_pid") + tuple(
     f"{prefix}_{field}"
-    for prefix in ("video", "point", "action")
+    for prefix in ("video", "action")
     for field in ("size", "max_size", "hits", "misses", "puts", "evictions")
 )
 _MOT_RUNTIME_CACHE_STAT_STRUCT = struct.Struct(f"<{len(MOT_RUNTIME_CACHE_STAT_FIELDS)}q")
@@ -117,10 +113,6 @@ class _BoundedLRUCache:
         }
 
 
-def _close_point_store(store: PointStore) -> None:
-    store.close()
-
-
 def _close_action_cache_entry(arrays: tuple[np.ndarray, np.ndarray, np.ndarray]) -> None:
     for array in arrays:
         mmap = getattr(array, "_mmap", None)
@@ -173,18 +165,6 @@ def mot_action_per_frame(
     return video_downsample_ratio * vae_temporal_factor
 
 
-def mot_geometry_groups(
-    action_chunk_size: int,
-    video_downsample_ratio: int = MOT_DEFAULT_VIDEO_DOWNSAMPLE_RATIO,
-    vae_temporal_factor: int = WAN_VAE_TEMPORAL_FACTOR,
-) -> int:
-    return MOT_ACTION_CHUNKS * mot_latent_frames_per_action_chunk_per_view(
-        action_chunk_size,
-        video_downsample_ratio,
-        vae_temporal_factor,
-    )
-
-
 MOT_ACTION_CHUNK_SIZE = MOT_DEFAULT_ACTION_CHUNK_SIZE
 MOT_SAMPLED_VIDEO_FRAMES_PER_ACTION_CHUNK_PER_VIEW = mot_sampled_video_frames_per_action_chunk_per_view(
     MOT_ACTION_CHUNK_SIZE
@@ -193,7 +173,6 @@ MOT_LATENT_FRAMES_PER_ACTION_CHUNK_PER_VIEW = mot_latent_frames_per_action_chunk
 MOT_TARGET_ACTIONS = MOT_ACTION_CHUNK_SIZE
 MOT_ACTION_SEQUENCE_LENGTH = mot_action_sequence_length(MOT_ACTION_CHUNK_SIZE)
 MOT_ACTION_PER_FRAME = mot_action_per_frame()
-MOT_GEOMETRY_GROUPS = mot_geometry_groups(MOT_ACTION_CHUNK_SIZE)
 MOT_DATASET_MAX_SAMPLE_ATTEMPTS = 10
 MOT_VIDEO_TIMESTAMP_TOLERANCE_S = 1e-4
 MOT_VIDEO_FPS_TOLERANCE = 1e-4
@@ -275,34 +254,6 @@ def validate_dataset_index_bounds(rows: Iterable[dict[str, Any]], *, context: st
             )
 
 
-def _group_mot_frames(
-    frame_ids: list[int],
-    *,
-    latent_frames_per_action_chunk_per_view: int,
-) -> tuple[list[list[int]], list[list[bool]]]:
-    groups: list[list[int]] = []
-    masks: list[list[bool]] = []
-    cursor = 0
-    # history 和 target 两个 chunk 分别处理
-    for _chunk_idx in range(MOT_ACTION_CHUNKS):
-        for latent_idx in range(int(latent_frames_per_action_chunk_per_view)):
-            # VAE 第一帧会单独 encode，后续都是 4 帧一个 latent frame
-            group_len = 1 if latent_idx == 0 else MOT_GEOMETRY_GROUP_SIZE
-            # frame_ids 里按当前位置 cursor 切出当前 group 需要的 frame id
-            group = [int(value) for value in frame_ids[cursor : cursor + group_len]]
-            cursor += group_len
-            if len(group) != group_len:
-                raise ValueError(f"MOT geometry grouping expected {group_len} frames, got {len(group)}")
-            # 第一个 group 只有一帧，为了便于后续模型处理，padding 到 4 帧
-            padded = group + [group[-1]] * (MOT_GEOMETRY_GROUP_SIZE - group_len)
-            groups.append(padded)
-            # mask 标记
-            masks.append([True] * group_len + [False] * (MOT_GEOMETRY_GROUP_SIZE - group_len))
-    if cursor != len(frame_ids):
-        raise ValueError(f"MOT geometry grouping consumed {cursor} frames from {len(frame_ids)}")
-    return groups, masks
-
-
 def _latent_valid_mask_from_sampled_frames(
     raw_video_valid_mask: torch.Tensor,
     *,
@@ -334,34 +285,17 @@ def mot_real_window_frame_ids(
     current_frame: int,
     video_downsample_ratio: int,
     action_chunk_size: int = MOT_DEFAULT_ACTION_CHUNK_SIZE,
-) -> tuple[list[int], list[int], list[list[int]], list[list[bool]]]:
+) -> tuple[list[int], list[int]]:
     current_frame = int(current_frame)
     action_chunk_size = int(action_chunk_size)
     stride = int(video_downsample_ratio)
     if stride <= 0:
         raise ValueError(f"video_downsample_ratio must be positive, got {video_downsample_ratio}")
     sampled_frames_per_view = mot_sampled_video_frames_per_action_chunk_per_view(action_chunk_size, stride)
-    latent_frames_per_view = mot_latent_frames_per_action_chunk_per_view(action_chunk_size, stride)
     # 从 start idx开始，构建 history chunk idx 和 target chunk idx
     history_ids = [current_frame - action_chunk_size - 1 + idx * stride for idx in range(sampled_frames_per_view)]
     target_ids = [current_frame + idx * stride for idx in range(sampled_frames_per_view)]
-    # 每个 chunk 的 13 个 sampled frames 会被分成 4 个 latent groups
-    # 共 2 chunks * 4 latent groups = 8 geometry groups
-    geometry_ids, geometry_group_mask = _group_mot_frames(
-        history_ids + target_ids,
-        latent_frames_per_action_chunk_per_view=latent_frames_per_view,
-    )
-    # geometry_ids, geometry_group_mask都是二维列表，输出类似：
-    # history latent 0: [0,0,0,0], mask [T,F,F,F]
-    # history latent 1: [1,2,3,4], mask [T,T,T,T]
-    # target latent 0: xxx  mask [T,F,F,F]
-    # target latent 1: xxx, mask [T,T,T,T]
-    # NOTE: 核心就是让后续 G-branch 可以构造与视频 latent 时间对齐的 register token，从而做 MOT attention
-    return history_ids, target_ids, geometry_ids, geometry_group_mask
-
-
-def _flatten_groups(groups: list[list[int]]) -> list[int]:
-    return [int(value) for group in groups for value in group]
+    return history_ids, target_ids
 
 
 def _allocate_weighted_counts(total: int, weights: Iterable[float]) -> list[int]:
@@ -490,69 +424,6 @@ def relative_20d_to_absolute_actions(reference_states: np.ndarray, relative_acti
     return out
 
 
-class MotBalancedMixDataset(Dataset):
-    def __init__(self, pointcloud_dataset: Dataset, pure_dataset: Dataset):
-        if len(pointcloud_dataset) <= 0:
-            raise ValueError("pointcloud_dataset must not be empty")
-        if len(pure_dataset) <= 0:
-            raise ValueError("pure_dataset must not be empty")
-        self.pointcloud_dataset = pointcloud_dataset
-        self.pure_dataset = pure_dataset
-        pointcloud_views = set(pointcloud_dataset.view_buckets)
-        pure_views = set(pure_dataset.view_buckets)
-        if pointcloud_views != pure_views:
-            raise ValueError(
-                "pointcloud and non-pointcloud sources must expose the same "
-                "nonempty native-view domain"
-            )
-        self.available_view_counts = tuple(sorted(pointcloud_views))
-        self._pairs = max(len(pointcloud_dataset), len(pure_dataset))
-
-    def __len__(self) -> int:
-        return 2 * self._pairs
-
-    @staticmethod
-    def encode_source_index(source: int, row_index: int) -> int:
-        source = int(source)
-        if source not in (0, 1):
-            raise ValueError(f"source must be 0 or 1, got {source}")
-        return 2 * int(row_index) + source
-
-    def _getitem_with_fallback(self, dataset: Dataset, start_idx: int, source_name: str) -> dict[str, Any]:
-        size = len(dataset)
-        if isinstance(dataset, MotTrainData):
-            return dataset[int(start_idx) % size]
-        last_exc = None
-        attempts = min(size, MOT_DATASET_MAX_SAMPLE_ATTEMPTS)
-        for offset in range(attempts):
-            sample_idx = (int(start_idx) + offset) % size
-            try:
-                return dataset[sample_idx]
-            except Exception as exc:
-                last_exc = exc
-                print(
-                    f"[MotBalancedMixDataset] skipped failed {source_name} sample idx={sample_idx}: {exc}",
-                    flush=True,
-                )
-        raise RuntimeError(
-            f"Failed to load {source_name} sample after {attempts} attempts starting at idx={int(start_idx) % size}"
-        ) from last_exc
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        pair_idx = int(idx) // 2
-        if int(idx) % 2 == 0:
-            return self._getitem_with_fallback(
-                self.pointcloud_dataset,
-                pair_idx % len(self.pointcloud_dataset),
-                "pointcloud",
-            )
-        return self._getitem_with_fallback(
-            self.pure_dataset,
-            pair_idx % len(self.pure_dataset),
-            "non_pointcloud",
-        )
-
-
 class MotTrainData(Dataset):
     def __init__(
         self,
@@ -563,37 +434,22 @@ class MotTrainData(Dataset):
         norm_stats_by_task: dict[str, dict[str, Any]],
         action_chunk_size: int,
         video_downsample_ratio: int,
-        text_emb_cache_path: str | Path,
+        text_emb_cache_path: str | Path | None,
         empty_emb_path: str | Path | None = None,
+        text_emb_cache: dict[str, torch.Tensor] | None = None,
         action_cache_manifest_path: str | Path | None = None,
         video_decoder_cache_size: int = MOT_DEFAULT_VIDEO_DECODER_CACHE_SIZE,
-        point_store_cache_size: int = MOT_DEFAULT_POINT_STORE_CACHE_SIZE,
         action_cache_size: int = MOT_DEFAULT_ACTION_CACHE_SIZE,
         random_start: bool = True,
-        data_profile: str = "joint",
     ):
-        self.data_profile = str(data_profile)
-        if self.data_profile not in {"geometry", "joint"}:
-            raise ValueError(
-                f"data_profile must be 'geometry' or 'joint', got {data_profile!r}"
-            )
         self._video_decoder_cache = _BoundedLRUCache(
             video_decoder_cache_size,
             name="video_decoder_cache_size",
         )
-        self._point_store_cache = _BoundedLRUCache(
-            point_store_cache_size,
-            name="point_store_cache_size",
-            on_evict=_close_point_store,
-        )
-        self._action_cache = (
-            _BoundedLRUCache(
-                action_cache_size,
-                name="action_cache_size",
-                on_evict=_close_action_cache_entry,
-            )
-            if self.data_profile == "joint"
-            else None
+        self._action_cache = _BoundedLRUCache(
+            action_cache_size,
+            name="action_cache_size",
+            on_evict=_close_action_cache_entry,
         )
         self.manifest_path = Path(manifest_path)
         self.rows = load_manifest(self.manifest_path)
@@ -622,7 +478,7 @@ class MotTrainData(Dataset):
         validate_dataset_index_bounds(self.rows, context=str(self.manifest_path))
         self.action_sequence_length = int(action_sequence_length)
         self.action_dim = int(action_dim)
-        if self.data_profile == "joint" and self.action_dim != RELATIVE_ACTION_DIM:
+        if self.action_dim != RELATIVE_ACTION_DIM:
             raise ValueError(f"MOT real dataset requires action_dim={RELATIVE_ACTION_DIM}, got {self.action_dim}")
         self.norm_stats_by_task = norm_stats_by_task
         self.action_chunk_size = int(action_chunk_size)
@@ -650,26 +506,23 @@ class MotTrainData(Dataset):
         self.total_latent_frames = self.history_latent_frames + self.target_latent_frames
         self.vae_input_frame_count = self.sampled_video_frames_per_action_chunk_per_view
         self.target_actions = self.action_chunk_size
-        self.geometry_groups = mot_geometry_groups(self.action_chunk_size, self.video_downsample_ratio)
-        self.geometry_group_size = MOT_GEOMETRY_GROUP_SIZE
         self.action_chunks = MOT_ACTION_CHUNKS
         expected_sequence_length = mot_action_sequence_length(self.action_chunk_size)
-        if self.data_profile == "joint" and self.action_sequence_length != expected_sequence_length:
+        if self.action_sequence_length != expected_sequence_length:
             raise ValueError(
                 f"action_sequence_length={self.action_sequence_length} must equal action_chunk_size+1={expected_sequence_length}"
             )
-        if self.data_profile == "joint":
-            self.text_emb_cache = torch.load(text_emb_cache_path, map_location="cpu", weights_only=False)
-            self.empty_text_emb = (
-                torch.load(empty_emb_path, map_location="cpu", weights_only=False)
-                if empty_emb_path is not None
-                else None
-            )
-            self._action_cache_index = load_action_cache_index(action_cache_manifest_path)
-        else:
-            self.text_emb_cache = None
-            self.empty_text_emb = None
-            self._action_cache_index = {}
+        if text_emb_cache is None:
+            if text_emb_cache_path is None:
+                raise ValueError("text_emb_cache_path is required unless text_emb_cache is supplied")
+            text_emb_cache = torch.load(text_emb_cache_path, map_location="cpu", weights_only=False)
+        self.text_emb_cache = text_emb_cache
+        self.empty_text_emb = (
+            torch.load(empty_emb_path, map_location="cpu", weights_only=False)
+            if empty_emb_path is not None
+            else None
+        )
+        self._action_cache_index = load_action_cache_index(action_cache_manifest_path)
         self.video_timestamp_tolerance_s = MOT_VIDEO_TIMESTAMP_TOLERANCE_S
 
     def __len__(self) -> int:
@@ -688,7 +541,6 @@ class MotTrainData(Dataset):
         }
         for prefix, cache in (
             ("video", self._video_decoder_cache),
-            ("point", self._point_store_cache),
             ("action", self._action_cache),
         ):
             cache_stats = (
@@ -707,8 +559,6 @@ class MotTrainData(Dataset):
         return encode_mot_runtime_cache_stats(stats)
 
     def _text_emb_for(self, text: str) -> torch.Tensor:
-        if self.text_emb_cache is None:
-            raise RuntimeError("text embeddings are unavailable in the geometry data profile")
         if text in self.text_emb_cache:
             return self.text_emb_cache[text]
         raise KeyError(f"No text embedding for prompt {text!r}")
@@ -733,102 +583,6 @@ class MotTrainData(Dataset):
         valid = torch.tensor([first_valid <= int(frame_id) <= last_valid for frame_id in frame_ids], dtype=torch.bool)
         return padded, valid
 
-    def _materialize_geometry_fields(
-        self,
-        row: dict[str, Any],
-        *,
-        padded_geometry_frame_ids: list[int],
-        geometry_flat_valid_mask: torch.Tensor,
-        geometry_group_mask: list[list[bool]],
-        decoded_rgb: torch.Tensor,
-        decoded_position: dict[int, int],
-    ) -> dict[str, torch.Tensor]:
-        geometry_positions = torch.tensor(
-            [decoded_position[frame_id] for frame_id in padded_geometry_frame_ids],
-            dtype=torch.long,
-            device=decoded_rgb.device,
-        )
-        geometry_rgb_flat = decoded_rgb.index_select(0, geometry_positions)
-        geometry_rgb = geometry_rgb_flat.reshape(
-            self.geometry_groups,
-            self.geometry_group_size,
-            *geometry_rgb_flat.shape[1:],
-        )
-        decoded_pts3d, decoded_point_valid_mask = self._load_points(
-            row,
-            list(decoded_position),
-            target_h_w=tuple(decoded_rgb.shape[-2:]),
-        )
-        geometry_pts3d_flat = decoded_pts3d.index_select(0, geometry_positions)
-        geometry_point_valid_mask = decoded_point_valid_mask.index_select(
-            0,
-            geometry_positions,
-        )
-        geometry_group_valid_mask = torch.tensor(
-            geometry_group_mask,
-            dtype=torch.bool,
-        ) & geometry_flat_valid_mask.reshape(
-            self.geometry_groups,
-            self.geometry_group_size,
-        )
-        geometry_pts3d = geometry_pts3d_flat.reshape(
-            self.geometry_groups,
-            self.geometry_group_size,
-            *geometry_pts3d_flat.shape[1:],
-        )
-        geometry_point_valid_mask = geometry_point_valid_mask.reshape(
-            self.geometry_groups,
-            self.geometry_group_size,
-            *geometry_point_valid_mask.shape[1:],
-        )
-        geometry_point_valid_mask = geometry_point_valid_mask & geometry_group_valid_mask[:, :, None, None, None]
-        return {
-            "geometry_rgb": geometry_rgb,
-            "geometry_pts3d": geometry_pts3d,
-            "geometry_point_valid_mask": geometry_point_valid_mask,
-            "geometry_group_valid_mask": geometry_group_valid_mask,
-        }
-
-    def _getitem_geometry_window(
-        self,
-        row: dict[str, Any],
-        *,
-        start_frame: int | None = None,
-    ) -> dict[str, Any]:
-        start = (
-            self._sample_start_from_range(row["valid_start_range"])
-            if start_frame is None
-            else int(start_frame)
-        )
-        _history, _target, geometry_frame_groups, geometry_group_mask = mot_real_window_frame_ids(
-            current_frame=start,
-            video_downsample_ratio=self.video_downsample_ratio,
-            action_chunk_size=self.action_chunk_size,
-        )
-        padded_geometry_frame_ids, geometry_flat_valid_mask = self._pad_frame_ids_to_segment(
-            row,
-            _flatten_groups(geometry_frame_groups),
-        )
-        unique_frame_ids = list(dict.fromkeys(padded_geometry_frame_ids))
-        decoded_rgb = self._load_rgb(row, unique_frame_ids)
-        decoded_position = {
-            frame_id: index for index, frame_id in enumerate(unique_frame_ids)
-        }
-        out = self._materialize_geometry_fields(
-            row,
-            padded_geometry_frame_ids=padded_geometry_frame_ids,
-            geometry_flat_valid_mask=geometry_flat_valid_mask,
-            geometry_group_mask=geometry_group_mask,
-            decoded_rgb=decoded_rgb,
-            decoded_position=decoded_position,
-        )
-        out.update(
-            has_pointcloud=torch.tensor(True, dtype=torch.bool),
-            dataset_skip_count=torch.tensor(0, dtype=torch.int64),
-            _runtime_cache_stats=self._runtime_cache_stats(),
-        )
-        return out
-
     def __getitem__(self, idx: int) -> dict[str, Any]:
         requested_index = int(idx) % len(self.rows)
         view_count, start_position = self._row_bucket_positions[requested_index]
@@ -837,34 +591,24 @@ class MotTrainData(Dataset):
         attempts = min(len(bucket), MOT_DATASET_MAX_SAMPLE_ATTEMPTS)
         for offset in range(attempts):
             sample_idx = bucket[(start_position + offset) % len(bucket)]
-            # 先选一条 episode
-            row = self.rows[sample_idx]
             try:
-                # 再从 episode 选实际用于训练的 chunk
-                sample = (
-                    self._getitem_geometry_window(row)
-                    if self.data_profile == "geometry"
-                    else self._getitem_window(row, sample_index=sample_idx)
-                )
-                sample["has_pointcloud"] = torch.tensor(bool(row.get("has_pointcloud")), dtype=torch.bool)
+                sample = self._getitem_window(self.rows[sample_idx], sample_index=sample_idx)
                 sample["dataset_skip_count"] = torch.tensor(offset, dtype=torch.int64)
                 return sample
             except Exception as exc:
                 last_exc = exc
-                print(
-                    f"[MotTrainData] skipped failed sample idx={sample_idx}: {exc}",
-                    flush=True,
-                )
+                print(f"[MotTrainData] skipped failed sample idx={sample_idx}: {exc}", flush=True)
         raise RuntimeError(
             "Failed to load MOT sample within the requested native-view bucket "
             f"V={view_count} after {attempts} attempts starting at idx={requested_index}"
         ) from last_exc
 
     def get_window(self, idx: int, start_frame: int) -> dict[str, Any]:
-        row = self.rows[idx % len(self.rows)]
-        if self.data_profile == "geometry":
-            return self._getitem_geometry_window(row, start_frame=start_frame)
-        return self._getitem_window(row, start_frame=start_frame, sample_index=idx)
+        return self._getitem_window(
+            self.rows[idx % len(self.rows)],
+            start_frame=start_frame,
+            sample_index=idx,
+        )
 
     def _getitem_window(
         self,
@@ -874,21 +618,17 @@ class MotTrainData(Dataset):
     ) -> dict[str, Any]:
         # 在 episode 采样 idx
         start = self._sample_start_from_range(row["valid_start_range"]) if start_frame is None else int(start_frame)
-        # 训练用的 segment 的 video idx，其中 geometry 部分是二维列表，以默认参数为例，就是 8 个 group（对应 VAE 后的 8 个 latent frame），每组 4 个 slot
-        # 这里返回的根据 current_frame直接算出来的，没有考虑越界，越界在下面代码进行 padding
-        history_frame_ids, target_frame_ids, geometry_frame_groups, geometry_group_mask = mot_real_window_frame_ids(
+        history_frame_ids, target_frame_ids = mot_real_window_frame_ids(
             current_frame=start,
             video_downsample_ratio=self.video_downsample_ratio,
             action_chunk_size=self.action_chunk_size,
         )
         frame_ids = history_frame_ids + target_frame_ids
-        geometry_frame_ids = _flatten_groups(geometry_frame_groups)
 
         # 处理越界，用 vaild episode idx 做 padding，同时生成 mask
         padded_frame_ids, raw_video_valid_mask = self._pad_frame_ids_to_segment(row, frame_ids)
         history_raw_video_valid_mask = raw_video_valid_mask[: self.sampled_video_frames_per_action_chunk_per_view]
         target_raw_video_valid_mask = raw_video_valid_mask[self.sampled_video_frames_per_action_chunk_per_view :]
-        padded_geometry_frame_ids, geometry_flat_valid_mask = self._pad_frame_ids_to_segment(row, geometry_frame_ids)
 
         # 把 raw-video mask 转换为 latent frame mask，这里只有全为 padding 时，对应的 latent frame mask 才是 False
         # TODO: 这里是为了兼容另一种设计：只要有 padding 就为 False，当前觉得上面那种更好
@@ -932,19 +672,18 @@ class MotTrainData(Dataset):
         rgb = decoded_rgb.index_select(0, frame_positions)
         vae_rgb_history = rgb[: self.sampled_video_frames_per_action_chunk_per_view]
         vae_rgb_target = rgb[self.sampled_video_frames_per_action_chunk_per_view :]
-        geometry_fields = self._materialize_geometry_fields(
-            row,
-            padded_geometry_frame_ids=padded_geometry_frame_ids,
-            geometry_flat_valid_mask=geometry_flat_valid_mask,
-            geometry_group_mask=geometry_group_mask,
-            decoded_rgb=decoded_rgb,
-            decoded_position=decoded_position,
-        )
         text = row["segment"]["action_text"]
         out = {
             "vae_rgb_history": vae_rgb_history,
             "vae_rgb_target": vae_rgb_target,
-            **geometry_fields,
+            "text": text,
+            "frame_ids": torch.tensor(padded_frame_ids, dtype=torch.long),
+            "requested_frame_ids": torch.tensor(frame_ids, dtype=torch.long),
+            "fps": torch.tensor(float(row["fps"]), dtype=torch.float32),
+            "view_names": [
+                str(view.get("video_key", f"stream_{_stream_id_for_view(view)}"))
+                for view in row["views"]
+            ],
             "stream_ids": torch.tensor([_stream_id_for_view(view) for view in row["views"]], dtype=torch.long),
             "video_latent_loss_mask": video_latent_loss_mask,
             "video_latent_valid_mask": video_latent_valid_mask,
@@ -955,7 +694,6 @@ class MotTrainData(Dataset):
             "action_q99": torch.from_numpy(action_q99[0]).float(),
             "action_reference_states": action_reference_states,
             "text_emb": self._text_emb_for(text),
-            "has_pointcloud": torch.tensor(bool(row.get("has_pointcloud")), dtype=torch.bool),
             "dataset_skip_count": torch.tensor(0, dtype=torch.int64),
             "_runtime_cache_stats": self._runtime_cache_stats(),
         }
@@ -1069,49 +807,6 @@ class MotTrainData(Dataset):
             )
             view_tensors.append(frames)
         return torch.stack(view_tensors, dim=1)
-
-    def _point_store(self, view: dict[str, Any]) -> PointStore:
-        store_dir = Path(view["preprocessed_pointcloud_dir"])
-        cached = self._point_store_cache.get(store_dir)
-        if cached is not None:
-            return cached
-        store = PointStore.open(store_dir)
-        self._point_store_cache.put(store_dir, store)
-        return store
-
-    def _load_points(
-        self,
-        row: dict[str, Any],
-        local_frame_ids: list[int],
-        target_h_w: tuple[int, int] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not bool(row.get("has_pointcloud")):
-            if target_h_w is None:
-                raise ValueError("target_h_w is required for non-pointcloud rows")
-            frames = len(local_frame_ids)
-            views = len(row["views"])
-            height, width = int(target_h_w[0]), int(target_h_w[1])
-            points = torch.zeros(frames, views, height, width, 3, dtype=torch.float32)
-            mask = torch.zeros(frames, views, height, width, dtype=torch.bool)
-            return points, mask
-
-        per_frame_points = []
-        per_frame_masks = []
-        for frame_id in local_frame_ids:
-            view_points = []
-            view_masks = []
-            for view in row["views"]:
-                store = self._point_store(view)
-                row_idx = store.row_for_episode_frame(int(frame_id))
-                if row_idx < 0:
-                    raise KeyError(f"No preprocessed pointcloud row covers episode frame {int(frame_id)} in {store.root}")
-                points_t = torch.from_numpy(np.array(store.points[row_idx], copy=True)).float()
-                mask_t = torch.from_numpy(np.array(store.valid_mask[row_idx], copy=True)).bool()
-                view_points.append(points_t)
-                view_masks.append(mask_t)
-            per_frame_points.append(torch.stack(view_points, dim=0))
-            per_frame_masks.append(torch.stack(view_masks, dim=0))
-        return torch.stack(per_frame_points, dim=0).float(), torch.stack(per_frame_masks, dim=0).bool()
 
     def _load_action_state_index_arrays(self, row: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         data_file = Path(row["data_file"])
@@ -1269,134 +964,15 @@ class MotTrainData(Dataset):
 
 
 
-class MotGeometryLeRobotData(MotTrainData):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if not all(bool(row.get("has_pointcloud")) for row in self.rows):
-            raise ValueError("MotGeometryLeRobotData requires all rows to have pointcloud labels")
-        for row in self.rows:
-            for view in row.get("views", []):
-                if "preprocessed_pointcloud_dir" not in view:
-                    raise ValueError(
-                        "Pointcloud training manifest must use preprocessed_pointcloud_dir. "
-                        "Regenerate pointcloud stores with the source-specific pointcloud pipeline, "
-                        "then rebuild the train manifest."
-                    )
-
-
-class MotPureLeRobotData(MotTrainData):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if any(bool(row.get("has_pointcloud")) for row in self.rows):
-            raise ValueError("MotPureLeRobotData requires all rows to be non-pointcloud rows")
-
-
-def _validate_geometry_batch_shapes(
-    batch: dict[str, Any],
-    *,
-    expected_frames: int | None = None,
-) -> tuple[int, int]:
-    required = (
-        "geometry_rgb",
-        "geometry_pts3d",
-        "geometry_point_valid_mask",
-        "geometry_group_valid_mask",
-    )
-    missing = [key for key in required if key not in batch]
-    if missing:
-        raise KeyError(f"MOT batch missing geometry fields: {missing}")
-
-    geometry_rgb = batch["geometry_rgb"]
-    geometry_pts3d = batch["geometry_pts3d"]
-    if geometry_rgb.ndim != 7:
-        raise ValueError(
-            "geometry_rgb must be [B,G,4,V,C,H,W], "
-            f"got {tuple(geometry_rgb.shape)}"
-        )
-    batch_size, groups, group_size, views, channels, height, width = geometry_rgb.shape
-    if expected_frames is not None and groups != int(expected_frames):
-        raise ValueError(
-            f"geometry_rgb must contain G={int(expected_frames)} groups, got {groups}"
-        )
-    if group_size != MOT_GEOMETRY_GROUP_SIZE:
-        raise ValueError(
-            f"geometry_rgb must use S={MOT_GEOMETRY_GROUP_SIZE}, got {group_size}"
-        )
-    if views not in MOT_SUPPORTED_VIEW_COUNTS:
-        raise ValueError(
-            f"geometry batch must use native V in {MOT_SUPPORTED_VIEW_COUNTS}, got {views}"
-        )
-    if channels != 3:
-        raise ValueError(f"geometry_rgb must have C=3, got {channels}")
-
-    expected_points = (batch_size, groups, group_size, views, height, width, 3)
-    if tuple(geometry_pts3d.shape) != expected_points:
-        raise ValueError(
-            f"geometry_pts3d must be {expected_points}, got {tuple(geometry_pts3d.shape)}"
-        )
-    if tuple(batch["geometry_point_valid_mask"].shape) != expected_points[:-1]:
-        raise ValueError(
-            "geometry_point_valid_mask shape "
-            f"{tuple(batch['geometry_point_valid_mask'].shape)} does not match "
-            f"geometry_pts3d {tuple(geometry_pts3d.shape)}"
-        )
-    expected_slots = (batch_size, groups, group_size)
-    if tuple(batch["geometry_group_valid_mask"].shape) != expected_slots:
-        raise ValueError(
-            f"geometry_group_valid_mask must be {expected_slots}, "
-            f"got {tuple(batch['geometry_group_valid_mask'].shape)}"
-        )
-    return batch_size, views
-
-
-def validate_mot_geometry_batch(
-    batch: dict[str, Any],
-    action_sequence_length: int | None = None,
-) -> dict[str, list[int]]:
-    expected_frames = (
-        None
-        if action_sequence_length is None
-        else mot_geometry_groups(int(action_sequence_length) - 1)
-    )
-    batch_size, _views = _validate_geometry_batch_shapes(
-        batch,
-        expected_frames=expected_frames,
-    )
-    if "has_pointcloud" not in batch:
-        raise KeyError("MOT geometry batch missing has_pointcloud")
-    has_pointcloud = torch.as_tensor(batch["has_pointcloud"], dtype=torch.bool)
-    if tuple(has_pointcloud.shape) != (batch_size,):
-        raise ValueError(
-            f"has_pointcloud must be [B], got {tuple(has_pointcloud.shape)}"
-        )
-    if not bool(has_pointcloud.all().item()):
-        raise ValueError("geometry-only training requires pointcloud labels for every sample")
-    return {
-        key: list(value.shape)
-        for key, value in batch.items()
-        if torch.is_tensor(value)
-    }
-
-
 def validate_mot_batch_for_forward(batch: dict[str, Any], action_sequence_length: int | None = None) -> dict[str, list[int]]:
     required = (
-        "latents",
-        "actions",
-        "action_loss_mask",
-        "action_valid_mask",
-        "text_emb",
-        "stream_ids",
-        "video_latent_loss_mask",
+        "latents", "actions", "action_loss_mask", "action_valid_mask",
+        "text_emb", "stream_ids", "video_latent_loss_mask",
         "video_latent_valid_mask",
-        "geometry_rgb",
-        "geometry_pts3d",
-        "geometry_point_valid_mask",
-        "geometry_group_valid_mask",
     )
     missing = [key for key in required if key not in batch]
     if missing:
         raise KeyError(f"MOT batch missing keys required by forward_train: {missing}")
-
     latents = batch["latents"]
     actions = batch["actions"]
     stream_ids = batch["stream_ids"]
@@ -1404,51 +980,35 @@ def validate_mot_batch_for_forward(batch: dict[str, Any], action_sequence_length
         raise ValueError(f"latents must be [B,C,F,V,H,W], got {tuple(latents.shape)}")
     if actions.ndim != 5:
         raise ValueError(f"actions must be [B,C,F,N,1], got {tuple(actions.shape)}")
-
     if action_sequence_length is None:
         if actions.shape[2] % MOT_ACTION_CHUNKS != 0:
-            raise ValueError(f"action frames must be divisible by {MOT_ACTION_CHUNKS}, got {actions.shape[2]}")
+            raise ValueError(f"action frames must be divisible by {MOT_ACTION_CHUNKS}")
         action_chunk_size = (actions.shape[2] // MOT_ACTION_CHUNKS - 1) * actions.shape[3]
     else:
         action_chunk_size = int(action_sequence_length) - 1
-    expected_frames = mot_geometry_groups(action_chunk_size)
+    expected_frames = MOT_ACTION_CHUNKS * mot_latent_frames_per_action_chunk_per_view(action_chunk_size)
     expected_action_per_frame = mot_action_per_frame()
     batch_size, _, latent_frames, views = latents.shape[:4]
-    geometry_batch_size, geometry_views = _validate_geometry_batch_shapes(
-        batch,
-        expected_frames=expected_frames,
-    )
-    if (geometry_batch_size, geometry_views) != (batch_size, views):
-        raise ValueError(
-            "geometry batch/view axes must match latents: "
-            f"geometry={(geometry_batch_size, geometry_views)}, "
-            f"latents={(batch_size, views)}"
-        )
-
     if latent_frames != expected_frames:
-        raise ValueError(f"latents must contain {expected_frames} MOT latent groups, got {latent_frames}")
+        raise ValueError(f"latents must contain {expected_frames} frames, got {latent_frames}")
     if actions.shape[2:] != (expected_frames, expected_action_per_frame, 1):
         raise ValueError(
-            f"actions must use MOT latent-frame packing [{expected_frames},{expected_action_per_frame},1], "
+            f"actions must use [{expected_frames},{expected_action_per_frame},1], "
             f"got {tuple(actions.shape[2:])}"
         )
     for name in ("action_loss_mask", "action_valid_mask"):
         if batch[name].shape != actions.shape:
-            raise ValueError(f"{name} shape {tuple(batch[name].shape)} does not match actions {tuple(actions.shape)}")
+            raise ValueError(f"{name} shape does not match actions")
     for name in ("video_latent_loss_mask", "video_latent_valid_mask"):
         if batch[name].shape != (batch_size, expected_frames):
-            raise ValueError(f"{name} must be [B,{expected_frames}], got {tuple(batch[name].shape)}")
+            raise ValueError(f"{name} must be [B,{expected_frames}]")
     if stream_ids.shape != (batch_size, views):
         raise ValueError(f"stream_ids must be [B,V], got {tuple(stream_ids.shape)}")
-    valid_stream_ids = (
-        (stream_ids >= STREAM_LEFT_WRIST) & (stream_ids <= STREAM_RIGHT_WRIST)
-    )
+    valid_stream_ids = (stream_ids >= STREAM_LEFT_WRIST) & (stream_ids <= STREAM_RIGHT_WRIST)
     if not bool(valid_stream_ids.all().item()):
-        raise ValueError(
-            "stream_ids must use LEFT_WRIST=0, HEAD=1, RIGHT_WRIST=2"
-        )
+        raise ValueError("stream_ids must use LEFT_WRIST=0, HEAD=1, RIGHT_WRIST=2")
     if action_sequence_length is not None and int(action_sequence_length) != mot_action_sequence_length(action_chunk_size):
         raise ValueError(
-            f"action_sequence_length must be {mot_action_sequence_length(action_chunk_size)}, got {action_sequence_length}"
+            f"action_sequence_length must be {mot_action_sequence_length(action_chunk_size)}"
         )
     return {key: list(value.shape) for key, value in batch.items() if torch.is_tensor(value)}

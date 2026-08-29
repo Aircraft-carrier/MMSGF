@@ -1,361 +1,626 @@
-"""Shared distillation trainer runtime."""
+"""Simplified standalone distillation trainer base (data + common prep).
+
+Deliberately does NOT inherit ``MOTTrainer``. The base owns device setup, MOT
+data loading, VAE/text initialization, latent preprocessing, the microstep loop
+and checkpoint save/load. Subclasses own schedulers, optimizers, model
+initialization from paths (``_build_method_model``) and FSDP/AC wrapping
+(``_wrap_method_models``), which hands wrapped models back to the method model
+via ``attach_wrapped_models``.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
+import random
 from typing import Any, Literal
 
+import numpy as np
 import torch
-
-from distillation.checkpoint import DistillationCheckpointIO
-from distillation.mask_profile import (
-    install_order_profile,
-    validate_checkpoint_generation_profile,
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    get_state_dict,
+    set_state_dict,
 )
+from torch.utils.data import DataLoader
+from safetensors.torch import save_file
+
+from distillation.mask_profile import generation_profile_contract
+from distillation.rollout_visualization import RolloutVisualizer
 from distillation.schema import TrainingStepResult
-from wan_va.train_mot import MOTTrainer
+from wan_va.dataset.mot_dataset import validate_mot_batch_for_forward
+from wan_va.modules.utils import WanVAEStreamingWrapper, load_vae
+from wan_va.mot_spec import mot_spec_from_config
+from wan_va.train_mot import (
+    _apply_cfg_text_dropout,
+    _build_mot_train_sampler,
+    _configure_adamw_foreach,
+    _mot_dataloader_kwargs,
+    _move_to_device,
+    _seed_mot_training,
+    build_mot_param_groups,
+    build_mot_train_dataset,
+)
+from wan_va.utils import warmup_constant_lambda
 
 
 @dataclass(frozen=True, slots=True)
 class OptimizationTarget:
-    name: Literal["student", "fake_score"]
+    name: Literal["generator", "fake_score"]
     optimizer: torch.optim.Optimizer
     model: torch.nn.Module
 
 
-class DistillationTrainerBase(MOTTrainer):
-    """Stage2/3 shared runtime from dataloader batch to optimizer/checkpoint.
+class DistillationTrainerBase:
+    """Common trainer preparation: data loading and preprocessing.
 
-    数据准备有两条合法入口：
+    Subclass contract:
 
-    1. cached latent batch 已含 ``latents [B,48,8,V,Hl,Wl]``，直接使用；
-    2. RGB batch 含 ``vae_rgb_history`` 与 ``vae_rgb_target``，调用父类 streaming
-       VAE 逐 batch/逐 view 编码，再沿 frame 轴拼成同样的 8-frame latent。
-
-    ``actions [B,20,8,16,1]``、V/A loss/valid mask、text embedding、geometry
-    RGB/point/mask 和 ``stream_ids [B,V]`` 都继续来自原生 MOT dataset/collate。
-    ``convert_input_format`` 先递归搬 tensor 到当前 rank device；
-    ``_materialize_batch_latents`` 只在缺少 cached latent 时调用 VAE。蒸馏代码
-    不伪造真实 RGB/geometry schema，也不复制 dataset 逻辑。
-
-    本类只接管 stage-specific loss、双 optimizer/EMA hook 和 checkpoint；外层
-    epoch/step、view-aware sampler、日志、NaN 同步仍复用 ``MOTTrainer.train``。
+    - ``_build_method_model(config)``: construct the method model from paths.
+    - ``_wrap_method_models()``: FSDP/AC wrap and ``attach_wrapped_models``.
+    - ``_optimization_target`` / ``_compute_training_step`` / ``_after_optimizer_step``.
     """
 
     method: str
 
-    def _load_transformer(self):
-        # MOTTrainer applies activation checkpoint wrappers immediately after
-        # this hook. Install the instance-local attention policy first so each
-        # wrapper preserves the patched block forward instead of being bypassed.
-        model = super()._load_transformer()
-        install_order_profile(model, self.config.distill.generation_shape)
-        return model
-
-    def __init__(self, config: Any):
+    def __init__(self, config: Any) -> None:
+        self.config = config
         self._resume_from = getattr(config.distill, "resume_from", None)
-        student_init = getattr(config.distill, "student_init", None)
+        self.device = torch.device(f"cuda:{config.local_rank}")
+        self.dtype = config.param_dtype
+        self.step = 0
+        self.optimizer_step = 0
+        self.gradient_accumulation_steps = int(
+            getattr(config, "gradient_accumulation_steps", 1)
+        )
+        self.save_interval = int(config.save_interval)
+        self.save_dir = Path(config.save_root) / "checkpoints"
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self._last_checkpoint_step = None
+        self.train_vae = None
+        self.empty_text_emb = None
 
-        # MOTTrainer only understands its top-level ``initialize_from`` and
-        # ``resume_from`` fields.  Distillation CLI arguments live under
-        # ``config.distill``; copy them before parent construction so the actual
-        # trainable student starts from the requested previous-stage export.
-        #
-        # Fresh stage2 example:
-        #   distill.student_init = stage1/checkpoint_step_2000
-        #   -> initialize_from    = the same checkpoint
-        #   -> parent loads stage1/transformer into ``self.transformer``
-        #
-        # Resume example:
-        #   distill.resume_from = stage2/checkpoint_step_4000
-        #   -> parent first materializes a model with the resume export layout;
-        #   -> DistillationCheckpointIO later restores raw student/optimizer/EMA.
-        # Clear the native env-derived resume field in both cases; otherwise an
-        # unrelated MOT_RESUME_FROM takes precedence over ``student_init``.
-        config.resume_from = None
-        if self._resume_from is not None:
-            config.initialize_from = str(Path(self._resume_from))
-        elif student_init is not None:
-            validate_checkpoint_generation_profile(
-                student_init,
-                config.distill.generation_shape,
-            )
-            config.initialize_from = str(Path(student_init))
-        else:
-            raise ValueError(
-                f"{self.method} requires distill.student_init for a fresh run"
-            )
+        _seed_mot_training(int(getattr(config, "train_seed", 42)))
+        self._build_dataloader(config)
 
-        super().__init__(config)
-        install_order_profile(self.transformer, config.distill.generation_shape)
+        self.model = self._build_method_model(config)
+        self._wrap_method_models()
+        self.rollout_visualizer = RolloutVisualizer(
+            config=config,
+            device=self.device,
+            rollout=self.rollout,
+            rollout_model=self._rollout_model,
+            get_vae=self._get_train_vae,
+        )
 
-        self.method_model = self._build_method_model(config)
-        self.checkpoint_io = DistillationCheckpointIO()
+    # Data loading ---------------------------------------------------------
 
-    @staticmethod
-    def _local_metric_value(value: Any) -> Any:
+    def _build_dataloader(self, config: Any) -> None:
+        train_dataset = build_mot_train_dataset(config)
+        train_sampler = _build_mot_train_sampler(train_dataset, config)
+        self.train_loader = DataLoader(
+            train_dataset,
+            **_mot_dataloader_kwargs(config, train_sampler),
+        )
+        self.train_loader_iter = iter(self.train_loader)
+
+    def _get_next_batch(self) -> dict[str, Any]:
         try:
-            from torch.distributed.tensor import DTensor
-        except Exception:
-            DTensor = ()
-        if torch.is_tensor(value) and isinstance(value, DTensor):
-            return value.to_local()
-        return value
+            return next(self.train_loader_iter)
+        except StopIteration:
+            self.train_loader_iter = iter(self.train_loader)
+            return next(self.train_loader_iter)
 
-    def _aggregate_log_records(self, records: list[dict[str, Any]]) -> dict[str, float]:
-        local_records = [
-            {key: self._local_metric_value(value) for key, value in record.items()}
-            for record in records
-        ]
-        return super()._aggregate_log_records(local_records)
+    # Model hooks ----------------------------------------------------------
 
     def _build_method_model(self, config: Any):
         raise NotImplementedError
 
-    def _prepare_joint_input_dict(self, batch_dict: dict, *, add_noise=True) -> dict:
-        """Reuse native field validation but apply the configured distill mask profile.
+    def _wrap_method_models(self) -> None:
+        """FSDP/AC wrap and hand models back via ``attach_wrapped_models``."""
 
-        ``MOTWindowSpec`` describes physical packing (8 latent frames, 16 action
-        tokens/frame); ``generation_shape`` describes how those frames receive causal
-        order ids. Distillation uses the segmented profile: the first half keeps
-        chunk order, while the second half advances one frame at a time. Stage1,
-        stage2 and stage3 must use the same values, or a checkpoint would be trained
-        under one attention graph while metadata advertises another.
-        """
-        input_dict = super()._prepare_joint_input_dict(
-            batch_dict,
-            add_noise=add_noise,
-        )
-        shape = self.config.distill.generation_shape
-        input_dict["chunk_size"] = int(shape["chunk_size"])
-        input_dict["window_size"] = int(shape["window_size"])
-        return input_dict
+    def _trainable_model(self) -> torch.nn.Module:
+        """Trainable model persisted under the checkpoint ``generator`` key."""
+        return self.model.generator.model
 
     def _optimization_target(self) -> OptimizationTarget:
-        return OptimizationTarget("student", self.optimizer, self.transformer)
+        raise NotImplementedError
 
     def _compute_training_step(
         self,
         batch: dict,
+        base_input: dict,
+        empty_text_emb: torch.Tensor,
         target: OptimizationTarget,
     ) -> TrainingStepResult:
-        return self.method_model.compute_step(batch)
+        return self.model.compute_step(
+            batch,
+            base_input=base_input,
+            empty_text_emb=empty_text_emb,
+        )
 
     def _after_optimizer_step(self, target: OptimizationTarget) -> None:
-        self.lr_scheduler.step()
-
-    def _maybe_run_training_rollout(self, batch: dict, completed_step: int) -> None:
         return None
 
-    def _loss_metrics(
+    def rollout(self, batch: dict):
+        raise NotImplementedError
+
+    def _rollout_model(self) -> torch.nn.Module:
+        return self.model.generator.model
+
+    # Optimizer ------------------------------------------------------------
+
+    def _build_optimizer(
         self,
-        loss: torch.Tensor,
-        metrics: dict[str, Any],
-    ) -> dict[str, torch.Tensor]:
-        zero = loss.detach().new_zeros(())
-        video_loss = sum(
-            (value for key, value in metrics.items() if key.endswith("_video_loss")),
-            zero,
-        )
-        action_loss = sum(
-            (value for key, value in metrics.items() if key.endswith("_action_loss")),
-            zero,
-        )
-        video_weight = float(self.config.video_loss_weight)
-        action_weight = float(self.config.action_loss_weight)
-        return {
-            "total_loss_raw": loss.detach(),
-            "latent_loss_raw": video_loss,
-            "action_loss_raw": action_loss,
-            "weighted_video_loss_raw": video_weight * video_loss,
-            "weighted_action_loss_raw": action_weight * action_loss,
-            "video_loss_weight": zero.new_tensor(video_weight),
-            "action_loss_weight": zero.new_tensor(action_weight),
-        }
-
-    @staticmethod
-    def _data_metrics(batch: dict, reference: torch.Tensor) -> dict[str, torch.Tensor]:
-        batch_size = batch["latents"].shape[0]
-        has_pointcloud = batch.get("has_pointcloud")
-        if has_pointcloud is None:
-            has_pointcloud = batch["geometry_group_valid_mask"].reshape(batch_size, -1).any(1)
-        has_pointcloud = torch.as_tensor(has_pointcloud, device=reference.device, dtype=torch.bool)
-
-        skip_count = batch.get("dataset_skip_count")
-        if skip_count is None:
-            skip_count = reference.new_zeros(batch_size)
-        skip_count = torch.as_tensor(skip_count, device=reference.device)
-
-        video_loss_mask = batch["video_latent_loss_mask"]
-        video_valid_mask = batch["video_latent_valid_mask"]
-        action_loss_mask = batch["action_loss_mask"]
-        action_valid_mask = batch["action_valid_mask"]
-        return {
-            "data_pointcloud_samples": has_pointcloud.sum().float(),
-            "data_pure_samples": (~has_pointcloud).sum().float(),
-            "data_dataset_skip_count": skip_count.sum().float(),
-            "data_local_samples": reference.new_tensor(batch_size, dtype=torch.float32),
-            "data_native_views": reference.new_tensor(batch["latents"].shape[3], dtype=torch.float32),
-            "data_video_supervised_num": video_loss_mask.sum().float(),
-            "data_video_supervised_den": reference.new_tensor(video_loss_mask.numel()),
-            "data_video_valid_num": video_valid_mask.sum().float(),
-            "data_video_valid_den": reference.new_tensor(video_valid_mask.numel()),
-            "data_action_supervised_num": action_loss_mask.sum().float(),
-            "data_action_supervised_den": reference.new_tensor(action_loss_mask.numel()),
-            "data_action_valid_num": action_valid_mask.sum().float(),
-            "data_action_valid_den": reference.new_tensor(action_valid_mask.numel()),
-        }
-
-    @staticmethod
-    def _active_nonfinite_grad_locations(
+        config: Any,
         model: torch.nn.Module,
-        max_items: int = 20,
-    ) -> list[dict[str, Any]]:
-        locations = []
-        for name, parameter in model.named_parameters():
-            grad = parameter.grad
-            if grad is None or bool(torch.isfinite(grad).all()):
-                continue
-            locations.append(
-                {
-                    "kind": "grad",
-                    "name": name,
-                    "num_nonfinite": int((~torch.isfinite(grad)).sum().item()),
-                }
-            )
-            if len(locations) == max_items:
-                break
-        return locations
+    ) -> torch.optim.Optimizer:
+        """Build a MOT-style AdamW optimizer for one trainable model.
 
-    def _train_step(
-        self,
-        batch,
-        batch_idx,
-        *,
-        collect_detailed_metrics: bool = False,
-        measure_performance: bool = False,
-    ):
-        """Run one microstep without requiring a stage-specific parent train loop.
-
-        输入可能是 RGB batch 或 cached-latent batch。先递归搬到当前 device，再
-        materialize ``latents``；stage2/stage3 从此处开始看到统一结构。之后：
-
-        1. ``_optimization_target`` 选择 student 或 fake-score；
-        2. stage-specific pipeline 返回一个保留 graph 的标量 loss；
-        3. loss 除以 gradient_accumulation_steps 后 backward；
-        4. 仅累积窗口最后一个 microstep 做 clip/finite check/optimizer.step；
-        5. 成功 student step 才推进 student LR scheduler；stage2 还更新 EMA；
-        6. 父 train loop 看到 optimizer_step_event 后才增加 optimizer_step。
-
-        例如 accumulation=2、stage3 当前选择 fake-score：batch_idx=0 只累积 grad，
-        batch_idx=1 才 clip 和 step；两个 microstep 的 optimizer_step 相同，所以
-        都走 fake-score 路径，不会出现第一半 fake、第二半 student 的混合窗口。
+        Subclasses may override this to customize lr/groups per role; the SGF
+        trainer reuses it for both the generator and the fake-score.
         """
+        param_groups = build_mot_param_groups(
+            model,
+            base_lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            betas=(config.beta1, config.beta2),
+            eps=1e-8,
+        )
+        _configure_adamw_foreach(optimizer)
+        return optimizer
+
+    def _build_lr_scheduler(
+        self,
+        config: Any,
+        optimizer: torch.optim.Optimizer,
+    ) -> torch.optim.lr_scheduler.LambdaLR:
+        """Build the shared warmup-then-constant LR scheduler."""
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: warmup_constant_lambda(
+                step,
+                warmup_steps=config.warmup_steps,
+            ),
+        )
+
+    # Preprocessing --------------------------------------------------------
+
+    def convert_input_format(self, input_dict):
+        return _move_to_device(
+            input_dict,
+            self.device,
+            non_blocking=(self.device.type == "cuda"),
+        )
+
+    def _get_train_vae(self):
+        if self.train_vae is None:
+            self.train_vae = load_vae(
+                str(Path(self.config.wan22_pretrained_model_name_or_path) / "vae"),
+                torch_dtype=self.dtype,
+                torch_device=self.device,
+            ).eval()
+            self.train_vae.requires_grad_(False)
+        return self.train_vae
+
+    def _get_empty_text_emb(self):
+        if self.empty_text_emb is None:
+            empty_path = Path(getattr(self.config, "empty_emb_path"))
+            if not empty_path.is_file():
+                raise FileNotFoundError(empty_path)
+            self.empty_text_emb = torch.load(
+                empty_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+        return self.empty_text_emb
+
+    @torch.no_grad()
+    def _encode_one_view_latent(self, frames: torch.Tensor) -> torch.Tensor:
+        spec = mot_spec_from_config(self.config)
+        if frames.shape[0] != spec.vae_input_frame_count:
+            raise ValueError(
+                f"MOT VAE input must have {spec.vae_input_frame_count} frames, "
+                f"got {frames.shape[0]}"
+            )
+        vae = self._get_train_vae()
+        vae_device = next(vae.parameters()).device
+        vae_dtype = next(vae.parameters()).dtype
+        wrapper = WanVAEStreamingWrapper(vae)
+        video = frames.permute(1, 0, 2, 3)[None].to(
+            device=vae_device,
+            dtype=vae_dtype,
+        ) * 2.0 - 1.0
+        chunks = [wrapper.encode_chunk(video[:, :, :1])]
+        for latent_idx in range(1, spec.latent_frames_per_action_chunk_per_view):
+            start = 1 + spec.vae_temporal_factor * (latent_idx - 1)
+            end = start + spec.vae_temporal_factor
+            chunks.append(wrapper.encode_chunk(video[:, :, start:end]))
+        enc = torch.cat(chunks, dim=2)
+        mu, _logvar = torch.chunk(enc, 2, dim=1)
+        mean = torch.tensor(
+            vae.config.latents_mean,
+            device=mu.device,
+            dtype=mu.dtype,
+        ).view(1, -1, 1, 1, 1)
+        std = torch.tensor(
+            vae.config.latents_std,
+            device=mu.device,
+            dtype=mu.dtype,
+        ).view(1, -1, 1, 1, 1)
+        return ((mu - mean) / std)[0].to(device=self.device, dtype=self.dtype)
+
+    @torch.no_grad()
+    def _encode_vae_rgb(self, vae_rgb: torch.Tensor) -> torch.Tensor:
+        batch_size, _time, views = vae_rgb.shape[:3]
+        per_batch = []
+        for batch_idx in range(batch_size):
+            per_view = [
+                self._encode_one_view_latent(vae_rgb[batch_idx, :, view_idx])
+                for view_idx in range(views)
+            ]
+            per_batch.append(torch.stack(per_view, dim=2))
+        return torch.stack(per_batch, dim=0)
+
+    @torch.no_grad()
+    def _materialize_batch_latents(self, batch_dict):
+        if "latents" in batch_dict:
+            return batch_dict
+        if (
+            "vae_rgb_history" not in batch_dict
+            or "vae_rgb_target" not in batch_dict
+        ):
+            raise KeyError(
+                "MOT batch must contain either latents or vae_rgb_history/target"
+            )
+        out = dict(batch_dict)
+        history = self._encode_vae_rgb(batch_dict["vae_rgb_history"])
+        target = self._encode_vae_rgb(batch_dict["vae_rgb_target"])
+        out["latents"] = torch.cat([history, target], dim=2)
+        return out
+
+    def _prepare_joint_input_dict(self, batch_dict: dict, *, add_noise: bool = True):
+        # Distillation installs its own noisy trajectories via
+        # ``replace_va_streams``, so only the clean-field layout is supported.
+        if add_noise:
+            raise NotImplementedError(
+                "simplified distillation trainer only prepares add_noise=False inputs"
+            )
+        spec = mot_spec_from_config(self.config)
+        video_latent_loss_mask = batch_dict["video_latent_loss_mask"].to(
+            device=batch_dict["latents"].device,
+            dtype=torch.bool,
+        )
+        video_latent_valid_mask = batch_dict["video_latent_valid_mask"].to(
+            device=batch_dict["latents"].device,
+            dtype=torch.bool,
+        )
+        action_loss_mask = batch_dict["action_loss_mask"].to(
+            device=batch_dict["actions"].device,
+            dtype=torch.bool,
+        )
+        action_valid_mask = batch_dict["action_valid_mask"].to(
+            device=batch_dict["actions"].device,
+            dtype=torch.bool,
+        )
+        text_emb = _apply_cfg_text_dropout(
+            batch_dict["text_emb"],
+            batch_dict.get("empty_text_emb")
+            if batch_dict.get("empty_text_emb") is not None
+            else self._get_empty_text_emb(),
+            float(getattr(self.config, "cfg_prob", 0.0)),
+            training=True,
+        )
+        latent_dict = {
+            "latent": batch_dict["latents"],
+            "text_emb": text_emb,
+            "video_latent_loss_mask": video_latent_loss_mask,
+            "video_latent_valid_mask": video_latent_valid_mask,
+        }
+        action_dict = {
+            "latent": batch_dict["actions"],
+            "text_emb": text_emb,
+            "action_loss_mask": action_loss_mask,
+            "action_valid_mask": action_valid_mask,
+        }
+        validate_mot_batch_for_forward(
+            batch_dict,
+            action_sequence_length=spec.action_sequence_length,
+        )
+        return {
+            "latent_dict": latent_dict,
+            "action_dict": action_dict,
+            "stream_ids": batch_dict["stream_ids"],
+            "chunk_size": spec.latent_frames_per_action_chunk_per_view,
+            "window_size": spec.attention_window_size,
+        }
+
+    # Step loop ------------------------------------------------------------
+
+    def _distributed_any(self, value: bool) -> bool:
+        if not (dist.is_available() and dist.is_initialized()):
+            return value
+        tensor = torch.tensor(int(bool(value)), device=self.device)
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+        return bool(tensor.item())
+
+    def _train_step(self, batch: dict, batch_idx: int) -> dict[str, Any]:
         batch = self.convert_input_format(batch)
         batch = self._materialize_batch_latents(batch)
+        base_input = self._prepare_joint_input_dict(batch, add_noise=False)
+        empty_text_emb = self._get_empty_text_emb()
         target = self._optimization_target()
-        should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
-        if hasattr(target.model, "set_requires_gradient_sync"):
-            target.model.set_requires_gradient_sync(should_sync)
-
-        result = self._compute_training_step(batch, target)
+        result = self._compute_training_step(
+            batch,
+            base_input,
+            empty_text_emb,
+            target,
+        )
         loss = result.loss
         metrics = result.metrics
-
-        local_loss_finite = torch.isfinite(loss).all()
-        global_loss_bad = self._distributed_any(not local_loss_finite)
+        should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
         out = {
             "loss": loss,
             **metrics,
-            **self._loss_metrics(loss, metrics),
-            **self._data_metrics(batch, loss),
-            "nonfinite_loss_event": bool(global_loss_bad),
-            "nonfinite_grad_event": False,
+            "batch": batch,
             "optimizer_step_event": False,
-            "grad_clip_event": torch.zeros((), device=self.device),
-            "grad_clip_count": torch.zeros((), device=self.device),
             "skipped_step": False,
             "should_log": True,
-            "_phase_timings": {},
         }
-        if global_loss_bad:
-            # 任一 rank loss 非有限时，所有 rank 都丢弃本累积窗口的梯度，避免
-            # FSDP collective/optimizer state 在不同 rank 上发生分叉。
-            self._skip_optimizer_step_for_nan(
-                trigger_stage="loss",
-                losses=out,
-                total_norm=None,
-                loss_finite=local_loss_finite,
-                grad_finite=None,
-                global_has_nan=True,
-                rank_has_nan=not local_loss_finite,
-                nan_locations=[],
-                batch=batch,
-            )
+        if bool(self._distributed_any(not torch.isfinite(loss).all())):
             target.optimizer.zero_grad(set_to_none=True)
             out["skipped_step"] = True
-            out["total_norm"] = torch.tensor(float("nan"), device=self.device)
-            return {key: value.detach() if torch.is_tensor(value) else value for key, value in out.items()}
-
-        inv_accum = 1.0 / float(self.gradient_accumulation_steps)
-        (loss * inv_accum).backward()
-
+            return out
+        (loss / float(self.gradient_accumulation_steps)).backward()
         if should_sync:
-            total_norm = torch.nn.utils.clip_grad_norm_(
+            torch.nn.utils.clip_grad_norm_(
                 target.model.parameters(),
                 self.config.distill.max_grad_norm,
             )
-            local_grad_finite = bool(torch.isfinite(total_norm).all())
-            global_grad_bad = self._distributed_any(not local_grad_finite)
-            if global_grad_bad:
-                out["nonfinite_grad_event"] = True
-                self._skip_optimizer_step_for_nan(
-                    trigger_stage="grad",
-                    losses=out,
-                    total_norm=total_norm,
-                    loss_finite=local_loss_finite,
-                    grad_finite=local_grad_finite,
-                    global_has_nan=True,
-                    rank_has_nan=not local_grad_finite,
-                    nan_locations=(
-                        self._active_nonfinite_grad_locations(target.model)
-                        if not local_grad_finite
-                        else []
-                    ),
-                    batch=batch,
-                )
-                target.optimizer.zero_grad(set_to_none=True)
-                out["skipped_step"] = True
-            else:
-                # 顺序很重要：先更新参数，再执行 stage hook。stage2 的 EMA 因而
-                # 读取本次新 student 参数；fake-score step 不会误推进 student LR。
-                target.optimizer.step()
-                self._after_optimizer_step(target)
-                target.optimizer.zero_grad(set_to_none=True)
-                out["optimizer_step_event"] = True
-                out["grad_clip_event"] = (
-                    total_norm > self.config.distill.max_grad_norm
-                ).to(dtype=torch.float32)
-                out["grad_clip_count"] = torch.ones((), device=self.device)
-            out["total_norm"] = total_norm.detach()
+            target.optimizer.step()
+            self._after_optimizer_step(target)
+            target.optimizer.zero_grad(set_to_none=True)
+            self.optimizer_step += 1
+            out["optimizer_step_event"] = True
         else:
             out["should_log"] = False
-            out["total_norm"] = torch.tensor(float("nan"), device=self.device)
+        return out
 
-        if out["optimizer_step_event"]:
-            self._maybe_run_training_rollout(batch, self.step + 1)
-        return {key: value.detach() if torch.is_tensor(value) else value for key, value in out.items()}
+    def train(self) -> None:
+        total = int(self.config.num_steps)
+        microstep = int(self.step)
+        while self.optimizer_step < total:
+            batch = self._get_next_batch()
+            result = self._train_step(
+                batch,
+                microstep % self.gradient_accumulation_steps,
+            )
+            microstep += 1
+            self.step = microstep
+            if result["optimizer_step_event"]:
+                self.rollout_visualizer.maybe_run(
+                    self.optimizer_step,
+                    result["batch"],
+                )
+            if (
+                result["optimizer_step_event"]
+                and self.optimizer_step > 0
+                and self.optimizer_step % self.save_interval == 0
+                and self._last_checkpoint_step != self.optimizer_step
+            ):
+                self.save_checkpoint()
+        if self._last_checkpoint_step != self.optimizer_step:
+            self.save_checkpoint()
+
+    # Checkpoint -----------------------------------------------------------
+
+    def _full_model_state(self, model: torch.nn.Module) -> dict[str, Any]:
+        return get_model_state_dict(
+            model,
+            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+        )
+
+    @staticmethod
+    def _checkpoint_options() -> StateDictOptions:
+        return StateDictOptions(
+            full_state_dict=False,
+            cpu_offload=True,
+            strict=True,
+        )
+
+    def _checkpoint_state_dict(self) -> dict[str, Any]:
+        model, optimizer = get_state_dict(
+            self._trainable_model(),
+            self.optimizer,
+            options=self._checkpoint_options(),
+        )
+        state = {"generator": model, "optimizer": optimizer}
+        self._extra_save_state(state)
+        return state
+
+    def _restore_checkpoint_state(self, state: dict[str, Any]) -> None:
+        set_state_dict(
+            self._trainable_model(),
+            self.optimizer,
+            model_state_dict=state["generator"],
+            optim_state_dict=state["optimizer"],
+            options=self._checkpoint_options(),
+        )
+        self._restore_extra_state(state)
+        _configure_adamw_foreach(self.optimizer)
+
+    def _export_model(self) -> torch.nn.Module:
+        return self._trainable_model()
+
+    def _write_transformer_export(
+        self,
+        checkpoint_dir: Path,
+        model: torch.nn.Module,
+        state_dict: dict[str, torch.Tensor],
+    ) -> None:
+        transformer_dir = checkpoint_dir / "transformer"
+        transformer_dir.mkdir(parents=True)
+        config_dict = dict(model.config)
+        config_dict.pop("_name_or_path", None)
+        config_dict["generation_shape"] = dict(
+            self.config.distill.generation_shape
+        )
+        (transformer_dir / "config.json").write_text(
+            json.dumps(config_dict, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        save_file(
+            {name: value.contiguous() for name, value in state_dict.items()},
+            transformer_dir / "diffusion_pytorch_model.safetensors",
+        )
+
+    def _write_checkpoint_metadata(self, checkpoint_dir: Path) -> None:
+        metadata = {
+            "format_version": 3,
+            "checkpoint_type": "mot_training",
+            "model_architecture": str(self.config.distill.model_architecture),
+            "has_full_state": True,
+            "distill_method": self.method,
+            "exported_model": (
+                "ema_student"
+                if self.method == "consistency_distillation"
+                else "student"
+            ),
+            "step": int(self.step),
+            "optimizer_step": int(self.optimizer_step),
+            "generation_profile": generation_profile_contract(
+                self.config.distill.generation_shape
+            ),
+        }
+        (checkpoint_dir / "checkpoint_metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def _capture_rng_state(self) -> dict[str, Any]:
+        cuda_state = None
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            cuda_state = torch.cuda.get_rng_state(self.device)
+        return {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": cuda_state,
+        }
+
+    def _collect_rng_states(self) -> list[dict[str, Any]]:
+        local_state = self._capture_rng_state()
+        if not (dist.is_available() and dist.is_initialized()):
+            return [local_state]
+        states = [None] * dist.get_world_size()
+        dist.all_gather_object(states, local_state)
+        return states
+
+    def _restore_rng_state(self, state: dict[str, Any]) -> None:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch_cpu"])
+        if state["torch_cuda"] is not None:
+            torch.cuda.set_rng_state(state["torch_cuda"], self.device)
+
+    def _set_sampler_resume_offset(self) -> None:
+        loader = getattr(self, "train_loader", None)
+        sampler = getattr(loader, "batch_sampler", None)
+        if hasattr(sampler, "set_start_step"):
+            sampler.set_start_step(self.step)
+            self.train_loader_iter = iter(loader)
+
+    def _extra_save_state(self, state: dict[str, Any]) -> None:
+        """Subclass hook for extra state (e.g. fake-score + its optimizer)."""
+
+    def _restore_extra_state(self, state: dict[str, Any]) -> None:
+        """Subclass hook for extra state (e.g. fake-score + its optimizer)."""
 
     def save_checkpoint(self) -> Path:
-        return self.checkpoint_io.save(self)
+        checkpoint_dir = self.save_dir / f"checkpoint_step_{self.optimizer_step:08d}"
+        export_model = self._export_model()
+        dcp_state = self._checkpoint_state_dict()
+        temp_dir = self.save_dir / f".{checkpoint_dir.name}.tmp"
+        if int(getattr(self.config, "rank", 0)) == 0:
+            if checkpoint_dir.exists():
+                raise FileExistsError(checkpoint_dir)
+            if temp_dir.exists():
+                raise FileExistsError(temp_dir)
+            temp_dir.mkdir(parents=True)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        dcp.save(
+            dcp_state,
+            checkpoint_id=temp_dir / "distributed_state",
+        )
+        export_state = self._full_model_state(export_model)
+        training_state = {
+            "step": self.step,
+            "optimizer_step": self.optimizer_step,
+            "lr_scheduler": self.lr_scheduler.state_dict(),
+            "rng_states_by_rank": self._collect_rng_states(),
+            "method_state_dict": self.get_method_state_dict(),
+        }
+        if int(getattr(self.config, "rank", 0)) == 0:
+            torch.save(training_state, temp_dir / "training_state.pt")
+            self._write_transformer_export(temp_dir, export_model, export_state)
+            self._write_checkpoint_metadata(temp_dir)
+            (temp_dir / "_SUCCESS").write_text("", encoding="utf-8")
+            temp_dir.replace(checkpoint_dir)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        self._last_checkpoint_step = self.optimizer_step
+        return checkpoint_dir
 
     def load_checkpoint(self, checkpoint_root: str | Path) -> None:
-        self.checkpoint_io.load(self, Path(checkpoint_root))
+        checkpoint_root = Path(checkpoint_root)
+        metadata = json.loads(
+            (checkpoint_root / "checkpoint_metadata.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        if metadata.get("distill_method") != self.method:
+            raise ValueError(
+                f"Checkpoint method {metadata.get('distill_method')} does not "
+                f"match current method {self.method}"
+            )
+        expected_profile = generation_profile_contract(
+            self.config.distill.generation_shape
+        )
+        if metadata.get("generation_profile") != expected_profile:
+            raise ValueError(
+                "Checkpoint generation profile does not match current config"
+            )
+        training_state = torch.load(
+            checkpoint_root / "training_state.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
+        dcp_state = self._checkpoint_state_dict()
+        dcp.load(
+            dcp_state,
+            checkpoint_id=checkpoint_root / "distributed_state",
+        )
+        self._restore_checkpoint_state(dcp_state)
+        self.step = int(training_state["step"])
+        self.optimizer_step = int(training_state["optimizer_step"])
+        self.lr_scheduler.load_state_dict(training_state["lr_scheduler"])
+        self.load_method_state_dict(training_state["method_state_dict"])
+        rank = int(getattr(self.config, "rank", 0))
+        self._restore_rng_state(training_state["rng_states_by_rank"][rank])
+        self._set_sampler_resume_offset()
+        self._last_checkpoint_step = self.optimizer_step
 
     def get_method_state_dict(self) -> dict[str, Any]:
         return {
             "method": self.method,
-            "method_model_state_dict": self.method_model.state_dict(),
+            "method_model_state_dict": self.model.state_dict(),
         }
 
     def load_method_state_dict(self, state: dict[str, Any]) -> None:
@@ -365,4 +630,4 @@ class DistillationTrainerBase(MOTTrainer):
                 f"current method {self.method}"
             )
         if "method_model_state_dict" in state:
-            self.method_model.load_state_dict(state["method_model_state_dict"])
+            self.model.load_state_dict(state["method_model_state_dict"])

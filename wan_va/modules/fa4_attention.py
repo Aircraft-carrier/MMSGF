@@ -1,5 +1,5 @@
 """
-FlashAttention-4 custom-mask helpers for 3DVA_MOT.
+FlashAttention-4 custom-mask helpers for VA_MOT.
 
 This module is intentionally import-safe on machines that do not yet have
 `flash-attn-4` installed.  The public dataclasses and backend-dispatch hooks are
@@ -29,20 +29,8 @@ from torch.nn.attention.flex_attention import create_block_mask
 
 STREAM_VIDEO = 0
 STREAM_ACTION = 1
-STREAM_GEOMETRY = 2
 NOISE_NOISY = 0
 NOISE_CLEAN = 1
-
-
-@dataclass(frozen=True)
-class ChunkCausalMaskSpec:
-    """Structured VGGTO chunk-causal mask used by the FA4 backend."""
-
-    frames: int
-    frames_per_chunk: int
-    tokens_per_frame: int
-    backend: str = "fa4"
-    token_valid_ids: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -95,65 +83,6 @@ def validate_fa4_training_environment(device: Optional[torch.device] = None) -> 
         )
 
 
-def chunk_causal_mask_from_spec(batch_size: int, spec: ChunkCausalMaskSpec, device: torch.device) -> torch.Tensor:
-    seq_len = spec.frames * spec.tokens_per_frame
-    frame_chunk_ids = torch.arange(spec.frames, device=device) // spec.frames_per_chunk
-    token_chunk_ids = frame_chunk_ids.repeat_interleave(spec.tokens_per_frame)
-    allow = token_chunk_ids[None, :] <= token_chunk_ids[:, None]
-    mask = allow[None, None].expand(batch_size, 1, seq_len, seq_len)
-    if spec.token_valid_ids is None:
-        return mask
-
-    token_valid = spec.token_valid_ids.to(device=device, dtype=torch.bool)
-    if tuple(token_valid.shape) != (batch_size, seq_len):
-        raise RuntimeError(f"ChunkCausalMaskSpec token_valid_ids must be [{batch_size},{seq_len}], got {tuple(token_valid.shape)}")
-    valid_mask = token_valid[:, None, :, None] & token_valid[:, None, None, :]
-    mask = mask & valid_mask
-    eye = torch.eye(seq_len, dtype=torch.bool, device=device)[None, None]
-    invalid_queries = ~token_valid[:, None, :, None]
-    return torch.where(invalid_queries, eye, mask)
-
-
-@lru_cache(maxsize=1)
-def _cute_chunk_causal_mask():
-    rt = _load_fa4_runtime()
-    cutlass = rt.cutlass
-    cute = rt.cute
-
-    @cute.jit
-    def _mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors, aux_scalars):
-        del batch, head, seqlen_info, aux_tensors
-        tokens_per_chunk = cutlass.Int32(aux_scalars[0])
-        return (kv_idx // tokens_per_chunk) <= (q_idx // tokens_per_chunk)
-
-    return _mask
-
-
-@lru_cache(maxsize=1)
-def _cute_chunk_causal_valid_mask():
-    rt = _load_fa4_runtime()
-    cutlass = rt.cutlass
-    cute = rt.cute
-    utils = rt.utils
-
-    @cute.jit
-    def _mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors, aux_scalars):
-        token_valid_ids = aux_tensors[0]
-        tokens_per_chunk = cutlass.Int32(aux_scalars[0])
-        b = batch[0]
-        h = head[0]
-        q = q_idx[0]
-        k = kv_idx[0]
-        q_valid = utils.scalar_to_ssa(token_valid_ids[b, h, q], cutlass.Int32)
-        k_valid = utils.scalar_to_ssa(token_valid_ids[b, h, k], cutlass.Int32)
-        chunk_causal = (kv_idx // tokens_per_chunk) <= (q_idx // tokens_per_chunk)
-        valid_pair = (q_valid != cutlass.Int32(0)) & (k_valid != cutlass.Int32(0))
-        invalid_query_self = (q_valid == cutlass.Int32(0)) & (q_idx == kv_idx)
-        return (chunk_causal & valid_pair) | invalid_query_self
-
-    return _mask
-
-
 @lru_cache(maxsize=1)
 def _cute_mot_mask():
     rt = _load_fa4_runtime()
@@ -191,8 +120,6 @@ def _cute_mot_mask():
 
         x_query = (q_stream == cutlass.Int32(STREAM_VIDEO)) | (q_stream == cutlass.Int32(STREAM_ACTION))
         x_key = (k_stream == cutlass.Int32(STREAM_VIDEO)) | (k_stream == cutlass.Int32(STREAM_ACTION))
-        g_query = q_stream == cutlass.Int32(STREAM_GEOMETRY)
-        g_key = k_stream == cutlass.Int32(STREAM_GEOMETRY)
 
         clean_to_clean = (
             (q_noise == cutlass.Int32(NOISE_CLEAN))
@@ -211,11 +138,7 @@ def _cute_mot_mask():
         )
         x_to_x = x_query & x_key & (clean_to_clean | noisy_to_clean | noisy_to_noisy)
 
-        # G is self-contained and uses the same chunk-causal clock as VA.
-        g_to_g = g_query & g_key & (k_order <= q_order)
-        clean_to_g = x_query & g_key & (q_noise == cutlass.Int32(NOISE_CLEAN)) & (k_order < q_order)
-        noisy_to_g = x_query & g_key & (q_noise == cutlass.Int32(NOISE_NOISY)) & (k_order < q_order)
-        return valid & (x_to_x | g_to_g | clean_to_g | noisy_to_g)
+        return valid & x_to_x
 
     return _mask
 
@@ -242,8 +165,6 @@ def _mot_flex_mask_mod(meta: Any):
 
         x_query = (q_stream == STREAM_VIDEO) | (q_stream == STREAM_ACTION)
         x_key = (k_stream == STREAM_VIDEO) | (k_stream == STREAM_ACTION)
-        g_query = q_stream == STREAM_GEOMETRY
-        g_key = k_stream == STREAM_GEOMETRY
 
         q_noise = meta.noise_ids[b, q_idx]
         k_noise = meta.noise_ids[b, kv_idx]
@@ -253,22 +174,7 @@ def _mot_flex_mask_mod(meta: Any):
         noisy_to_clean = (q_noise == NOISE_NOISY) & (k_noise == NOISE_CLEAN) & (k_order < q_order)
         noisy_to_noisy = (q_noise == NOISE_NOISY) & (k_noise == NOISE_NOISY) & (k_order == q_order)
         x_to_x = x_query & x_key & (clean_to_clean | noisy_to_clean | noisy_to_noisy)
-        g_to_g = g_query & g_key & (k_order <= q_order)
-        clean_to_g = x_query & g_key & (q_noise == NOISE_CLEAN) & (k_order < q_order)
-        noisy_to_g = x_query & g_key & (q_noise == NOISE_NOISY) & (k_order < q_order)
-        return valid & (x_to_x | g_to_g | clean_to_g | noisy_to_g)
-
-    return mask_mod
-
-
-def _chunk_causal_flex_mask_mod(tokens_per_chunk: int, token_valid_ids: Optional[torch.Tensor] = None):
-    def mask_mod(b, h, q_idx, kv_idx):
-        chunk_causal = (kv_idx // tokens_per_chunk) <= (q_idx // tokens_per_chunk)
-        if token_valid_ids is None:
-            return chunk_causal
-        q_valid = token_valid_ids[b, q_idx]
-        k_valid = token_valid_ids[b, kv_idx]
-        return (chunk_causal & q_valid & k_valid) | (~q_valid & (q_idx == kv_idx))
+        return valid & x_to_x
 
     return mask_mod
 
@@ -424,55 +330,13 @@ def _mot_block_sparse(meta: Any, num_heads: int):
     return cache[key]
 
 
-_CHUNK_BLOCK_CACHE: dict[tuple, tuple[Any, Any]] = {}
-
-
-def _chunk_block_sparse(batch_size: int, num_heads: int, seq_len: int, spec: ChunkCausalMaskSpec, device: torch.device):
-    del num_heads
-    tokens_per_chunk = spec.frames_per_chunk * spec.tokens_per_frame
-    mask_only = spec.token_valid_ids is not None
-    key = (
-        "mask_only" if mask_only else "exact",
-        batch_size,
-        _BLOCK_MASK_HEADS,
-        seq_len,
-        spec.frames,
-        spec.frames_per_chunk,
-        spec.tokens_per_frame,
-        device,
-        _FA4_BLOCK_SIZE,
-    )
-    if spec.token_valid_ids is not None:
-        if key not in _CHUNK_BLOCK_CACHE:
-            _CHUNK_BLOCK_CACHE[key] = _block_sparse_from_flex(
-                _chunk_causal_flex_mask_mod(tokens_per_chunk),
-                batch_size=batch_size,
-                num_heads=_BLOCK_MASK_HEADS,
-                seq_len=seq_len,
-                device=device,
-                block_size=_FA4_BLOCK_SIZE,
-                mask_only=True,
-            )
-        return _CHUNK_BLOCK_CACHE[key]
-    if key not in _CHUNK_BLOCK_CACHE:
-        _CHUNK_BLOCK_CACHE[key] = _block_sparse_from_flex(
-            _chunk_causal_flex_mask_mod(tokens_per_chunk),
-            batch_size=batch_size,
-            num_heads=_BLOCK_MASK_HEADS,
-            seq_len=seq_len,
-            device=device,
-            block_size=_FA4_BLOCK_SIZE,
-        )
-    return _CHUNK_BLOCK_CACHE[key]
-
-
 def fa4_attention_from_meta(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     meta: Any,
 ) -> torch.Tensor:
-    """Run VA-G MoT attention with FA4 custom mask.
+    """Run Video+Action MoT attention with an FA4 custom mask.
 
     Inputs follow the local model convention `[B, L, H, D]`.  This is the FA4
     migration point for the register-only VA-G joint attention mask discussed
@@ -495,71 +359,6 @@ def fa4_attention_from_meta(
         mask_mod=_cute_mot_mask(),
         aux_tensors=aux_tensors,
         aux_scalars=[rt.cutlass.Int32(meta.window_size)],
-        block_sparse_tensors=block_sparse_fwd,
-        block_sparse_tensors_bwd=block_sparse_bwd,
-        return_lse=False,
-    )
-    return out
-
-
-def fa4_full_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Run ordinary unmasked full attention with FlashAttention-4.
-
-    Inputs and outputs use the local `[B, L, H, D]` convention.  Cross-view
-    VGGTO attention forms one independent timestamp sequence per batch row, so
-    valid rows need no custom CuTe mask or block-sparse metadata.
-    """
-
-    _require_h100_cuda(q)
-    if q.ndim != 4 or k.shape != q.shape or v.shape != q.shape:
-        raise RuntimeError(
-            "FlashAttention-4 full attention requires matching [B,L,H,D] Q/K/V; "
-            f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
-        )
-    rt = _load_fa4_runtime()
-    head_dim = q.shape[-1]
-    out, _ = rt.flash_attn_func(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        softmax_scale=1.0 / math.sqrt(head_dim),
-        pack_gqa=False,
-        return_lse=False,
-    )
-    return out
-
-
-def fa4_chunk_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, spec: ChunkCausalMaskSpec) -> torch.Tensor:
-    """Run VGGTO chunk-causal attention with FA4 custom mask."""
-
-    _require_h100_cuda(q)
-    rt = _load_fa4_runtime()
-    batch_size, seq_len, num_heads, head_dim = q.shape
-    expected_len = spec.frames * spec.tokens_per_frame
-    if seq_len != expected_len:
-        raise RuntimeError(
-            f"FlashAttention-4 VGGTO chunk-causal mask expected L={expected_len} "
-            f"from frames={spec.frames}, tokens_per_frame={spec.tokens_per_frame}; got L={seq_len}."
-        )
-    tokens_per_chunk = spec.frames_per_chunk * spec.tokens_per_frame
-    aux_tensors = None
-    mask_mod = _cute_chunk_causal_mask()
-    if spec.token_valid_ids is not None:
-        token_valid_ids = spec.token_valid_ids.to(device=q.device, dtype=torch.int32)
-        if tuple(token_valid_ids.shape) != (batch_size, seq_len):
-            raise RuntimeError(f"ChunkCausalMaskSpec token_valid_ids must be [{batch_size},{seq_len}], got {tuple(token_valid_ids.shape)}")
-        aux_tensors = [token_valid_ids[:, None, :].expand(-1, num_heads, -1).contiguous()]
-        mask_mod = _cute_chunk_causal_valid_mask()
-    block_sparse_fwd, block_sparse_bwd = _chunk_block_sparse(batch_size, num_heads, seq_len, spec, q.device)
-    out, _ = rt.flash_attn_func(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        softmax_scale=1.0 / math.sqrt(head_dim),
-        pack_gqa=False,
-        mask_mod=mask_mod,
-        aux_tensors=aux_tensors,
-        aux_scalars=[rt.cutlass.Int32(tokens_per_chunk)],
         block_sparse_tensors=block_sparse_fwd,
         block_sparse_tensors_bwd=block_sparse_bwd,
         return_lse=False,

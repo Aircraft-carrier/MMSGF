@@ -12,8 +12,8 @@ def make_mot_eval_cfg(
     mode: str = "video",
 ) -> EasyDict:
     mode = str(mode).strip().lower()
-    if mode not in {"video", "geometry", "full"}:
-        raise ValueError(f"MOT evaluation mode must be video, geometry, or full, got {mode!r}")
+    if mode not in {"video", "full"}:
+        raise ValueError(f"MOT evaluation mode must be video or full, got {mode!r}")
     return EasyDict(
         mode=mode,
         device="cuda:0",
